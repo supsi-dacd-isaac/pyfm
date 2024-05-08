@@ -86,7 +86,7 @@ if __name__ == "__main__":
     dso_demand = dso.get_flexibility_quantities(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
 
     # Get baselines
-    fsp.set_baselines(slot_time, cfg['fm']['granularity'])
+    fsp.set_baselines(slot_time)
 
     # Place orders
     for p in fsp.portfolios:

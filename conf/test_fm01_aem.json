@@ -18,7 +18,7 @@
           "mainSettings": {
             "side": "Buy",
             "regulationType": "Down",
-            "quantity": 1.5,
+            "quantity": 1.2,
             "unitPrice": 1,
             "priceType": "Limit",
             "currency": "CHF",
@@ -32,7 +32,9 @@
           "name": "SUPSI",
           "role": "fsp",
           "baselines": {
-            "tmpFolder": "/home/dstreppa/development/python/pyfm/data/tmp"
+            "tmpFolder": "/home/dstreppa/development/python/pyfm/data/tmp",
+            "fromBeforeNowHours": 12,
+            "toAfterNowHours": 12
           },
           "orderSection": {
             "quantityPercBaseline": 50,

@@ -93,8 +93,8 @@ class Player:
 
     def sell_flexibility(self, dt, p_id, dso_demand):
         for k_regulation_type in dso_demand.keys():
-            quantity_to_sell = self.calculate_quantity_to_sell_basic(dso_demand[k_regulation_type],
-                                                                     self.baselines[p_id]['quantity'].iloc[0])
+            quantity_to_sell = self.calculate_quantity_to_sell_basic(dt, dso_demand[k_regulation_type],
+                                                                     self.baselines[p_id]['quantity'])
 
             self.logger.info('Portfolio: %s, Regulation: %s, Bidded flexibility: %s' % (p_id, k_regulation_type,
                                                                                         quantity_to_sell))
@@ -145,15 +145,18 @@ class Player:
         self.logger.info('Flexibility quantities (%s): UP = %.3f, DOWN = %.3f' % (quantity_type, quantity_up, quantity_down))
         return {'Up': quantity_up, 'Down': quantity_down}
 
-    def calculate_quantity_to_sell_basic(self, demand, baseline):
+    def calculate_quantity_to_sell_basic(self, timeslot, demand, baseline_time_seris):
         if demand > 0:
+            # Basic approach, only the baseline value of the timeslot is taking into account,
+            # past and and future are not considered
+            baseline = baseline_time_seris.loc[timeslot.strftime('%Y-%m-%dT%H:%M:%SZ')]
             marketable_quantity = baseline * self.cfg['orderSection']['quantityPercBaseline'] / 1e2
 
             if marketable_quantity <= demand:
-                # Everything is bidded
+                # Everything is sold
                 return marketable_quantity
             else:
-                # Only a part of the flexibility is bidded in order to cover the entire demand
+                # Only a part of the flexibility is sold covering the entire demand
                 return demand
         else:
             return 0.0

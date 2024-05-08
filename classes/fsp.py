@@ -29,8 +29,11 @@ class FSP(Player):
         self.assets_portfolios_assignments = self.get_assets_portfolios_assignments()
         self.baselines = {}
 
-    def set_baselines(self, slot_time_from, granularity):
-        slot_time_to = slot_time_from + timedelta(minutes=granularity)
+    def set_baselines(self, slot_time):
+        # slot_time_to = slot_time + timedelta(minutes=granularity)
+        slot_time_from = slot_time - timedelta(hours=self.cfg['baselines']['fromBeforeNowHours'])
+        slot_time_to = slot_time + timedelta(hours=self.cfg['baselines']['toAfterNowHours'])
+
         from_str = slot_time_from.strftime('%Y-%m-%dT%H:%M:%SZ')
         to_str = slot_time_to.strftime('%Y-%m-%dT%H:%M:%SZ')
 
@@ -38,8 +41,11 @@ class FSP(Player):
         for p in self.portfolios:
             res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
                                                              'BaselineIntervals?assetPortfolioId=%s&'
-                                                             'periodFrom=%s&periodTo=%s' % (p['id'], from_str, to_str)))
+                                                             'periodFrom.GreaterThanOrEqual=%s&'
+                                                             'periodFrom.LessThanOrEqual=%s&'
+                                                             'orderBy=PeriodFrom Asc' % (p['id'], from_str, to_str)))
             df = pd.DataFrame(res['items'])
+            df['periodFrom'] = pd.to_datetime(df['periodFrom'], utc=True).dt.strftime('%Y-%m-%dT%H:%M:%SZ')
             df.set_index('periodFrom', inplace=True)
 
             bs[p['id']] = df
