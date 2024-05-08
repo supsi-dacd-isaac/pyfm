@@ -1,109 +1,51 @@
 {
-  "connectionsFile": "conf/private/conns.json",
+  "connectionsFile": "../conf/private/conns.json",
   "utils": {
-    "baselineProfileFile": "data/baselines/example01.csv"
+    "baselineProfileFile": "../data/baselines/example01.csv"
   },
   "fm": {
-    "resolution": "15M",
-    "actors": [
-      {
+    "granularity": 15,
+    "ordersTimeShift": 60,
+    "marketName": "Opentunity-CH",
+    "gridAreaName": "Switzerland",
+    "actors": {
+      "dso": {
         "id": "AEM",
         "name": "Switzerland",
         "role": "dso",
-        "grid":{
-          "sub01": {
-            "id": "sub01",
-            "features": {},
-            "children": {
-              "node01": {
-                "id": "node01",
-                "features": {},
-                "children": []
-              },
-              "node02": {
-                "id": "node02",
-                "features": {},
-                "children": []
-              }
-            }
+        "orderSection": {
+          "nodeName": "Massagno_1",
+          "mainSettings": {
+            "side": "Buy",
+            "regulationType": "Down",
+            "quantity": 1.5,
+            "unitPrice": 1,
+            "priceType": "Limit",
+            "currency": "CHF",
+            "fillType": "Normal"
           }
         }
       },
-      {
-        "id": "SUPSI",
-        "name": "SUPSI",
-        "role": "fsp",
-        "baselines": {
-          "intervalDays": 1,
-          "tmpFolder": "/home/dstreppa/development/python/pyfm/data/tmp"
-        },
-        "assets": [
-          {
-            "id": "supsi_hp01",
-            "features": { "nominalPower": 7.0 }
+      "fsps": {
+        "supsi01": {
+          "id": "SUPSI",
+          "name": "SUPSI",
+          "role": "fsp",
+          "baselines": {
+            "tmpFolder": "/home/dstreppa/development/python/pyfm/data/tmp"
           },
-          {
-            "id": "supsi_hp02",
-            "features": { "nominalPower": 10.0 }
-          },
-          {
-            "id": "supsi_hp03",
-            "features": { "nominalPower": 4.0 }
+          "orderSection": {
+            "quantityPercBaseline": 50,
+            "mainSettings": {
+              "side": "Sell",
+              "unitPrice": 1,
+              "priceType": "Limit",
+              "currency": "CHF",
+              "fillType": "Normal"
+            }
           }
-        ]
+        }
       }
-    ],
-    "msp_TO_BE_IMPLEMENTED": {
-      "id": "AEM",
-      "dataSource": "XXX"
-    },
-    "agg_THIS_PART_HAS_TO_BE_RESTRUCTURED_AND_INTEGRATED_IN_THE_fsps_SECTION_ABOVE": [
-      {
-        "name": "AEM_HP01",
-        "fsps": [
-          {
-            "name": "AEM_HP01_01",
-            "measureId": "POD_HP01_01",
-            "measureAtAssetLevel": false,
-            "control": {
-              "type": "digital",
-              "states": [0, 100]
-            },
-            "features": {
-              "nominalPower": 7.0
-            }
-          },
-          {
-            "name": "AEM_HP01_02",
-            "measureId": "POD_HP01_02",
-            "measureAtAssetLevel": false,
-            "control": {
-              "type": "digital",
-              "states": [0, 100]
-            },
-            "features": {
-              "nominalPower": 13.0
-            }
-          }
-        ]
-      },
-      {
-        "name": "AEM_HP02",
-        "fsps": [
-          {
-            "name": "AEM_HP02_01",
-            "measureId": "POD_HP02_01",
-            "measureAtAssetLevel": false,
-            "control": {
-              "type": "digital",
-              "states": [0, 25, 50, 75, 100]
-            },
-            "features": {
-              "nominalPower": 50.0
-            }
-          }
-        ]
-      }
-    ]
+    }
   }
 }

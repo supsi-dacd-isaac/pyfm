@@ -125,12 +125,14 @@ class NODESInterface:
             return False
 
     def post_request(self, endpoint, data):
+        self.logger.info('Body request: %s' % data)
         try:
             response = requests.post(endpoint, headers=self.headers, json=data)
             if response.status_code == http.HTTPStatus.OK:
                 self.logger.info('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
             else:
                 self.logger.warning('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+            self.logger.info('Body response: %s' % response.text)
             return response.ok
         except Exception as e:
             self.logger.error('EXCEPTION: %s' % str(e))

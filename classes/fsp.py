@@ -27,23 +27,31 @@ class FSP(Player):
 
         # Get asset assigned to portfolios
         self.assets_portfolios_assignments = self.get_assets_portfolios_assignments()
+        self.baselines = {}
 
-    def get_baselines(self, from_period, to_period):
+    def set_baselines(self, slot_time_from, granularity):
+        slot_time_to = slot_time_from + timedelta(minutes=granularity)
+        from_str = slot_time_from.strftime('%Y-%m-%dT%H:%M:%SZ')
+        to_str = slot_time_to.strftime('%Y-%m-%dT%H:%M:%SZ')
+
         bs = {}
         for p in self.portfolios:
-            # res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-            #                                                  'BaselineIntervals?assetPortfolioId=%s&periodFrom=%s&periodTo=%s' % (p['id'], from_period, to_period)))
             res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                             'BaselineIntervals?assetPortfolioId=%s' % p['id']))
+                                                             'BaselineIntervals?assetPortfolioId=%s&'
+                                                             'periodFrom=%s&periodTo=%s' % (p['id'], from_str, to_str)))
             df = pd.DataFrame(res['items'])
             df.set_index('periodFrom', inplace=True)
 
             bs[p['id']] = df
-        return bs
+        self.baselines = bs
 
     def update_baselines(self, portfolio_id, baseline_dataframe):
         tmp_baseline_file = '%s%s%s.csv' % (self.cfg['baselines']['tmpFolder'], os.sep, portfolio_id)
         baseline_dataframe.to_csv(tmp_baseline_file, index=False)
+
+        self.logger.info('Update baseline of portfolio %s, period [%s-%s]' % (portfolio_id,
+                                                                              baseline_dataframe['periodTo'].iloc[0],
+                                                                              baseline_dataframe['periodTo'].iloc[-1]))
 
         endpoint = '%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'BaselineIntervals/import')
         return self.nodes_interface.post_csv_file_request(endpoint, tmp_baseline_file)
@@ -99,66 +107,13 @@ class FSP(Player):
         res = self.nodes_interface.delete_request(endpoint)
         return res
 
-    # def add_baseline_interval(self, portfolio_id, from_period, to_period):
-    #     body = {
-    #         # "id": "string",
-    #         # "status": "Received",
-    #         # "created": datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
-    #         # "createdByUserId": "string",
-    #         # "lastModified": "2024-04-30T11:42:56.287Z",
-    #         # "lastModifiedByUserId": "string",
-    #         "assetPortfolioId": portfolio_id,
-    #         "periodFrom": from_period,
-    #         "periodTo": to_period,
-    #         # "batchReference": "string",
-    #         "quantity": 0.1,
-    #         "quantityType": "Power"
-    #     }
-    #
-    #     # body = {
-    #     #     "assetPortfolioId": portfolio_id,
-    #     #     "periodFrom": from_period,
-    #     #     "periodTo": to_period,
-    #     #     "quantity": 0.03,
-    #     #     "quantityType": "Power"
-    #     # }
-    #     self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'BaselineIntervals/import'),
-    #                                       body)
-
-
     @staticmethod
     def calc_from_to_period(days):
         from_dt = datetime.utcnow()
         to_dt = from_dt + timedelta(days=days)
         return from_dt.strftime('%Y-%m-%dT%H:%M:%SZ'), to_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
-    # def create_portfolio(self, portfolio_id, portfolio_metadata):
-    #     self.portfolios[portfolio_id] = Portfolio(portfolio_id, portfolio_metadata)
-    #     return True
-    #
-    # def delete_portfolio(self, portfolio_id):
-    #     if len(self.portfolios[portfolio_id].get_assets().keys()) == 0:
-    #         del self.portfolios[portfolio_id]
-    #         return True
-    #     else:
-    #         return False
-    #
-    # def add_asset_to_portfolio(self, portfolio_id, asset):
-    #     if asset.dso.id == self.dso.cfg['id'] and asset.approved is True:
-    #         self.portfolios[portfolio_id].add_asset(asset)
-    #         return True
-    #     else:
-    #         return False
-    #
-    # def remove_asset_from_portfolio(self, portfolio_id, asset):
-    #     if asset.dso.id == self.id and asset.approved is True:
-    #         self.portfolios[portfolio_id].remove_asset(asset)
-    #         return True
-    #     else:
-    #         return False
-    #
-    # def add_baseline_to_portfolio(self, portfolio_id, baseline_id, baseline_metadata, baseline_timeseries):
-    #     return self.portfolios[portfolio_id].add_baseline(baseline_id, baseline_metadata, baseline_timeseries)
+
 
 
 

@@ -1,0 +1,62 @@
+# Importing section
+import argparse
+import logging
+import os
+import sys
+import json
+
+from classes.dso import DSO
+from classes.postgresql_interface import PostgreSQLInterface
+
+
+if __name__ == "__main__":
+    # --------------------------------------------------------------------------- #
+    # Configuration file
+    # --------------------------------------------------------------------------- #
+    arg_parser = argparse.ArgumentParser()
+    arg_parser.add_argument('--config_file', help='configuration file')
+    arg_parser.add_argument('--log_file', help='log file (optional, if empty log redirected on stdout)')
+    args = arg_parser.parse_args()
+
+    # Load the main parameters
+    config_file = args.config_file
+    if os.path.isfile(config_file) is False:
+        print('\nATTENTION! Unable to open configuration file %s\n' % config_file)
+        sys.exit(1)
+
+    # Load configuration
+    cfg = json.loads(open(config_file).read())
+    cfg_conns = json.loads(open(cfg['connectionsFile']).read())
+    cfg.update(cfg_conns)
+
+    logger = logging.getLogger()
+    logging.basicConfig(format='%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s', level=logging.INFO,
+                        filename=None)
+
+    logger.info('Starting program')
+
+    # Database connection
+    pgi = PostgreSQLInterface(cfg['postgreSQL'], logger)
+
+    # Market main parameters
+
+    # DSO
+    dso = DSO(cfg['fm']['actors']['dso'], cfg['nodesAPI'], logger)
+    user_info = dso.nodes_interface.get_user_info()
+
+    dso.set_markets(filter_dict={'name': cfg['fm']['marketName']})
+    dso.set_organization(filter_dict={'name': dso.cfg['id']})
+    dso.set_grid_area(filter_dict={'name': cfg['fm']['gridAreaName']})
+    dso.set_grid_nodes(filter_dict={'gridAreaId': dso.grid_area['id']})
+
+    slot_time = dso.get_adjusted_time(cfg['fm']['granularity'], cfg['fm']['ordersTimeShift'])
+
+    dso.print_user_info(user_info)
+    dso.print_player_info()
+
+    # Place
+    dso.demand_flexibility(slot_time)
+    # fmo.add_entry_to_ledger(timeslot=ts_slot, player=dso, portfolio=None,
+    #                         case='buy', data={'amount': 30, 'unit': 'kW'})
+
+    logger.info('Ending program')
