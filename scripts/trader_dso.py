@@ -30,9 +30,14 @@ if __name__ == "__main__":
     cfg_conns = json.loads(open(cfg['connectionsFile']).read())
     cfg.update(cfg_conns)
 
+    # Logger object
+    if not args.l:
+        log_file = None
+    else:
+        log_file = args.log_file
     logger = logging.getLogger()
     logging.basicConfig(format='%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s', level=logging.INFO,
-                        filename=None)
+                        filename=log_file)
 
     logger.info('Starting program')
 
