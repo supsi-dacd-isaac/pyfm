@@ -56,7 +56,7 @@ if __name__ == "__main__":
     cfg.update(cfg_conns)
 
     # Logger object
-    if not args.l:
+    if not args.log_file:
         log_file = None
     else:
         log_file = args.log_file
