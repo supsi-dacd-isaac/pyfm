@@ -6,6 +6,7 @@ import sys
 import json
 
 from classes.dso import DSO
+from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 
 
@@ -54,9 +55,12 @@ if __name__ == "__main__":
     dso.print_user_info(user_info)
     dso.print_player_info()
 
-    # Place
-    dso.demand_flexibility(slot_time)
-    # fmo.add_entry_to_ledger(timeslot=ts_slot, player=dso, portfolio=None,
-    #                         case='buy', data={'amount': 30, 'unit': 'kW'})
+    # FMO object
+    fmo = FMO({}, logger, pgi)
+
+    # Place order
+    resp_demand = dso.demand_flexibility(slot_time)
+    if resp_demand is not False:
+        fmo.add_entry_to_ledger(timeslot=slot_time, player=dso, portfolio=None, features=resp_demand)
 
     logger.info('Ending program')

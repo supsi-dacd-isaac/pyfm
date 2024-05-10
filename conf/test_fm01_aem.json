@@ -1,7 +1,8 @@
 {
   "connectionsFile": "../conf/private/conns.json",
   "utils": {
-    "baselineProfileFile": "../data/baselines/example01.csv"
+    "baselineProfileFile": "../data/baselines/example01.csv",
+    "baselineShiftMinutes": 30
   },
   "fm": {
     "granularity": 15,
@@ -15,11 +16,11 @@
         "role": "dso",
         "orderSection": {
           "nodeName": "Massagno_1",
+          "quantities": [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0],
           "mainSettings": {
             "side": "Buy",
             "regulationType": "Down",
-            "quantity": 1.2,
-            "unitPrice": 1,
+            "unitPrice": 10,
             "priceType": "Limit",
             "currency": "CHF",
             "fillType": "Normal"
@@ -40,7 +41,7 @@
             "quantityPercBaseline": 50,
             "mainSettings": {
               "side": "Sell",
-              "unitPrice": 1,
+              "unitPrice": 10,
               "priceType": "Limit",
               "currency": "CHF",
               "fillType": "Normal"

@@ -10,6 +10,7 @@ import pandas as pd
 
 from classes.dso import DSO
 from classes.fsp import FSP
+from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 
 
@@ -88,10 +89,14 @@ if __name__ == "__main__":
     # Get baselines
     fsp.set_baselines(slot_time)
 
+    # FMO object
+    fmo = FMO({}, logger, pgi)
+
     # Place orders
     for p in fsp.portfolios:
-        fsp.sell_flexibility(slot_time, p['id'], dso_demand)
-        # fmo.add_entry_to_ledger(timeslot=ts_slot, player=fsp, portfolio=fsp.portfolios['portfolio_hps'],
-        #                         case='sell', data={'amount': 10, 'unit': 'kW', 'price': 1})
+        resp_selling = fsp.sell_flexibility(slot_time, p['id'], dso_demand)
+        for k in resp_selling.keys():
+            if resp_selling[k] is not False:
+                fmo.add_entry_to_ledger(timeslot=slot_time, player=fsp, portfolio=p['name'], features=resp_selling[k])
 
     logger.info('Ending program')

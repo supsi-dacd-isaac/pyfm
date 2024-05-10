@@ -9,26 +9,34 @@ from datetime import datetime, timedelta
 import pandas as pd
 
 from classes.fsp import FSP
-from classes.postgresql_interface import PostgreSQLInterface
 
 
-def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
+def create_dataframe_for_portfolio_baseline(p_id, data_file_path,bs_shift):
     current_time = datetime.utcnow()
     adjusted_time = (current_time.replace(minute=(current_time.minute // 15) * 15, second=0, microsecond=0) +
-                     timedelta(minutes=30))
-    time_step = timedelta(minutes=15)
+                     timedelta(minutes=bs_shift))
 
     df = pd.read_csv(data_file_path)
-    df.insert(loc=0, column="assetPortfolioId", value=p_id)
 
-    period_from = [adjusted_time + i * time_step for i in range(len(df))]
-    period_from_iso = [dt.strftime("%Y-%m-%dT%H:%M:%SZ") for dt in period_from]
-    df.insert(loc=1, column="periodFrom", value=period_from_iso)
+    df['slot_dt'] = pd.to_datetime(df['slot'], format='%H:%M')
+    df['minutes_in_day'] = df['slot_dt'].dt.hour * 60 + df['slot_dt'].dt.minute
+    current_daily_minutes = adjusted_time.hour * 60 + adjusted_time.minute
 
-    period_to = period_from[1:]
-    period_to.append(period_to[-1] + timedelta(minutes=15))
-    period_to_iso = [dt.strftime("%Y-%m-%dT%H:%M:%SZ") for dt in period_to]
-    df.insert(loc=2, column="periodTo", value=period_to_iso)
+    df_today = df[df['minutes_in_day'] >= current_daily_minutes]
+    df_today = df_today.copy()
+    df_today.loc[:, 'periodFrom'] = pd.to_datetime(adjusted_time.strftime('%Y-%m-%d ') + df_today['slot'])
+
+    df_tomorrow = df[df['minutes_in_day'] < current_daily_minutes]
+    df_tomorrow = df_tomorrow.copy()
+    df_tomorrow.loc[:, 'periodFrom'] = pd.to_datetime((adjusted_time+timedelta(days=1)).strftime('%Y-%m-%d ') + df_tomorrow['slot'])
+
+    df = pd.concat([df_today, df_tomorrow], ignore_index=True)
+    df['periodTo'] = df['periodFrom'] + pd.Timedelta(minutes=15)
+    df.insert(loc=0, column='assetPortfolioId', value=p_id)
+
+    # assetPortfolioId, periodFrom, periodTo, quantity, quantityType
+    df = df[['assetPortfolioId', 'periodFrom', 'periodTo', 'quantity', 'quantityType']]
+
     return df
 
 
@@ -74,7 +82,8 @@ if __name__ == "__main__":
 
     # Update baselines
     for p in fsp.portfolios:
-        df = create_dataframe_for_portfolio_baseline(p['id'], cfg['utils']['baselineProfileFile'])
+        df = create_dataframe_for_portfolio_baseline(p['id'], cfg['utils']['baselineProfileFile'],
+                                                     cfg['utils']['baselineShiftMinutes'])
         fsp.update_baselines(p['id'], df)
 
     logger.info('Ending program')

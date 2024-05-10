@@ -30,35 +30,21 @@ class FMO:
         self.ledger = ledger
         self.pgi = pgi
 
-    def add_entry_to_ledger(self, timeslot, player, portfolio, case, data):
+    def add_entry_to_ledger(self, timeslot, player, portfolio, features):
         if portfolio is None:
             portfolio_id = 'none'
             price = 0.0
         else:
-            portfolio_id = portfolio.id
-            price = data['price']
+            portfolio_id = portfolio
+            price = float(features['unitPrice'])
 
-        # now = pd.Timestamp.now()
-        # new_entry = pd.DataFrame({
-        #     'market_timeslot': [pd.Timestamp.fromtimestamp(timeslot)],
-        #     'created_at': [now],
-        #     'player': [player.id],
-        #     'role': [player.cfg['role']],
-        #     'portfolio': [portfolio_id],
-        #     'case': [case],
-        #     'amount': [data['amount']],
-        #     'unit': [data['unit']],
-        #     'price': [price]
-        # })
-        #
-        # # Append the new row to the DataFrame
-        # self.ledger = pd.concat([self.ledger, new_entry], ignore_index=True)
-
-        sql = ('INSERT INTO fm_changelog.market_ledger ' \
-              '(timeslot_market, player_id, player_role, portfolio_id, activity, amount, unit, price) VALUES' \
-              '(\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\')' %
-               (pd.Timestamp.fromtimestamp(timeslot), player.id, player.cfg['role'], portfolio_id, case,
-                data['amount'], data['unit'], price))
+        sql = ('INSERT INTO market_ledger ' \
+              '(timeslot_market, player_id, player_role, portfolio_id, side, regulation, flexibility_quantity, '
+               'flexibility_unit, price, currency) VALUES' \
+              '(\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\')' %
+               (timeslot, player.cfg['id'], player.cfg['role'], portfolio_id, features['side'],
+                features['regulationType'], features['quantity'], 'MW', float(price),
+                features['currency']))
         cur = self.pgi.conn.cursor()
         cur.execute(sql)
         cur.close()

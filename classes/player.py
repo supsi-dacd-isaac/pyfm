@@ -1,5 +1,5 @@
 # import section
-import sys
+import random
 from datetime import datetime, timedelta
 
 from classes.nodes_interface import NODESInterface
@@ -73,7 +73,14 @@ class Player:
         else:
             return []
 
+    def get_random_quantity(self):
+        index = random.randint(0, len(self.cfg['orderSection']['quantities']) - 1)
+        return self.cfg['orderSection']['quantities'][index]
+
     def demand_flexibility(self, dt):
+        # Get demanded quantity
+        demanded_flexibility = self.get_random_quantity()
+
         # Get the node id configured to demand flexibility
         node_id = None
         for n in self.grid_nodes:
@@ -87,11 +94,17 @@ class Player:
             "validTo": (dt+timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "marketId": self.markets[0]['id'],
             "gridNodeId": node_id,
+            "quantity": demanded_flexibility,
         }
         body.update(self.cfg['orderSection']['mainSettings'])
-        return self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
+        response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
+        if response is True:
+            return body
+        else:
+            return response
 
     def sell_flexibility(self, dt, p_id, dso_demand):
+        selling_result = {}
         for k_regulation_type in dso_demand.keys():
             quantity_to_sell = self.calculate_quantity_to_sell_basic(dt, dso_demand[k_regulation_type],
                                                                      self.baselines[p_id]['quantity'])
@@ -110,7 +123,14 @@ class Player:
                     "quantity": quantity_to_sell,
                 }
                 body.update(self.cfg['orderSection']['mainSettings'])
-                self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
+                response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
+                if response is True:
+                    selling_result[k_regulation_type] = body
+                else:
+                    selling_result[k_regulation_type] = False
+            else:
+                selling_result[k_regulation_type] = False
+        return selling_result
 
     def print_user_info(self, user_info):
         self.logger.info('user id: %s' % user_info['user']['id'])
