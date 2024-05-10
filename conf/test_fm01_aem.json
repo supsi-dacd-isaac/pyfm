@@ -33,7 +33,7 @@
           "name": "SUPSI",
           "role": "fsp",
           "baselines": {
-            "tmpFolder": "/home/dstreppa/development/python/pyfm/data/tmp",
+            "tmpFolder": "../data/tmp",
             "fromBeforeNowHours": 12,
             "toAfterNowHours": 12
           },
