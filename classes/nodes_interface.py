@@ -30,7 +30,7 @@ class NODESInterface:
 
             # Check if the already existing token is working
             r = self.get_user_info()
-            if 'StatusCode' in r.keys() and  r['StatusCode'] != http.HTTPStatus.OK:
+            if 'invalid_token' in r['title']:
                 self.logger.warning('Local token is expired, a new token will be requested to NODES API')
                 os.unlink(tkn_file_name)
                 self.get_new_token(player_cfg, tkn_file_name)
