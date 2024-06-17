@@ -91,17 +91,18 @@ if __name__ == "__main__":
     # Get quantities demanded by the DSO in the
     dso_demand = dso.get_flexibility_quantities(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
 
-    # Get baselines
+    # Set current baselins for FSP
     fsp.set_baselines(slot_time)
 
     # FMO object
     fmo = FMO({}, logger, pgi)
 
     # Place orders
-    for p in fsp.portfolios:
-        resp_selling = fsp.sell_flexibility(slot_time, p['id'], dso_demand)
+    for p_k in fsp.portfolios.keys():
+        resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
         for k in resp_selling.keys():
             if resp_selling[k] is not False:
-                fmo.add_entry_to_ledger(timeslot=slot_time, player=fsp, portfolio=p['name'], features=resp_selling[k])
+                fmo.add_entry_to_ledger(timeslot=slot_time, player=fsp, portfolio=fsp.portfolios[p_k].metadata['name'],
+                                        features=resp_selling[k])
 
     logger.info('Ending program')

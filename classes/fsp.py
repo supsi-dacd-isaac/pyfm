@@ -66,17 +66,17 @@ class FSP(Player):
         to_str = slot_time_to.strftime('%Y-%m-%dT%H:%M:%SZ')
 
         bs = {}
-        for p in self.portfolios:
+        for p_k in self.portfolios.keys():
             res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
                                                              'BaselineIntervals?assetPortfolioId=%s&'
                                                              'periodFrom.GreaterThanOrEqual=%s&'
                                                              'periodFrom.LessThanOrEqual=%s&'
-                                                             'orderBy=PeriodFrom Asc' % (p['id'], from_str, to_str)))
+                                                             'orderBy=PeriodFrom Asc' % (p_k, from_str, to_str)))
             df = pd.DataFrame(res['items'])
             df['periodFrom'] = pd.to_datetime(df['periodFrom'], utc=True).dt.strftime('%Y-%m-%dT%H:%M:%SZ')
             df.set_index('periodFrom', inplace=True)
 
-            bs[p['id']] = df
+            bs[p_k] = df
         self.baselines = bs
 
     def update_baselines(self, portfolio_id, baseline_dataframe):
