@@ -153,24 +153,29 @@ class Player:
         orders = self.get_orders(filter_dict=filter_dict)
 
         quantity_up = 0.0
-        quantity_down = 0.0
+        quantity_dn = 0.0
         for order in orders:
             # Only not-settled order will be considered
             if order['completionType'] is None:
                 if order['regulationType'] == 'Down':
-                    quantity_down += float(order['quantity'])
+                    quantity_dn += float(order['quantity'])
                 elif order['regulationType'] == 'Up':
                     quantity_up += float(order['quantity'])
 
-        self.logger.info('Flexibility quantities (%s): UP = %.3f, DOWN = %.3f' % (quantity_type, quantity_up, quantity_down))
-        return {'Up': quantity_up, 'Down': quantity_down}
+        quantity_up = round(quantity_up, 3)
+        quantity_dn = round(quantity_dn, 3)
+        self.logger.info('Flexibility demanded by the DSO (%s): Up = %.3f MW, Down = %.3f MW' % (quantity_type,
+                                                                                                 quantity_up,
+                                                                                                 quantity_dn))
+        return {'Up': quantity_up, 'Down': quantity_dn}
 
     def calculate_quantity_to_sell_basic(self, timeslot, demand, baseline_time_series):
         if demand > 0:
             # Basic approach, only the baseline value of the timeslot is taking into account,
             # past and and future are not considered
             baseline = baseline_time_series.loc[timeslot.strftime('%Y-%m-%dT%H:%M:%SZ')]
-            marketable_quantity = baseline * self.cfg['orderSection']['quantityPercBaseline'] / 1e2
+            self.logger.info('Baseline: %.3f MW (%i%% to be sold)' % (baseline, self.cfg['orderSection']['quantityPercBaseline']))
+            marketable_quantity = round(baseline * self.cfg['orderSection']['quantityPercBaseline'] / 1e2, 3)
 
             if marketable_quantity <= demand:
                 # Everything is sold
