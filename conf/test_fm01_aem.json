@@ -27,7 +27,7 @@
           "quantities": [0.005, 0.008, 0.01, 0.013, 0.015, 0.018, 0.02, 0.023, 0.025, 0.028, 0.03],
           "mainSettings": {
             "side": "Buy",
-            "regulationType": "Down",
+            "regulationType": "Up",
             "unitPrice": 10,
             "priceType": "Limit",
             "currency": "CHF",
