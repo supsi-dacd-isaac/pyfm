@@ -1,9 +1,11 @@
 # import section
 import os
-
 import pandas as pd
-from classes.player import Player
 from datetime import datetime, timedelta
+
+from classes.asset import Asset
+from classes.player import Player
+from classes.portfolio import Portfolio
 
 
 class FSP(Player):
@@ -22,12 +24,38 @@ class FSP(Player):
         self.nodes_id = res['items'][0]['id']
 
         # Portfolios owned by the FSP
-        self.portfolios = self.get_portfolios()['items']
-        self.assets = self.get_assets()['items']
+        self.portfolios = {}
+        for p in self.get_portfolios()['items']:
+            self.portfolios[p['id']] = Portfolio(p['id'], p)
+
+        # Asset owned by the FSP
+        self.assets = {}
+        for a in self.get_assets()['items']:
+            self.assets[a['id']] = Asset(a['id'], a)
 
         # Get asset assigned to portfolios
-        self.assets_portfolios_assignments = self.get_assets_portfolios_assignments()
+        self.assets_ids, self.assets_mpids = self.get_assets_portfolios_assignments()
+
+        # Assign MPID to assets
+        self.set_assets_mpids()
+
+        # Assign assets to portfolios
+        self.set_portfolios_assets()
+
+        # Baselines
         self.baselines = {}
+
+    def set_assets_mpids(self):
+        for k_p in self.portfolios.keys():
+            for a_id in self.assets_ids[k_p]:
+                self.assets[a_id].set_mpid(self.assets_mpids[k_p][a_id])
+
+    def set_portfolios_assets(self):
+        for k_p in self.portfolios.keys():
+            tmp_assets = []
+            for a_id in self.assets_ids[k_p]:
+                tmp_assets.append(self.assets[a_id])
+            self.portfolios[k_p].set_assets(tmp_assets)
 
     def set_baselines(self, slot_time):
         # slot_time_to = slot_time + timedelta(minutes=granularity)
@@ -68,17 +96,24 @@ class FSP(Player):
             tmp_assets_grid_assignments[elem['id']] = elem
 
         tmp_assets_portfolios_assignments = {}
-        for p in self.portfolios:
-            tmp_assets_portfolios_assignments[p['id']] = self.get_assets_assigned_to_portfolio(p['id'])
+        for p_k in self.portfolios.keys():
+            tmp_assets_portfolios_assignments[p_k] = self.get_assets_assigned_to_portfolio(p_k)
 
         # Cycle over the portfolios that have at least an assignment
-        assets_portfolios_assignments = {}
+        # assets_portfolios_assignments = {}
+        assets_mpids = {}
+        assets_ids = {}
         for k_p in tmp_assets_portfolios_assignments.keys():
+            assets_mpids[k_p] = {}
+            assets_ids[k_p] = []
             # Cycle over the asset assigned to the portfolio
             for p_assignment in tmp_assets_portfolios_assignments[k_p]['items']:
                 asset_id = tmp_assets_grid_assignments[p_assignment['assetGridAssignmentId']]['assetId']
-                assets_portfolios_assignments[asset_id] = k_p
-        return assets_portfolios_assignments
+                # assets_portfolios_assignments[asset_id] = k_p
+                # assets_mpids[k_p].append(tmp_assets_grid_assignments[p_assignment['assetGridAssignmentId']]['mpid'])
+                assets_mpids[k_p][asset_id] = tmp_assets_grid_assignments[p_assignment['assetGridAssignmentId']]['mpid']
+                assets_ids[k_p].append(asset_id)
+        return assets_ids, assets_mpids
 
     def get_organization_id(self):
         res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],

@@ -1,8 +1,16 @@
 {
   "connectionsFile": "../conf/private/conns.json",
-  "utils": {
-    "baselineProfileFile": "../data/baselines/example01.csv",
-    "baselineShiftMinutes": 30
+  "baseline": {
+    "case": "from_db",
+    "shiftMinutes": 30,
+    "fileSettings": {
+      "profileFile": "../data/baselines/example01.csv"
+    },
+    "dbSettings": {
+      "upcomingHoursToQuery": 24,
+      "daysToGoBack": 7,
+      "timeGrouping": "15m"
+    }
   },
   "fm": {
     "granularity": 15,

@@ -165,11 +165,11 @@ class Player:
         self.logger.info('Flexibility quantities (%s): UP = %.3f, DOWN = %.3f' % (quantity_type, quantity_up, quantity_down))
         return {'Up': quantity_up, 'Down': quantity_down}
 
-    def calculate_quantity_to_sell_basic(self, timeslot, demand, baseline_time_seris):
+    def calculate_quantity_to_sell_basic(self, timeslot, demand, baseline_time_series):
         if demand > 0:
             # Basic approach, only the baseline value of the timeslot is taking into account,
             # past and and future are not considered
-            baseline = baseline_time_seris.loc[timeslot.strftime('%Y-%m-%dT%H:%M:%SZ')]
+            baseline = baseline_time_series.loc[timeslot.strftime('%Y-%m-%dT%H:%M:%SZ')]
             marketable_quantity = baseline * self.cfg['orderSection']['quantityPercBaseline'] / 1e2
 
             if marketable_quantity <= demand:

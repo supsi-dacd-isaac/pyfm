@@ -1,4 +1,5 @@
 .idea
 .venv
+conf/private/*.json
 data/tmp/*
 tkns/*
