@@ -86,11 +86,12 @@ class NODESInterface:
 
     def get_request(self, endpoint):
         try:
-            response = requests.get(endpoint, headers=self.headers)
+            self.logger.info('GET endpoint: %s' % endpoint)
+            response = requests.get(endpoint, headers=self.headers, timeout=self.cfg['requestTimeout'])
             if response.status_code == http.HTTPStatus.OK:
-                self.logger.info('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+                self.logger.info('GET endpoint: %s, status code: %i' % (endpoint, response.status_code))
             else:
-                self.logger.warning('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+                self.logger.warning('GET endpoint: %s, status code: %i' % (endpoint, response.status_code))
             return json.loads(response.text)
         except Exception as e:
             self.logger.error('EXCEPTION: %s' % str(e))
@@ -109,30 +110,32 @@ class NODESInterface:
             return False
 
     def post_csv_file_request(self, endpoint, tmp_baseline_file):
+        self.logger.info    ('POST Endpoint: %s' % endpoint)
         try:
             headers = self.headers
             headers['accept'] = 'application/json'
-            files = { 'file': (tmp_baseline_file.split(os.sep)[-1], open(tmp_baseline_file, 'rb'), 'text/csv') }
-            response = requests.post(endpoint, headers=headers, files=files)
+            files = {'file': (tmp_baseline_file.split(os.sep)[-1], open(tmp_baseline_file, 'rb'), 'text/csv')}
+            response = requests.post(endpoint, headers=headers, files=files, timeout=self.cfg['requestTimeout'])
 
             if response.status_code == http.HTTPStatus.OK:
-                self.logger.info('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+                self.logger.info('POST Endpoint: %s, status code: %i' % (endpoint, response.status_code))
             else:
-                self.logger.warning('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+                self.logger.warning('POST Endpoint: %s, status code: %i' % (endpoint, response.status_code))
             return json.loads(response.text)
         except Exception as e:
             self.logger.error('EXCEPTION: %s' % str(e))
             return False
 
     def post_request(self, endpoint, data):
-        self.logger.info('Body request: %s' % data)
+        self.logger.info('POST Endpoint: %s' % endpoint)
+        self.logger.info('POST Body request: %s' % data)
         try:
-            response = requests.post(endpoint, headers=self.headers, json=data)
+            response = requests.post(endpoint, headers=self.headers, json=data, timeout=self.cfg['requestTimeout'])
             if response.status_code == http.HTTPStatus.OK:
-                self.logger.info('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+                self.logger.info('POST Endpoint: %s, status code: %i' % (endpoint, response.status_code))
             else:
-                self.logger.warning('Endpoint: %s, status code: %i' % (endpoint, response.status_code))
-            self.logger.info('Body response: %s' % response.text)
+                self.logger.warning('POST Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+            self.logger.info('POST Body response: %s' % response.text)
             return response.ok
         except Exception as e:
             self.logger.error('EXCEPTION: %s' % str(e))

@@ -7,11 +7,11 @@ class DSO(Player):
     DSO (Flexibility Service Provider) class
     """
 
-    def __init__(self, dso_cfg, nodes_cfg, logger):
+    def __init__(self, dso_cfg, main_cfg, logger):
         """
         Constructor
         """
-        super().__init__(dso_cfg, nodes_cfg, logger)
+        super().__init__(dso_cfg, main_cfg, logger)
 
         # Get identifier of NODES platform
         res = self.get_grid_areas()

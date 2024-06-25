@@ -1,5 +1,6 @@
 # import section
 import os
+import copy
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -13,11 +14,11 @@ class FSP(Player):
     FSP (Flexibility Service Provider) class
     """
 
-    def __init__(self, fsp_cfg, nodes_cfg, logger):
+    def __init__(self, fsp_cfg, main_cfg, logger):
         """
         Constructor
         """
-        super().__init__(fsp_cfg, nodes_cfg, logger)
+        super().__init__(fsp_cfg, main_cfg, logger)
 
         # Get identifier of NODES platform
         res = self.get_organization_id()
@@ -79,7 +80,7 @@ class FSP(Player):
             bs[p_k] = df
         self.baselines = bs
 
-    def update_baselines(self, portfolio_id, baseline_dataframe):
+    def update_portfolio_baseline(self, portfolio_id, baseline_dataframe):
         tmp_baseline_file = '%s%s%s.csv' % (self.cfg['baselines']['tmpFolder'], os.sep, portfolio_id)
         baseline_dataframe.to_csv(tmp_baseline_file, index=False)
 
@@ -154,7 +155,82 @@ class FSP(Player):
         to_dt = from_dt + timedelta(days=days)
         return from_dt.strftime('%Y-%m-%dT%H:%M:%SZ'), to_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
 
+    def update_baselines(self, bs_cfg):
+        current_time = datetime.utcnow()
+        adjusted_time = (current_time.replace(minute=(current_time.minute // 15) * 15, second=0, microsecond=0) +
+                         timedelta(minutes=bs_cfg['shiftMinutes']))
 
+        # Cycle over the portfolios
+        for k_p in self.portfolios.keys():
+
+            if bs_cfg['source'] == 'file':
+                df = self.create_df_baseline_from_file(self.portfolios[k_p], adjusted_time, bs_cfg['fileSettings'])
+            elif bs_cfg['source'] == 'db':
+                df = self.create_df_baseline_from_db(self.portfolios[k_p], adjusted_time, bs_cfg['dbSettings'])
+            else:
+                self.logger.error('Baseline source option \'%s\' not available' % bs_cfg['source'])
+                return False
+            self.update_portfolio_baseline(k_p, df)
+        return True
+
+    def create_df_baseline_from_db(self, portfolio, adjusted_time, bs_cfg):
+        start_dt = adjusted_time - timedelta(days=bs_cfg['daysToGoBack'])
+        start_dt_str = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_dt_str = (start_dt+timedelta(hours=bs_cfg['upcomingHoursToQuery'])).strftime('%Y-%m-%dT%H:%M:%SZ')
+        str_mpids = '('
+        for mpid in portfolio.get_assets_mpids():
+            str_mpids = '%s OR site_name=\'%s\'' % (str_mpids, mpid)
+        str_mpids = '%s)' % str_mpids.replace('( OR ', '(')
+
+        query = ("SELECT sum(import) AS portfolio_cons, sum(export) AS portfolio_exp from %s WHERE "
+                 "time>='%s' AND time<'%s' AND %s GROUP BY time(%im)") % (self.main_cfg['influxDB']['measurement'],
+                                                                          start_dt_str, end_dt_str, str_mpids,
+                                                                          self.main_cfg['fm']['granularity'])
+        self.logger.info('Query: %s' % query)
+        try:
+            res = self.influx_client.query(query)
+            df_data = res[self.main_cfg['influxDB']['measurement']]
+            df_data_bs = copy.deepcopy(df_data)
+            df_data_bs.index = df_data_bs.index + pd.DateOffset(days=bs_cfg['daysToGoBack'])
+
+            # Handle columns and indexes
+            df_data_bs['periodFrom'] = df_data_bs.index
+            df_data_bs['periodTo'] = df_data_bs['periodFrom'] + pd.Timedelta(minutes=self.main_cfg['fm']['granularity'])
+            df_data_bs.insert(loc=0, column='assetPortfolioId', value=portfolio.id)
+            df_data_bs.insert(loc=1, column='quantityType', value='Power')
+            df_data_bs.rename(columns={'portfolio_cons': 'quantity'}, inplace=True)
+            df_data_bs['quantity'] = df_data_bs['quantity'] / 1e3
+            df_data_bs.reset_index(drop=True, inplace=True)
+
+            df_data_bs = df_data_bs[['assetPortfolioId', 'periodFrom', 'periodTo', 'quantity', 'quantityType']]
+            return df_data_bs
+        except Exception as e:
+            self.logger.error('EXCEPTION: %s' % str(e))
+            return None
+
+    def create_df_baseline_from_file(self, portfolio, adjusted_time, bs_file_cfg):
+        df = pd.read_csv(bs_file_cfg['profileFile'])
+
+        df['slot_dt'] = pd.to_datetime(df['slot'], format='%H:%M')
+        df['minutes_in_day'] = df['slot_dt'].dt.hour * 60 + df['slot_dt'].dt.minute
+        current_daily_minutes = adjusted_time.hour * 60 + adjusted_time.minute
+
+        df_today = df[df['minutes_in_day'] >= current_daily_minutes]
+        df_today = df_today.copy()
+        df_today.loc[:, 'periodFrom'] = pd.to_datetime(adjusted_time.strftime('%Y-%m-%d ') + df_today['slot'])
+
+        df_tomorrow = df[df['minutes_in_day'] < current_daily_minutes]
+        df_tomorrow = df_tomorrow.copy()
+        df_tomorrow.loc[:, 'periodFrom'] = pd.to_datetime((adjusted_time+timedelta(days=1)).strftime('%Y-%m-%d ') + df_tomorrow['slot'])
+
+        df = pd.concat([df_today, df_tomorrow], ignore_index=True)
+        df['periodTo'] = df['periodFrom'] + pd.Timedelta(minutes=15)
+        df.insert(loc=0, column='assetPortfolioId', value=portfolio.id)
+
+        # assetPortfolioId, periodFrom, periodTo, quantity, quantityType
+        df = df[['assetPortfolioId', 'periodFrom', 'periodTo', 'quantity', 'quantityType']]
+
+        return df
 
 
 

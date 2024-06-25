@@ -1,15 +1,14 @@
 {
   "connectionsFile": "../conf/private/conns.json",
   "baseline": {
-    "case": "from_db",
+    "source": "db",
     "shiftMinutes": 30,
     "fileSettings": {
       "profileFile": "../data/baselines/example01.csv"
     },
     "dbSettings": {
       "upcomingHoursToQuery": 24,
-      "daysToGoBack": 7,
-      "timeGrouping": "15m"
+      "daysToGoBack": 7
     }
   },
   "fm": {
@@ -22,9 +21,18 @@
         "id": "AEM",
         "name": "Switzerland",
         "role": "dso",
+        "flexibilitySource": "db",
         "orderSection": {
           "nodeName": "Massagno_1",
-          "quantities": [0.005, 0.008, 0.01, 0.013, 0.015, 0.018, 0.02, 0.023, 0.025, 0.028, 0.03],
+          "quantities": {
+            "random": [0.005, 0.008, 0.01, 0.013, 0.015, 0.018, 0.02, 0.023, 0.025, 0.028, 0.03],
+            "db": {
+              "fields":["CH2ActivePowL1", "CH2ActivePowL2", "CH2ActivePowL3"],
+              "community": "ECM",
+              "device": "sgim",
+              "daysToGoBack": 7
+            }
+          },
           "mainSettings": {
             "side": "Buy",
             "regulationType": "Up",

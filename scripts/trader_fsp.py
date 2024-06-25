@@ -74,12 +74,12 @@ if __name__ == "__main__":
 
     # Actors definition
     # DSO
-    dso = DSO(cfg['fm']['actors']['dso'], cfg['nodesAPI'], logger)
+    dso = DSO(cfg['fm']['actors']['dso'], cfg, logger)
     dso.set_organization(filter_dict={'name': dso.cfg['id']})
     slot_time = dso.get_adjusted_time(cfg['fm']['granularity'], cfg['fm']['ordersTimeShift'])
 
     # FSP
-    fsp = FSP(cfg['fm']['actors']['fsps'][fsp_identifier], cfg['nodesAPI'], logger)
+    fsp = FSP(cfg['fm']['actors']['fsps'][fsp_identifier], cfg, logger)
     user_info = fsp.nodes_interface.get_user_info()
 
     fsp.set_markets(filter_dict={'name': cfg['fm']['marketName']})

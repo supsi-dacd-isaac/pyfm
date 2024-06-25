@@ -1,6 +1,8 @@
 # import section
 import random
+import sys
 from datetime import datetime, timedelta
+from influxdb import DataFrameClient
 
 from classes.nodes_interface import NODESInterface
 
@@ -10,18 +12,33 @@ class Player:
     Player (Flexibility Service Provider) class
     """
 
-    def __init__(self, player_cfg, nodes_cfg, logger):
+    def __init__(self, player_cfg, main_cfg, logger):
         """
         Constructor
         """
         self.cfg = player_cfg
+        self.main_cfg = main_cfg
         self.logger = logger
-        self.nodes_interface = NODESInterface(nodes_cfg, logger)
+        self.nodes_interface = NODESInterface(main_cfg['nodesAPI'], logger)
         self.nodes_interface.set_token(player_cfg)
         self.markets = []
         self.grid_nodes = []
         self.organization = None
         self.grid_area = None
+
+        self.logger.info('Connection to InfluxDb server on socket [%s:%s]' % (main_cfg['influxDB']['host'],
+                                                                              main_cfg['influxDB']['port']))
+        try:
+            self.influx_client = DataFrameClient(host=main_cfg['influxDB']['host'],
+                                                 port=main_cfg['influxDB']['port'],
+                                                 password=main_cfg['influxDB']['password'],
+                                                 username=main_cfg['influxDB']['user'],
+                                                 database=main_cfg['influxDB']['database'],
+                                                 ssl=main_cfg['influxDB']['ssl'])
+        except Exception as e:
+            self.logger.error('EXCEPTION: %s' % str(e))
+            sys.exit(3)
+        self.logger.info('Connection successful')
 
     def set_markets(self, filter_dict=None):
         self.markets = self.get_nodes_api_info('markets', filter_dict)
@@ -73,13 +90,16 @@ class Player:
         else:
             return []
 
-    def get_random_quantity(self):
-        index = random.randint(0, len(self.cfg['orderSection']['quantities']) - 1)
-        return self.cfg['orderSection']['quantities'][index]
-
-    def demand_flexibility(self, dt):
+    def demand_flexibility(self, dt_slot):
         # Get demanded quantity
-        demanded_flexibility = self.get_random_quantity()
+        if self.cfg['flexibilitySource'] == 'random':
+            demanded_flexibility = self.get_random_quantity()
+        elif self.cfg['flexibilitySource'] == 'db':
+            demanded_flexibility = self.get_quantity_from_db(dt_slot)
+        else:
+            self.logger.error('Option \'%s\' not available for demanding flexibility '
+                              'strategy' % self.cfg['flexibilitySource'])
+            return False
 
         # Get the node id configured to demand flexibility
         node_id = None
@@ -89,9 +109,9 @@ class Player:
 
         body = {
             "ownerOrganizationId": self.organization['id'],
-            "periodFrom": dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            "periodTo": (dt+timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ'),
-            "validTo": (dt+timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "periodFrom": dt_slot.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "periodTo": (dt_slot+timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            "validTo": (dt_slot+timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ'),
             "marketId": self.markets[0]['id'],
             "gridNodeId": node_id,
             "quantity": demanded_flexibility,
@@ -102,6 +122,36 @@ class Player:
             return body
         else:
             return response
+
+    def get_random_quantity(self):
+        index = random.randint(0, len(self.cfg['orderSection']['quantities']['random']) - 1)
+        return self.cfg['orderSection']['quantities']['random'][index]
+
+    def get_quantity_from_db(self, dt_slot):
+        start_dt = dt_slot - timedelta(days=self.cfg['orderSection']['quantities']['db']['daysToGoBack'])
+        start_dt_str = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        end_dt_str = (start_dt + timedelta(minutes=self.main_cfg['fm']['granularity'])).strftime('%Y-%m-%dT%H:%M:%SZ')
+        str_fields = ''
+        for f in self.cfg['orderSection']['quantities']['db']['fields']:
+            str_fields = '%s mean(%s),' % (str_fields, f)
+        str_fields = str_fields[1:-1]
+
+        query = ("SELECT %s from %s WHERE energy_community=\'%s\' AND device_name=\'%s\' AND time>='%s' AND time<'%s' "
+                 "GROUP BY time(%im)") % (str_fields, self.main_cfg['influxDB']['measurement'],
+                                          self.cfg['orderSection']['quantities']['db']['community'],
+                                          self.cfg['orderSection']['quantities']['db']['device'],
+                                          start_dt_str,
+                                          end_dt_str,
+                                          self.main_cfg['fm']['granularity'])
+
+        self.logger.info('Query: %s' % query)
+        try:
+            res = self.influx_client.query(query)
+            df_data = res[self.main_cfg['influxDB']['measurement']]
+            return round(df_data.sum(axis=1).values[0]/1e3, 3)
+        except Exception as e:
+            self.logger.error('EXCEPTION: %s' % str(e))
+            return False
 
     def sell_flexibility(self, dt, p_id, dso_demand):
         selling_result = {}

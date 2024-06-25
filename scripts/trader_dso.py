@@ -47,7 +47,7 @@ if __name__ == "__main__":
     # Market main parameters
 
     # DSO
-    dso = DSO(cfg['fm']['actors']['dso'], cfg['nodesAPI'], logger)
+    dso = DSO(cfg['fm']['actors']['dso'], cfg, logger)
     user_info = dso.nodes_interface.get_user_info()
 
     dso.set_markets(filter_dict={'name': cfg['fm']['marketName']})
@@ -66,6 +66,7 @@ if __name__ == "__main__":
     # Place order
     resp_demand = dso.demand_flexibility(slot_time)
     if resp_demand is not False:
+        logger.info('Requested flexibility: %.3f MW (type=%s)' % (resp_demand['quantity'], resp_demand['regulationType']))
         fmo.add_entry_to_ledger(timeslot=slot_time, player=dso, portfolio=None, features=resp_demand)
 
     logger.info('Ending program')
