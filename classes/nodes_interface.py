@@ -141,3 +141,33 @@ class NODESInterface:
             self.logger.error('EXCEPTION: %s' % str(e))
             return False
 
+    def put_request(self, endpoint, data):
+        self.logger.info('PUT Endpoint: %s' % endpoint)
+        self.logger.info('PUT Body request: %s' % data)
+        try:
+            response = requests.put(endpoint, headers=self.headers, json=data, timeout=self.cfg['requestTimeout'])
+            if response.status_code == http.HTTPStatus.OK:
+                self.logger.info('PUT Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+            else:
+                self.logger.warning('PUT Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+            self.logger.info('PUT Body response: %s' % response.text)
+            return response.ok
+        except Exception as e:
+            self.logger.error('EXCEPTION: %s' % str(e))
+            return False
+
+    def patch_request(self, endpoint, data):
+        self.logger.info('PATCH Endpoint: %s' % endpoint)
+        self.logger.info('PATCH Body request: %s' % data)
+        try:
+            response = requests.patch(endpoint, headers=self.headers, json=data, timeout=self.cfg['requestTimeout'])
+            if response.status_code == http.HTTPStatus.OK:
+                self.logger.info('PATCH Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+            else:
+                self.logger.warning('PATCH Endpoint: %s, status code: %i' % (endpoint, response.status_code))
+            self.logger.info('PATCH Body response: %s' % response.text)
+            return response.ok
+        except Exception as e:
+            self.logger.error('EXCEPTION: %s' % str(e))
+            return False
+

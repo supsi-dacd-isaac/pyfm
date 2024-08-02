@@ -75,6 +75,9 @@ class Player:
     def get_orders(self, filter_dict=None):
         return self.get_nodes_api_info('orders', filter_dict)
 
+    def get_contracts(self, filter_dict=None):
+        return self.get_nodes_api_info('longflexcontracts', filter_dict)
+
     def get_nodes_api_info(self, request_type, filter_dict=None):
         if filter_dict is not None:
             filter_str = '?'
@@ -118,10 +121,7 @@ class Player:
         }
         body.update(self.cfg['orderSection']['mainSettings'])
         response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
-        if response is True:
-            return body
-        else:
-            return response
+        return self.handle_response(response, body)
 
     def get_random_quantity(self):
         index = random.randint(0, len(self.cfg['orderSection']['quantities']['random']) - 1)
@@ -222,7 +222,7 @@ class Player:
     def calculate_quantity_to_sell_basic(self, timeslot, demand, baseline_time_series):
         if demand > 0:
             # Basic approach, only the baseline value of the timeslot is taking into account,
-            # past and and future are not considered
+            # past and future are not considered
             baseline = baseline_time_series.loc[timeslot.strftime('%Y-%m-%dT%H:%M:%SZ')]
             self.logger.info('Baseline: %.3f MW (%i%% to be sold)' % (baseline, self.cfg['orderSection']['quantityPercBaseline']))
             marketable_quantity = round(baseline * self.cfg['orderSection']['quantityPercBaseline'] / 1e2, 3)
@@ -236,3 +236,9 @@ class Player:
         else:
             return 0.0
 
+    @staticmethod
+    def handle_response(response, body):
+        if response is True:
+            return body
+        else:
+            return response

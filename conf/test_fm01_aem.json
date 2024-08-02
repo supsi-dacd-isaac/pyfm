@@ -21,7 +21,7 @@
         "id": "AEM",
         "name": "Switzerland",
         "role": "dso",
-        "flexibilitySource": "db",
+        "flexibilitySource": "random",
         "orderSection": {
           "nodeName": "Massagno_1",
           "quantities": {
@@ -41,12 +41,45 @@
             "currency": "CHF",
             "fillType": "Normal"
           }
+        },
+        "contractSection": {
+          "mainSettings": {
+            "unitPrice": 100,
+            "availabilityPrice": 50,
+            "crontab": "* 9-12,13-17 * 7,8 1,2,3,4,5",
+            "crontabSummertimeCooling": "* 9-12,13-17 * 7,8 1,2,3,4,5"
+          }
         }
       },
       "fsps": {
         "supsi01": {
           "id": "SUPSI",
           "name": "SUPSI",
+          "role": "fsp",
+          "baselines": {
+            "tmpFolder": "../data/tmp",
+            "fromBeforeNowHours": 12,
+            "toAfterNowHours": 12
+          },
+          "orderSection": {
+            "quantityPercBaseline": 50,
+            "mainSettings": {
+              "side": "Sell",
+              "unitPrice": 10,
+              "priceType": "Limit",
+              "currency": "CHF",
+              "fillType": "Normal"
+            }
+          },
+          "contractSection": {
+            "mainSettings": {
+              "autoCreateExpiry": 7200
+            }
+          }
+        },
+        "supsi02": {
+          "id": "SUPSI2",
+          "name": "SUPSI2",
           "role": "fsp",
           "baselines": {
             "tmpFolder": "../data/tmp",

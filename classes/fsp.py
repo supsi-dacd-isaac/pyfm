@@ -232,5 +232,25 @@ class FSP(Player):
 
         return df
 
+    def propose_contract(self, dt_slot, contract_request):
+        body = {
+            "approvedBySeller": True,
+            "autoCreateOrders": True,
+            "autoCreateExpiryRelativeTo": "PeriodFrom",
+            "quantity": contract_request['quantity'],
+            "unitPrice": contract_request['unitPrice'],
+            "availabilityPrice": contract_request['availabilityPrice'],
+            "autoCreateExpiry": self.cfg['contractSection']['mainSettings']['autoCreateExpiry'],
+            "baseContractId": contract_request['id'],
+            "name": 'contract_proposal_%s_%s' % (self.cfg['id'], dt_slot.strftime('%Y%m%d')),
+            "comments": "",
+            "periodFrom": contract_request['periodFrom'],
+            "periodTo": contract_request['periodTo'],
+            "sellerOrganizationId": self.organization['id'],
+            "assetPortfolioId": list(self.portfolios.keys())[0],
+            "crontab": contract_request['crontab']
+        }
 
-
+        response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
+                                                               'longflexcontracts'), body)
+        return self.handle_response(response, body)
