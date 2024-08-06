@@ -7,6 +7,7 @@ import json
 from datetime import timedelta
 
 from classes.dso import DSO
+from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 
 
@@ -61,6 +62,7 @@ if __name__ == "__main__":
                                                         'periodTo': (slot_time + timedelta(days=14)).strftime('%Y-%m-%dT00:00:00Z')
                                                        })
 
+    fmo = FMO({}, logger, pgi)
     for contract_request in contracts_requests:
         if 'request' in contract_request['name'] and contract_request['baseContractId'] is None:
             # Get the id of the contract proposal
@@ -68,7 +70,7 @@ if __name__ == "__main__":
 
             # todo in this case I take the first proposal without any evaluation
             if len(contracts_proposals) > 0:
-                dso.sign_contract(contracts_proposals[0])
+                dso.sign_contract(contracts_proposals[0], fmo)
             else:
                 logger.warning('No available contract proposals available for request contract %s',
                                contract_request['id'])

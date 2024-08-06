@@ -67,6 +67,6 @@ if __name__ == "__main__":
     resp_demand = dso.demand_flexibility(slot_time)
     if resp_demand is not False:
         logger.info('Requested flexibility: %.3f MW (type=%s)' % (resp_demand['quantity'], resp_demand['regulationType']))
-        fmo.add_entry_to_ledger(timeslot=slot_time, player=dso, portfolio=None, features=resp_demand)
+        fmo.add_entry_to_market_ledger(timeslot=slot_time, player=dso, portfolio=None, features=resp_demand)
 
     logger.info('Ending program')

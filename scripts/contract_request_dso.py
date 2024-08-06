@@ -6,6 +6,7 @@ import sys
 import json
 
 from classes.dso import DSO
+from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 
 
@@ -58,6 +59,6 @@ if __name__ == "__main__":
     dso.print_player_info()
 
     # Send the contract request
-    resp_demand = dso.request_contract(slot_time)
+    resp_demand = dso.request_contract(slot_time, FMO({}, logger, pgi))
 
     logger.info('Ending program')

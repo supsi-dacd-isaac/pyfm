@@ -6,6 +6,7 @@ import sys
 import json
 from datetime import timedelta
 
+from classes.fmo import FMO
 from classes.fsp import FSP
 from classes.postgresql_interface import PostgreSQLInterface
 
@@ -66,8 +67,9 @@ if __name__ == "__main__":
                                                         'periodTo': (slot_time + timedelta(days=14)).strftime('%Y-%m-%dT00:00:00Z')
                                                        })
 
+    fmo = FMO({}, logger, pgi)
     for contract_request in contracts_requests:
         if 'request' in contract_request['name'] and contract_request['baseContractId'] is None:
-            fsp.propose_contract(slot_time, contract_request)
+            fsp.propose_contract(slot_time, contract_request, fmo)
 
     logger.info('Ending program')

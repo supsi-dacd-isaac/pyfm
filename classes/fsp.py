@@ -232,7 +232,7 @@ class FSP(Player):
 
         return df
 
-    def propose_contract(self, dt_slot, contract_request):
+    def propose_contract(self, dt_slot, contract_request, fmo):
         body = {
             "approvedBySeller": True,
             "autoCreateOrders": True,
@@ -253,4 +253,10 @@ class FSP(Player):
 
         response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
                                                                'longflexcontracts'), body)
-        return self.handle_response(response, body)
+        result = self.handle_response(response, body)
+        if result is not False:
+            # The delivery of the request has been successful, save the data in the ledger
+            fmo.add_entry_to_contract_proposal_ledger(self.cfg, self.organization,
+                                                      self.portfolios[list(self.portfolios.keys())[0]].metadata,
+                                                      contract_request, body)
+        return result

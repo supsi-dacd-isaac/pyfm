@@ -102,7 +102,9 @@ if __name__ == "__main__":
         resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
         for k in resp_selling.keys():
             if resp_selling[k] is not False:
-                fmo.add_entry_to_ledger(timeslot=slot_time, player=fsp, portfolio=fsp.portfolios[p_k].metadata['name'],
-                                        features=resp_selling[k])
+                fmo.add_entry_to_market_ledger(timeslot=slot_time,
+                                               player=fsp,
+                                               portfolio=fsp.portfolios[p_k].metadata['name'],
+                                               features=resp_selling[k])
 
     logger.info('Ending program')

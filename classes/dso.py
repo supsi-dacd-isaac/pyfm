@@ -40,7 +40,7 @@ class DSO(Player):
                                                          'GridAreas?name=%s' % self.cfg['name']))
         return res
 
-    def request_contract(self, dt_slot):
+    def request_contract(self, dt_slot, fmo):
         if self.cfg['flexibilitySource'] == 'random':
             quantity = self.get_random_quantity()
         elif self.cfg['flexibilitySource'] == 'db':
@@ -56,6 +56,7 @@ class DSO(Player):
             if n['name'] in self.cfg['orderSection']['nodeName']:
                 node_id = n['id']
 
+        # We suppose here to consider only the case with one market
         body = {
             "name": 'contract_request_%s_%s' % (self.cfg['id'], dt_slot.strftime('%Y%m%d')),
             "contractType": "Standard",
@@ -79,16 +80,26 @@ class DSO(Player):
             "crontab": self.cfg['contractSection']['mainSettings']['crontab']
         }
         body.update(self.cfg['orderSection']['mainSettings'])
+
         response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
                                                                'longflexcontracts'), body)
-        return self.handle_response(response, body)
+        result = self.handle_response(response, body)
+        if result is not False:
+            # The delivery of the request has been successful, save the data in the ledger
+            fmo.add_entry_to_contract_request_ledger(self.cfg, self.markets[0]['name'], body)
+        return result
 
-    def sign_contract(self, contract_proposal):
+    def sign_contract(self, contract_proposal, fmo):
         body = {
             "approvedByBuyer": True,
             "visibility": "Public",
             "id": contract_proposal['id'],
         }
+
         str_url = '%s%s/%s' % (self.nodes_interface.cfg['mainEndpoint'], 'longflexcontracts', contract_proposal['id'])
         response = self.nodes_interface.patch_request(str_url, body)
-        return self.handle_response(response, body)
+
+        result = self.handle_response(response, body)
+        if result is not False:
+            fmo.update_contract_request(contract_proposal, body)
+        return result
