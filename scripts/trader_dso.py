@@ -61,7 +61,7 @@ if __name__ == "__main__":
     dso.print_player_info()
 
     # FMO object
-    fmo = FMO({}, logger, pgi)
+    fmo = FMO(dso.cfg, logger, pgi)
 
     # Place order
     resp_demand = dso.demand_flexibility(slot_time)

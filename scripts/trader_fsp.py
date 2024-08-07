@@ -95,7 +95,7 @@ if __name__ == "__main__":
     fsp.set_baselines(slot_time)
 
     # FMO object
-    fmo = FMO({}, logger, pgi)
+    fmo = FMO(fsp.cfg, logger, pgi)
 
     # Place orders
     for p_k in fsp.portfolios.keys():

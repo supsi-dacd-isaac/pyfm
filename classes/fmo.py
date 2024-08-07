@@ -16,6 +16,7 @@ class FMO:
         :type logger: Logger object
         """
         # Market ledger
+        self.cfg = cfg
         self.ledger = pd.DataFrame()
         self.logger = logger
         ledger = pd.DataFrame(columns=['market_timeslot', 'created_at', 'player', 'role', 'case', 'portfolio', 'amount', 'unit', 'price'])
@@ -45,7 +46,7 @@ class FMO:
               '(\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\',\'%s\')' %
                (timeslot, player.cfg['id'], player.cfg['role'], portfolio_id, features['side'],
                 features['regulationType'], features['quantity'], 'MW', float(price),
-                features['currency']))
+                self.cfg['orderSection']['mainSettings']['currency']))
         cur = self.pgi.conn.cursor()
         cur.execute(sql)
         cur.close()
