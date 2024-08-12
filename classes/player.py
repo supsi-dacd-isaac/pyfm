@@ -174,7 +174,7 @@ class Player:
                 }
                 body.update(self.cfg['orderSection']['mainSettings'])
                 response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
-                if response is True:
+                if response is not False:
                     selling_result[k_regulation_type] = body
                 else:
                     selling_result[k_regulation_type] = False
