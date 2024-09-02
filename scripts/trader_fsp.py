@@ -91,8 +91,8 @@ if __name__ == "__main__":
     # Get quantities demanded by the DSO in the
     dso_demand = dso.get_flexibility_quantities(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
 
-    # Set current baselins for FSP
-    fsp.set_baselines(slot_time)
+    # Set current baselines for FSP
+    fsp.download_baselines(slot_time)
 
     # FMO object
     fmo = FMO(fsp.cfg, logger, pgi)
