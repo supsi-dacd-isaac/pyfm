@@ -2,4 +2,6 @@
 .venv
 conf/private/*.json
 data/tmp/*
+data/plots/*
+data/csv/*
 tkns/*
