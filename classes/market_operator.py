@@ -108,7 +108,6 @@ class MarketOperator:
         time_slots_to_clear = [ts for ts in sorted(self.buyer_requests.keys()) if not self.is_time_slot_cleared(ts)][-steps_to_clear:]
 
         for time_slot in time_slots_to_clear:
-
             bids_list = self.bidder_bids.get(time_slot, [])
 
             clearing_results[time_slot] = []
@@ -132,10 +131,12 @@ class MarketOperator:
                 for bid in buyer_bids:
                     allocated_power = min(bid['power'], remaining_demand)
                     if allocated_power > 0:
+                        bid['reward'] = self.calculate_reward(bid)
                         allocations.append({
                             'bidder_id': bid['bidder_id'],
                             'allocated_power': allocated_power,
-                            'price': bid['price']
+                            'price': bid['price'],
+                            'reward': bid['reward']  # Include reward in allocation
                         })
                         remaining_demand -= allocated_power
                         accepted_bids[time_slot].append(bid)
@@ -253,3 +254,11 @@ class MarketOperator:
 
     def is_time_slot_cleared(self, time_slot):
         return time_slot in self.cleared_time_slots
+
+    # tbd integration of self.alpha_rem and self.beta_rem parameters
+    def calculate_reward(self, bid):
+        """
+        Calculate the reward for a given accepted bid.
+        The reward can be based on the bid's price and power.
+        """
+        return bid['price'] * bid['power']

@@ -6,7 +6,8 @@ from classes.buyer import Buyer
 from classes.bidder import Bidder
 from classes.market_operator import MarketOperator
 from scripts.utils import (plot_successful_bids_per_bidder, plot_unsuccessful_bids_per_bidder,
-                           plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp)
+                           plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp,
+                           plot_rewards_per_bidder, plot_all_bidders_rewards)
 
 def test_market_simulation():
     # Initialize simulation parameters
@@ -142,8 +143,14 @@ def test_market_simulation():
     # Plot and save all accepted bids
     plot_all_accepted_bids(all_accepted_bids, plot_dir)
 
+    # PLot and save rewards for each bidder
+    plot_rewards_per_bidder(all_accepted_bids, plot_dir)
+
     # Plot and save buyer requests and willingness to pay
     plot_buyer_requests_and_wtp(buyers, plot_dir)
+
+    # Plot and save all bidders rewards
+    plot_all_bidders_rewards(all_accepted_bids, plot_dir)
 
 if __name__ == "__main__":
     test_market_simulation()

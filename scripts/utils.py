@@ -188,3 +188,55 @@ def plot_buyer_requests_and_wtp(buyers, plot_dir):
         fig.tight_layout()
         plt.savefig(os.path.join(plot_dir, f'buyer_requests_wtp_{buyer.id}.png'))
         plt.close()
+
+def plot_rewards_per_bidder(all_accepted_bids, plot_dir):
+    bidders_rewards = {}
+
+    # Collect rewards for each bidder
+    for time_slot, bids in all_accepted_bids.items():
+        for bid in bids:
+            bidder_id = bid['bidder_id']
+            reward = bid['reward']
+            if bidder_id not in bidders_rewards:
+                bidders_rewards[bidder_id] = {'time_slots': [], 'rewards': []}
+            bidders_rewards[bidder_id]['time_slots'].append(time_slot)
+            bidders_rewards[bidder_id]['rewards'].append(reward)
+
+    # Plot rewards for each bidder
+    for bidder_id, data in bidders_rewards.items():
+        plt.figure()
+        plt.plot(data['time_slots'], data['rewards'], label=f'Rewards for {bidder_id}')
+        plt.xlabel('Time Step')
+        plt.ylabel('Reward')
+        plt.title(f'Rewards over Time for {bidder_id}')
+        # plt.legend()
+        plt.grid()
+        plt.savefig(os.path.join(plot_dir, f'rewards_{bidder_id}.png'))
+        plt.close()
+
+
+def plot_all_bidders_rewards(all_accepted_bids, plot_dir):
+    bidders_rewards = {}
+
+    # Collect rewards for each bidder
+    for time_slot, bids in all_accepted_bids.items():
+        for bid in bids:
+            bidder_id = bid['bidder_id']
+            reward = bid['reward']
+            if bidder_id not in bidders_rewards:
+                bidders_rewards[bidder_id] = {'time_slots': [], 'rewards': []}
+            bidders_rewards[bidder_id]['time_slots'].append(time_slot)
+            bidders_rewards[bidder_id]['rewards'].append(reward)
+
+    # Plot rewards for all bidders on the same graph
+    plt.figure()
+    for bidder_id, data in bidders_rewards.items():
+        plt.plot(data['time_slots'], data['rewards'], label=f'{bidder_id}')
+
+    plt.xlabel('Time Step')
+    plt.ylabel('Reward')
+    plt.title('Rewards over Time for All Bidders')
+    plt.legend()
+    plt.grid()
+    plt.savefig(os.path.join(plot_dir, 'all_bidders_rewards.png'))
+    plt.close()
