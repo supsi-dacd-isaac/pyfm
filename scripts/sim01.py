@@ -8,10 +8,11 @@ from classes.market_operator import MarketOperator
 from scripts.utils import (plot_successful_bids_per_bidder, plot_unsuccessful_bids_per_bidder,
                            plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp,
                            plot_rewards_per_bidder, plot_all_bidders_rewards)
+from scripts.utils_baselines import create_residential_like_pattern, create_office_like_pattern, create_battery_pattern
 
 def test_market_simulation():
     # Initialize simulation parameters
-    num_days = 1
+    num_days = 2
     slots_per_day = 96
     num_slots = num_days * slots_per_day
     clearing_steps = 24
@@ -53,17 +54,19 @@ def test_market_simulation():
         Buyer("BUYER_2", df_bus, willingness_to_pay=55.0)
     ]
 
+    # Generate baselines for bidders
+    residential_baseline = create_residential_like_pattern(time_index)
+    office_baseline = create_office_like_pattern(time_index)
+    battery_baseline = create_battery_pattern(time_index)
+
     # Create Bidders
-    b1 = Bidder(id="BIDDER_01", alpha=0.02, beta=0.02, gamma=0.5, L=7, w1=1.0, w2=1.0, w3=1.0, baseline=50)
-    b1.pow_base = 4.0
+    b1 = Bidder(id="BIDDER_01", alpha=0.02, beta=0.02, gamma=0.5, L=7, w1=1.0, w2=1.0, w3=1.0, baseline=residential_baseline)
     b1.pow_bid = 3.0
 
-    b2 = Bidder(id="BIDDER_02", alpha=0.05, beta=0.03, gamma=0.7, L=10, w1=1.5, w2=0.8, w3=0.8, baseline=80)
-    b2.pow_base = 7.0
+    b2 = Bidder(id="BIDDER_02", alpha=0.05, beta=0.03, gamma=0.7, L=10, w1=1.5, w2=0.8, w3=0.8, baseline=office_baseline)
     b2.pow_bid = 5.0
 
-    b3 = Bidder(id="BIDDER_03", alpha=0.03, beta=0.03, gamma=0.4, L=5, w1=1.0, w2=1.2, w3=1.0, baseline=100)
-    b3.pow_base = 10.0
+    b3 = Bidder(id="BIDDER_03", alpha=0.03, beta=0.03, gamma=0.4, L=5, w1=1.0, w2=1.2, w3=1.0, baseline=battery_baseline)
     b3.pow_bid = 8.0
 
     bidders = [b1, b2, b3]
@@ -80,9 +83,15 @@ def test_market_simulation():
         pow_req_ref = market_op.average_last_n_requested_powers(7)
         avg_acc_ref = market_op.average_last_n_accepted_prices(7)
 
+        # Baselines update in the market operator reusing always the same values. This is a simplification,
+        # in a real scenario, the baselines about the future steps should be updated considering their last forecast.
+        print("Baselines updating")
+        for bidder in bidders:
+            market_op.store_bidder_baseline(bidder.id, bidder.baseline)
+
         # Buyers requests
         current_buyer_requests = []
-        print("Flexibility requests:")
+        print("Flexibility requests storage")
         for buyer in buyers:
             request_info = {
                 'id': buyer.id,
@@ -93,8 +102,8 @@ def test_market_simulation():
             current_buyer_requests.append(request_info)
             print("Request info:", request_info)
 
-        # Bidders bids
-        print("Flexibility bidding:")
+        # Store bidding in market operator
+        print("Flexibility bidding storage")
         for bidder in bidders:
             bidder.set_reference_values(pow_req_ref, avg_acc_ref)
             best_buyer = bidder.select_buyer(current_buyer_requests)
@@ -102,6 +111,12 @@ def test_market_simulation():
             bidder.update_current_bidding(buyer_id=best_buyer['id'], offered_power=final_power, offered_price=p_start)
             market_op.receive_bid_from_bidder(time_slot=time_slot, bid_info=bidder.current_bidding)
             print("Bid info:", bidder.current_bidding)
+
+        # Store actual values in market operator
+        print("Actual values storage")
+        for bidder in bidders:
+            baseline_value_with_noise = bidder.baseline.loc[time_slot, 'value'] * (1 + 0.15 * np.random.randn())
+            market_op.store_bidder_actual(bidder.id, time_slot, baseline_value_with_noise)
 
         # Solve the market every 24 steps
         if (step + 1) % clearing_steps == 0:
@@ -153,4 +168,6 @@ def test_market_simulation():
     plot_all_bidders_rewards(all_accepted_bids, plot_dir)
 
 if __name__ == "__main__":
+    # todo (listed by priority):
+    #   - Marginal costs analysis: how would my flexibility activation cost? (Bidder)
     test_market_simulation()

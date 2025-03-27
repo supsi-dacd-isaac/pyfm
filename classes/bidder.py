@@ -16,7 +16,7 @@ class Bidder:
         :param w1: Weight for the requested power in the priority calculation
         :param w2: Weight for the average accepted price in the priority calculation
         :param w3: Weight for penalizing a low success ratio in the priority calculation
-        :param baseline: Bidder baseline.
+        :param baseline: Time-series dataset for the bidder baseline.
         """
         self.id = id
         self.alpha = alpha
@@ -26,7 +26,7 @@ class Bidder:
         self.w1 = w1
         self.w2 = w2
         self.w3 = w3
-        self.baseline = baseline
+        self.baseline = baseline if baseline is not None else pd.DataFrame()
         self.pow_req_ref = pow_req_ref
         self.avg_acc_ref = avg_acc_ref
         self.memory = {}
