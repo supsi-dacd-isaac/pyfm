@@ -1,3 +1,5 @@
+import pandas as pd
+
 class Bidder:
     """
     A class representing a Bidder in a pay-as-bid market, with an adaptive strategy
@@ -27,6 +29,7 @@ class Bidder:
         self.w2 = w2
         self.w3 = w3
         self.baseline = baseline if baseline is not None else pd.DataFrame()
+        self.actual_values = pd.DataFrame()
         self.pow_req_ref = pow_req_ref
         self.avg_acc_ref = avg_acc_ref
         self.memory = {}
@@ -213,3 +216,12 @@ class Bidder:
             self.pow_req_ref = pow_req_ref
         if avg_acc_ref != 0.0:
             self.avg_acc_ref = avg_acc_ref
+
+    def add_actual_value(self, time_slot, value):
+        """
+        Add an actual value for a specific time slot.
+
+        :param time_slot: The time (or slot) of the market session
+        :param value: The actual value to be added
+        """
+        self.actual_values.loc[time_slot, 'value'] = value

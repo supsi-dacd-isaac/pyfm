@@ -83,8 +83,9 @@ def test_market_simulation():
         pow_req_ref = market_op.average_last_n_requested_powers(7)
         avg_acc_ref = market_op.average_last_n_accepted_prices(7)
 
-        # Baselines update in the market operator reusing always the same values. This is a simplification,
-        # in a real scenario, the baselines about the future steps should be updated considering their last forecast.
+        # Baselines update in the market operator is now reusing always the same values. This is a simplification,
+        # in a real scenario, the baselines about the future steps should be updated considering the last forecast.
+        # todo: Change the code below in order to update the baselines, considering the last forecast for the future steps
         print("Baselines updating")
         for bidder in bidders:
             market_op.store_bidder_baseline(bidder.id, bidder.baseline)
@@ -112,10 +113,11 @@ def test_market_simulation():
             market_op.receive_bid_from_bidder(time_slot=time_slot, bid_info=bidder.current_bidding)
             print("Bid info:", bidder.current_bidding)
 
-        # Store actual values in market operator
+        # Store actual values in market operator and bidders
         print("Actual values storage")
         for bidder in bidders:
             baseline_value_with_noise = bidder.baseline.loc[time_slot, 'value'] * (1 + 0.15 * np.random.randn())
+            bidder.add_actual_value(time_slot, baseline_value_with_noise)
             market_op.store_bidder_actual(bidder.id, time_slot, baseline_value_with_noise)
 
         # Solve the market every 24 steps
