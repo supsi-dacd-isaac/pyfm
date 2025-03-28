@@ -153,6 +153,8 @@ class MarketOperator:
                                                               requested_flexibility=request['requested_power'])
                         allocations.append({
                             'bidder_id': bid['bidder_id'],
+                            'buyer_id': request['id'],
+                            'requested_flexibility': request['requested_power'],
                             'bidded_flexibility': bid['power'],
                             'provided_flexibility': real_flexibility,
                             'allocated_flexibility': allocated_power,

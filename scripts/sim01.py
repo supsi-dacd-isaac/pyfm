@@ -8,7 +8,7 @@ from classes.metering_agent import MeteringAgent
 from scripts.utils import (plot_successful_bids_per_bidder, plot_unsuccessful_bids_per_bidder,
                            plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp,
                            plot_rewards_per_bidder, plot_all_bidders_rewards, plot_flexibility_from_history,
-                           plot_flexibility_and_rewards_from_history)
+                           plot_flexibility_and_rewards_from_history, plot_flexibility_requested_and_rewards_from_history)
 from scripts.utils_baselines import create_residential_like_pattern, create_office_like_pattern, create_battery_pattern
 from utils_baselines import create_duck_curve_pattern, create_bus_curve_pattern
 
@@ -56,7 +56,7 @@ def test_market_simulation():
 
     # Initialize MarketOperator
     # market_op = MarketOperator(alpha_rem=5.0, beta_rem=-2.0, gamma_rem=0.5, threshold_rem=0.1, threshold_rem_bid_inf=0.25, power_ref=100, price_ref=20)
-    market_op = MarketOperator(alpha_rem=0, beta_rem=0, gamma_rem=0, threshold_rem=0.1, threshold_rem_bid_inf=0.25, power_ref=100, price_ref=20)
+    market_op = MarketOperator(alpha_rem=1, beta_rem=0, gamma_rem=0, threshold_rem=0.1, threshold_rem_bid_inf=0.25, power_ref=100, price_ref=20)
 
     # Main simulation loop
     all_accepted_bids = {}
@@ -144,32 +144,35 @@ def test_market_simulation():
 
     print("Printing plots in", plot_dir)
 
-    # Plot and save the successful bids for each bidder
-    plot_successful_bids_per_bidder(all_accepted_bids, plot_dir)
+    # # Plot and save the successful bids for each bidder
+    # plot_successful_bids_per_bidder(all_accepted_bids, plot_dir)
+    #
+    # # Plot and save the unsuccessful bids for each bidder
+    # plot_unsuccessful_bids_per_bidder(all_not_accepted_bids, plot_dir)
+    #
+    # # Plot and save the combined bids for each bidder
+    # plot_combined_bids_per_bidder(all_accepted_bids, all_not_accepted_bids, plot_dir)
+    #
+    # # Plot and save all accepted bids
+    # plot_all_accepted_bids(all_accepted_bids, plot_dir)
+    #
+    # # PLot and save rewards for each bidder
+    # plot_rewards_per_bidder(all_accepted_bids, plot_dir)
+    #
+    # # Plot and save buyer requests and willingness to pay
+    # plot_buyer_requests_and_wtp(buyers, plot_dir)
+    #
+    # # Plot and save all bidders rewards
+    # plot_all_bidders_rewards(all_accepted_bids, plot_dir)
+    #
+    # # Plot and save flexibility activation for each bidder
+    # plot_flexibility_from_history(market_op, plot_dir)
+    #
+    # # Plot and save flexibility activation and rewards for each bidder
+    # plot_flexibility_and_rewards_from_history(market_op, plot_dir)
 
-    # Plot and save the unsuccessful bids for each bidder
-    plot_unsuccessful_bids_per_bidder(all_not_accepted_bids, plot_dir)
-
-    # Plot and save the combined bids for each bidder
-    plot_combined_bids_per_bidder(all_accepted_bids, all_not_accepted_bids, plot_dir)
-
-    # Plot and save all accepted bids
-    plot_all_accepted_bids(all_accepted_bids, plot_dir)
-
-    # PLot and save rewards for each bidder
-    plot_rewards_per_bidder(all_accepted_bids, plot_dir)
-
-    # Plot and save buyer requests and willingness to pay
-    plot_buyer_requests_and_wtp(buyers, plot_dir)
-
-    # Plot and save all bidders rewards
-    plot_all_bidders_rewards(all_accepted_bids, plot_dir)
-
-    # Plot and save flexibility activation for each bidder
-    plot_flexibility_from_history(market_op, plot_dir)
-
-    # Plot and save flexibility activation and rewards for each bidder
-    plot_flexibility_and_rewards_from_history(market_op, plot_dir)
+    # Plot and save flexibility requested and rewards for each bidder
+    plot_flexibility_requested_and_rewards_from_history(market_op, plot_dir)
 
 if __name__ == "__main__":
     # todo (listed by priority):
