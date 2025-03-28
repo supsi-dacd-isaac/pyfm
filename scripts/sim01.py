@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from classes.buyer import Buyer
 from classes.bidder import Bidder
 from classes.market_operator import MarketOperator
+from classes.metering_agent import MeteringAgent
 from scripts.utils import (plot_successful_bids_per_bidder, plot_unsuccessful_bids_per_bidder,
                            plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp,
                            plot_rewards_per_bidder, plot_all_bidders_rewards)
@@ -71,6 +72,12 @@ def test_market_simulation():
 
     bidders = [b1, b2, b3]
 
+    # Initialize MeteringAgent
+    metering_agent = MeteringAgent()
+    # todo: Now we cycle only on the bidders but other meter point, not related to the bidders, should be added
+    for bidder in bidders:
+        metering_agent.add_metering_point(bidder.id)
+
     # Initialize MarketOperator
     market_op = MarketOperator(alpha_rem=5.0, beta_rem=-2.0, threshold_rem=0.1, power_ref=100, price_ref=20)
 
@@ -83,6 +90,7 @@ def test_market_simulation():
         pow_req_ref = market_op.average_last_n_requested_powers(7)
         avg_acc_ref = market_op.average_last_n_accepted_prices(7)
 
+        # STEP 1: Bidders update their baselines
         # Baselines update in the market operator is now reusing always the same values. This is a simplification,
         # in a real scenario, the baselines about the future steps should be updated considering the last forecast.
         # todo: Change the code below in order to update the baselines, considering the last forecast for the future steps
@@ -90,7 +98,7 @@ def test_market_simulation():
         for bidder in bidders:
             market_op.store_bidder_baseline(bidder.id, bidder.baseline)
 
-        # Buyers requests
+        # STEP 2: Buyers requesting flexibility
         current_buyer_requests = []
         print("Flexibility requests storage")
         for buyer in buyers:
@@ -103,6 +111,7 @@ def test_market_simulation():
             current_buyer_requests.append(request_info)
             print("Request info:", request_info)
 
+        # STEP 3: Bidders offering flexibility to the buyers
         # Store bidding in market operator
         print("Flexibility bidding storage")
         for bidder in bidders:
@@ -113,15 +122,23 @@ def test_market_simulation():
             market_op.receive_bid_from_bidder(time_slot=time_slot, bid_info=bidder.current_bidding)
             print("Bid info:", bidder.current_bidding)
 
-        # Store actual values in market operator and bidders
+        # STEP 4: Metering agent stores actual values
+        # Store actual values in metering agent
         print("Actual values storage")
+        # todo: Now we cycle only on the bidders but other actual values for the market operator should be added
         for bidder in bidders:
             baseline_value_with_noise = bidder.baseline.loc[time_slot, 'value'] * (1 + 0.15 * np.random.randn())
-            bidder.add_actual_value(time_slot, baseline_value_with_noise)
-            market_op.store_bidder_actual(bidder.id, time_slot, baseline_value_with_noise)
+            metering_agent.add_energy_measure(bidder.id, time_slot, baseline_value_with_noise)
 
-        # Solve the market every 24 steps
+        # STEP 5: Send information about the actual values to the bidders and the market operator
+        # Store actual values related to the bidding in market operator and bidders
+        for bidder in bidders:
+            bidder.add_actual_value(time_slot, metering_agent.get_energy_data(bidder.id).loc[time_slot, 'energy'])
+            market_op.store_bidder_actual(bidder.id, time_slot, metering_agent.get_energy_data(bidder.id).loc[time_slot, 'energy'])
+
+        # Solve the market every clearing_steps steps
         if (step + 1) % clearing_steps == 0:
+            # STEP 6: Market clearing
             print(f"Time slot: {time_slot}: Starting clearing the last {clearing_steps} steps.")
             accepted_bids, non_accepted_bids = market_op.pay_as_bid_market_solving(clearing_steps)
 
@@ -171,5 +188,5 @@ def test_market_simulation():
 
 if __name__ == "__main__":
     # todo (listed by priority):
-    #   - Marginal costs analysis: how would my flexibility activation cost? (Bidder)
+    #   - Marginal costs analysis: how much would my flexibility activation cost? (Bidder)
     test_market_simulation()
