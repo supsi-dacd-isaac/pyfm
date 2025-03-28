@@ -43,6 +43,9 @@ class MarketOperator:
         # Store bidder actuals
         self.bidder_actuals = {}
 
+        # Clearing results history
+        self.clearing_results_history = {}
+
     # -------------------------------------------------------------------------
     # Receiving Buyer Requests and Bidder Bids
     # -------------------------------------------------------------------------
@@ -136,19 +139,20 @@ class MarketOperator:
                 remaining_demand = demand
 
                 for bid in buyer_bids:
-                    baseline = self.get_bidder_baseline(bid['bidder_id'], time_slot)
-                    actual = self.get_bidder_actual(bid['bidder_id'], time_slot)
-                    real_flexibility = baseline - actual
+                    baseline_value = self.get_bidder_baseline(bid['bidder_id'], time_slot)
+                    actual_value = self.get_bidder_actual(bid['bidder_id'], time_slot)
+                    real_flexibility = baseline_value - actual_value
 
                     allocated_power = min(real_flexibility, remaining_demand)
                     if allocated_power > 0:
                         bid['reward'] = self.calculate_reward(bid['price'], real_flexibility, request['requested_power'])
                         allocations.append({
                             'bidder_id': bid['bidder_id'],
-                            'bidded_power': bid['power'],
-                            'allocated_power': allocated_power,
-                            'baseline': baseline,
-                            'actual': actual,
+                            'bidded_flexibility': bid['power'],
+                            'provided_flexibility': real_flexibility,
+                            'allocated_flexibility': allocated_power,
+                            'baseline_value': baseline_value,
+                            'actual_value': actual_value,
                             'remaining_demand': remaining_demand,
                             'price': bid['price'],
                             'reward': bid['reward']
@@ -179,6 +183,9 @@ class MarketOperator:
             print(f"Clearing results for {time_slot}:")
             for result in results:
                 print(result)
+
+        # Append the clearing_results to clearing_results_history
+        self.clearing_results_history.update(clearing_results)
 
         return accepted_bids, non_accepted_bids
 
