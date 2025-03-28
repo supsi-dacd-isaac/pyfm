@@ -240,3 +240,37 @@ def plot_all_bidders_rewards(all_accepted_bids, plot_dir):
     plt.grid()
     plt.savefig(os.path.join(plot_dir, 'all_bidders_rewards.png'))
     plt.close()
+
+def plot_flexibility_from_history(market_operator, plot_dir):
+    """
+    Plot the bidded flexibility and the real provided flexibility for each bidder using clearing_results_history.
+
+    :param market_operator: MarketOperator object
+    :param plot_dir: Directory to save the plots
+    """
+    bidder_data = {}
+
+    # Aggregate data for each bidder
+    for time_slot, results in market_operator.clearing_results_history.items():
+        for result in results:
+            allocations = result['allocations']
+            for allocation in allocations:
+                bidder_id = allocation['bidder_id']
+                if bidder_id not in bidder_data:
+                    bidder_data[bidder_id] = {'time_slots': [], 'bidded_flexibility': [], 'real_flexibility': []}
+                bidder_data[bidder_id]['time_slots'].append(time_slot)
+                bidder_data[bidder_id]['bidded_flexibility'].append(allocation['bidded_flexibility'])
+                bidder_data[bidder_id]['real_flexibility'].append(allocation['provided_flexibility'])
+
+    # Plot data for each bidder
+    for bidder_id, data in bidder_data.items():
+        plt.figure(figsize=(10, 6))
+        plt.plot(data['time_slots'], data['bidded_flexibility'], label='Bidded')
+        plt.plot(data['time_slots'], data['real_flexibility'], label='Provided')
+        plt.xlabel('Time Slot')
+        plt.ylabel('Flexibility [MW]')
+        plt.title(f'Flexibility {bidder_id}')
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{plot_dir}/flexibility_{bidder_id}.png")
+        plt.close()

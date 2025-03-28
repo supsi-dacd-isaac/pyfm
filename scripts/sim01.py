@@ -8,7 +8,7 @@ from classes.market_operator import MarketOperator
 from classes.metering_agent import MeteringAgent
 from scripts.utils import (plot_successful_bids_per_bidder, plot_unsuccessful_bids_per_bidder,
                            plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp,
-                           plot_rewards_per_bidder, plot_all_bidders_rewards)
+                           plot_rewards_per_bidder, plot_all_bidders_rewards, plot_flexibility_from_history)
 from scripts.utils_baselines import create_residential_like_pattern, create_office_like_pattern, create_battery_pattern
 
 def test_market_simulation():
@@ -62,13 +62,10 @@ def test_market_simulation():
 
     # Create Bidders
     b1 = Bidder(id="BIDDER_01", alpha=0.02, beta=0.02, gamma=0.5, L=7, w1=1.0, w2=1.0, w3=1.0, baseline=residential_baseline)
-    b1.pow_bid = 3.0
 
     b2 = Bidder(id="BIDDER_02", alpha=0.05, beta=0.03, gamma=0.7, L=10, w1=1.5, w2=0.8, w3=0.8, baseline=office_baseline)
-    b2.pow_bid = 5.0
 
     b3 = Bidder(id="BIDDER_03", alpha=0.03, beta=0.03, gamma=0.4, L=5, w1=1.0, w2=1.2, w3=1.0, baseline=battery_baseline)
-    b3.pow_bid = 8.0
 
     bidders = [b1, b2, b3]
 
@@ -117,7 +114,9 @@ def test_market_simulation():
         for bidder in bidders:
             bidder.set_reference_values(pow_req_ref, avg_acc_ref)
             best_buyer = bidder.select_buyer(current_buyer_requests)
-            p_start, final_power = bidder.build_offer(best_buyer['id'], best_buyer['requested_power'], bidder.pow_bid)
+            p_start, final_power = bidder.build_offer(buyer_id=best_buyer['id'],
+                                                      pow_req=best_buyer['requested_power'],
+                                                      pow_bid=bidder.baseline.loc[time_slot, 'value']*0.8)
             bidder.update_current_bidding(buyer_id=best_buyer['id'], offered_power=final_power, offered_price=p_start)
             market_op.receive_bid_from_bidder(time_slot=time_slot, bid_info=bidder.current_bidding)
             print("Bid info:", bidder.current_bidding)
@@ -127,8 +126,8 @@ def test_market_simulation():
         print("Actual values storage")
         # todo: Now we cycle only on the bidders but other actual values for the market operator should be added
         for bidder in bidders:
-            baseline_value_with_noise = bidder.baseline.loc[time_slot, 'value'] * (1 + 0.15 * np.random.randn())
-            metering_agent.add_energy_measure(bidder.id, time_slot, baseline_value_with_noise)
+            actual_value = bidder.baseline.loc[time_slot, 'value'] - bidder.current_bidding['power'] * (1 + 0.1 * np.random.randn())
+            metering_agent.add_energy_measure(bidder.id, time_slot, actual_value)
 
         # STEP 5: Send information about the actual values to the bidders and the market operator
         # Store actual values related to the bidding in market operator and bidders
@@ -185,6 +184,9 @@ def test_market_simulation():
 
     # Plot and save all bidders rewards
     plot_all_bidders_rewards(all_accepted_bids, plot_dir)
+
+    # Plot and save flexibility activation for each bidder
+    plot_flexibility_from_history(market_op, plot_dir)
 
 if __name__ == "__main__":
     # todo (listed by priority):

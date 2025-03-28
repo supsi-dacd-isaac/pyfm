@@ -137,13 +137,13 @@ class Bidder:
 
         return best_buyer
 
-    def build_offer(self, buyer_id, pow_req, pow_bid):
+    def build_offer(self, buyer_id, pow_req=None, pow_bid=0.0):
         """
         Build an offer (price, final power) for the selected Buyer based on the extended strategy.
 
         :param buyer_id: Identifier of the Buyer
         :param pow_req: The power requested by this Buyer
-        :param pow_bid: Maximum power the Bidder can actually offer (must be <= pow_base)
+        :param pow_bid: Maximum power the Bidder can actually offer
         :return: (offer_price, offer_power)
         """
         # Retrieve Buyer-specific stats
@@ -177,8 +177,7 @@ class Bidder:
         # Decide the power to offer:
         # If the requested power is bigger than pow_bid, we can only offer pow_bid
         # Otherwise, offer exactly the requested power
-        final_power = min(pow_req, pow_bid)
-
+        final_power = pow_bid
         return p_start, final_power
 
     def get_last_record(self, buyer_id):
