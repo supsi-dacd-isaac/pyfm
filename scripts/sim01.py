@@ -1,15 +1,16 @@
 import numpy as np
 import pandas as pd
 import os
-from datetime import datetime, timedelta
 from classes.buyer import Buyer
 from classes.bidder import Bidder
 from classes.market_operator import MarketOperator
 from classes.metering_agent import MeteringAgent
 from scripts.utils import (plot_successful_bids_per_bidder, plot_unsuccessful_bids_per_bidder,
                            plot_combined_bids_per_bidder, plot_all_accepted_bids, plot_buyer_requests_and_wtp,
-                           plot_rewards_per_bidder, plot_all_bidders_rewards, plot_flexibility_from_history)
+                           plot_rewards_per_bidder, plot_all_bidders_rewards, plot_flexibility_from_history,
+                           plot_flexibility_and_rewards_from_history)
 from scripts.utils_baselines import create_residential_like_pattern, create_office_like_pattern, create_battery_pattern
+from utils_baselines import create_duck_curve_pattern, create_bus_curve_pattern
 
 def test_market_simulation():
     # Initialize simulation parameters
@@ -24,35 +25,12 @@ def test_market_simulation():
     os.makedirs(plot_dir, exist_ok=True)
 
     # Create Buyers with demand curves
-    duck_base = np.array([
-        0.4, 0.3, 0.25, 0.25, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.25,
-        0.3, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.8, 0.8, 0.7,
-        0.6, 0.5, 0.4, 0.35, 0.3, 0.3, 0.3, 0.25, 0.2, 0.15, 0.1, 0.1,
-        0.1, 0.1, 0.2, 0.3, 0.4, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.85,
-        0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.8,
-        0.7, 0.7, 0.7, 0.6, 0.5, 0.4, 0.4, 0.35, 0.3, 0.2, 0.2, 0.2,
-        0.25, 0.3, 0.3, 0.4, 0.5, 0.7, 0.9, 1.0, 1.1, 1.2, 1.2, 1.1,
-        1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.5, 0.4, 0.3, 0.2, 0.2, 0.2
-    ])
-    duck_base = np.tile(duck_base, num_days)
-    df_duck = pd.DataFrame({'demand': duck_base}, index=time_index)
-
-    bus_base = np.array([
-        0.0, 0.0, 0.0, 0.2, 0.5, 0.5, 0.5, 0.5, 0.3, 0.3, 0.3, 0.2,
-        0.2, 0.2, 0.3, 0.4, 0.5, 1.0, 1.2, 1.2, 1.2, 1.2, 1.2, 1.0,
-        0.8, 0.6, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 0.5,
-        1.0, 1.5, 1.5, 1.5, 1.5, 1.2, 1.0, 0.8, 0.8, 0.8, 0.8, 0.8,
-        0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.0,
-        0.8, 0.6, 0.6, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.8, 1.0,
-        1.0, 1.2, 1.2, 1.2, 1.2, 1.0, 0.8, 0.6, 0.5, 0.5, 0.4, 0.3,
-        0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.4, 0.6, 0.8, 1.0
-    ])
-    bus_base = np.tile(bus_base, num_days)
-    df_bus = pd.DataFrame({'demand': bus_base}, index=time_index)
+    duck_curve_data = create_duck_curve_pattern(time_index, num_days)
+    bus_curve_data = create_bus_curve_pattern(time_index, num_days)
 
     buyers = [
-        Buyer("BUYER_1", df_duck, willingness_to_pay=50.0),
-        Buyer("BUYER_2", df_bus, willingness_to_pay=55.0)
+        Buyer("BUYER_1", duck_curve_data, willingness_to_pay=50.0),
+        Buyer("BUYER_2", bus_curve_data, willingness_to_pay=55.0)
     ]
 
     # Generate baselines for bidders
@@ -61,22 +39,24 @@ def test_market_simulation():
     battery_baseline = create_battery_pattern(time_index)
 
     # Create Bidders
-    b1 = Bidder(id="BIDDER_01", alpha=0.02, beta=0.02, gamma=0.5, L=7, w1=1.0, w2=1.0, w3=1.0, baseline=residential_baseline)
-
-    b2 = Bidder(id="BIDDER_02", alpha=0.05, beta=0.03, gamma=0.7, L=10, w1=1.5, w2=0.8, w3=0.8, baseline=office_baseline)
-
-    b3 = Bidder(id="BIDDER_03", alpha=0.03, beta=0.03, gamma=0.4, L=5, w1=1.0, w2=1.2, w3=1.0, baseline=battery_baseline)
+    # b1 = Bidder(id="BIDDER_01", alpha=0.02, beta=0.02, gamma=0.5, L=7, w1=1.0, w2=1.0, w3=1.0, baseline=residential_baseline)
+    # b2 = Bidder(id="BIDDER_02", alpha=0.05, beta=0.03, gamma=0.7, L=10, w1=1.5, w2=0.8, w3=0.8, baseline=office_baseline)
+    # b3 = Bidder(id="BIDDER_03", alpha=0.03, beta=0.03, gamma=0.4, L=5, w1=1.0, w2=1.2, w3=1.0, baseline=battery_baseline)
+    b1 = Bidder(id="BIDDER_01", alpha=0, beta=0, gamma=0, L=7, w1=1.0, w2=1.0, w3=1.0, baseline=residential_baseline)
+    b2 = Bidder(id="BIDDER_02", alpha=0, beta=0, gamma=0, L=10, w1=1.0, w2=1.0, w3=1.0, baseline=office_baseline)
+    b3 = Bidder(id="BIDDER_03", alpha=0, beta=0, gamma=0, L=5, w1=1.0, w2=1.0, w3=1.0, baseline=battery_baseline)
 
     bidders = [b1, b2, b3]
 
     # Initialize MeteringAgent
     metering_agent = MeteringAgent()
-    # todo: Now we cycle only on the bidders but other meter point, not related to the bidders, should be added
+    # todo: Now we cycle only on the bidders but other meter point, not related to the bidders, could be added
     for bidder in bidders:
         metering_agent.add_metering_point(bidder.id)
 
     # Initialize MarketOperator
-    market_op = MarketOperator(alpha_rem=5.0, beta_rem=-2.0, threshold_rem=0.1, power_ref=100, price_ref=20)
+    # market_op = MarketOperator(alpha_rem=5.0, beta_rem=-2.0, gamma_rem=0.5, threshold_rem=0.1, threshold_rem_bid_inf=0.25, power_ref=100, price_ref=20)
+    market_op = MarketOperator(alpha_rem=0, beta_rem=0, gamma_rem=0, threshold_rem=0.1, threshold_rem_bid_inf=0.25, power_ref=100, price_ref=20)
 
     # Main simulation loop
     all_accepted_bids = {}
@@ -187,6 +167,9 @@ def test_market_simulation():
 
     # Plot and save flexibility activation for each bidder
     plot_flexibility_from_history(market_op, plot_dir)
+
+    # Plot and save flexibility activation and rewards for each bidder
+    plot_flexibility_and_rewards_from_history(market_op, plot_dir)
 
 if __name__ == "__main__":
     # todo (listed by priority):

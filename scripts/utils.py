@@ -208,7 +208,7 @@ def plot_rewards_per_bidder(all_accepted_bids, plot_dir):
         plt.plot(data['time_slots'], data['rewards'], label=f'Rewards for {bidder_id}')
         plt.xlabel('Time Step')
         plt.ylabel('Reward')
-        plt.title(f'Rewards over Time for {bidder_id}')
+        plt.title(f'Rewards for {bidder_id}')
         # plt.legend()
         plt.grid()
         plt.savefig(os.path.join(plot_dir, f'rewards_{bidder_id}.png'))
@@ -235,7 +235,7 @@ def plot_all_bidders_rewards(all_accepted_bids, plot_dir):
 
     plt.xlabel('Time Step')
     plt.ylabel('Reward')
-    plt.title('Rewards over Time for All Bidders')
+    plt.title('Rewards for All Bidders')
     plt.legend()
     plt.grid()
     plt.savefig(os.path.join(plot_dir, 'all_bidders_rewards.png'))
@@ -273,4 +273,51 @@ def plot_flexibility_from_history(market_operator, plot_dir):
         plt.legend()
         plt.grid(True)
         plt.savefig(f"{plot_dir}/flexibility_{bidder_id}.png")
+        plt.close()
+
+import matplotlib.pyplot as plt
+
+def plot_flexibility_and_rewards_from_history(market_operator, plot_dir):
+    """
+    Plot the bidded flexibility, real provided flexibility, and rewards for each bidder using clearing_results_history.
+
+    :param market_operator: MarketOperator object
+    :param plot_dir: Directory to save the plots
+    """
+    bidder_data = {}
+
+    # Aggregate data for each bidder
+    for time_slot, results in market_operator.clearing_results_history.items():
+        for result in results:
+            allocations = result['allocations']
+            for allocation in allocations:
+                bidder_id = allocation['bidder_id']
+                if bidder_id not in bidder_data:
+                    bidder_data[bidder_id] = {'time_slots': [], 'bidded_flexibility': [], 'real_flexibility': [], 'rewards': []}
+                bidder_data[bidder_id]['time_slots'].append(time_slot)
+                bidder_data[bidder_id]['bidded_flexibility'].append(allocation['bidded_flexibility'])
+                bidder_data[bidder_id]['real_flexibility'].append(allocation['provided_flexibility'])
+                bidder_data[bidder_id]['rewards'].append(allocation['reward'])
+
+    # Plot data for each bidder
+    for bidder_id, data in bidder_data.items():
+        fig, ax1 = plt.subplots(figsize=(10, 6))
+
+        ax1.set_xlabel('Time Slot')
+        ax1.set_ylabel('Flexibility (kW)', color='tab:blue')
+        ax1.plot(data['time_slots'], data['bidded_flexibility'], label='Bidded Flexibility', color='tab:blue')
+        ax1.plot(data['time_slots'], data['real_flexibility'], label='Real Provided Flexibility', color='tab:green')
+        ax1.tick_params(axis='y', labelcolor='tab:blue')
+        ax1.legend(loc='upper left')
+        ax1.grid(True)
+
+        ax2 = ax1.twinx()
+        ax2.set_ylabel('Rewards', color='tab:red')
+        ax2.plot(data['time_slots'], data['rewards'], label='Rewards', color='tab:red')
+        ax2.tick_params(axis='y', labelcolor='tab:red')
+        ax2.legend(loc='upper right')
+
+        plt.title(f'Flexibility and Rewards for Bidder {bidder_id}')
+        fig.tight_layout()
+        plt.savefig(f"{plot_dir}/flexibility_rewards_{bidder_id}.png")
         plt.close()
