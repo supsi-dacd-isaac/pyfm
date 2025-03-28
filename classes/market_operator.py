@@ -9,13 +9,15 @@ class MarketOperator:
       4) Settles/Remunerates based on the approach described in the attached PDF (Chapter 4).
     """
 
-    def __init__(self, alpha_rem, beta_rem, threshold_rem, power_ref, price_ref):
+    def __init__(self, alpha_rem, beta_rem, gamma_rem, threshold_rem, threshold_rem_bid_inf, power_ref, price_ref):
         """
         Initialize the MarketOperator with remuneration parameters.
         """
         self.alpha_rem = alpha_rem
         self.beta_rem = beta_rem
+        self.gamma_rem = gamma_rem
         self.threshold_rem = threshold_rem
+        self.threshold_rem_bid_inf = threshold_rem_bid_inf
 
         # Data structures to store incoming requests/bids
         self.buyer_requests = {}
@@ -145,7 +147,10 @@ class MarketOperator:
 
                     allocated_power = min(real_flexibility, remaining_demand)
                     if allocated_power > 0:
-                        bid['reward'] = self.calculate_reward(bid['price'], real_flexibility, request['requested_power'])
+                        bid['reward'] = self.calculate_reward(price=bid['price'],
+                                                              bidded_flexibility=bid['power'],
+                                                              provided_flexibility=real_flexibility,
+                                                              requested_flexibility=request['requested_power'])
                         allocations.append({
                             'bidder_id': bid['bidder_id'],
                             'bidded_flexibility': bid['power'],
@@ -277,7 +282,7 @@ class MarketOperator:
     def is_time_slot_cleared(self, time_slot):
         return time_slot in self.cleared_time_slots
 
-    def calculate_reward(self, price, real_flexibility, power_requested):
+    def calculate_reward(self, price, bidded_flexibility, provided_flexibility, requested_flexibility):
         """
         Calculate the reward for a given accepted bid based on the real flexibility amount and power requested.
 
@@ -285,21 +290,23 @@ class MarketOperator:
         ----------
         price : float
             The price offered by the bidder.
-        real_flexibility : float
-            The actual flexibility provided by the bidder.
-        power_requested : float
-            The power requested by the buyer.
-
+        bidded_flexibility : float
+            The flexibility amount bidded by the bidder.
+        provided_flexibility : float
+            The actual flexibility amount provided by the bidder.
+        requested_flexibility : float
+            The flexibility amount requested by the buyer.
         Returns
         -------
         float
             The calculated reward.
         """
-        base = min(power_requested, real_flexibility) * price
-        penalty = self.alpha_rem * max(power_requested - real_flexibility - (self.threshold_rem * power_requested), 0) * price
-        adjustment = self.beta_rem * max(real_flexibility - power_requested - (self.threshold_rem * power_requested), 0) * price
+        base = min(requested_flexibility, provided_flexibility) * price
+        under_delivery_penalty = self.alpha_rem * max(requested_flexibility - provided_flexibility - (self.threshold_rem * requested_flexibility), 0) * price
+        over_delivery_adjustment = self.beta_rem * max(provided_flexibility - requested_flexibility - (self.threshold_rem * requested_flexibility), 0) * price
+        bid_inflation_penalty = self.gamma_rem * max(bidded_flexibility - requested_flexibility - (self.threshold_rem_bid_inf * bidded_flexibility), 0) * price
 
-        return base - penalty + adjustment
+        return base - under_delivery_penalty + over_delivery_adjustment - bid_inflation_penalty
 
     def store_bidder_baseline(self, bidder_id, baseline):
         if isinstance(baseline, pd.DataFrame):
