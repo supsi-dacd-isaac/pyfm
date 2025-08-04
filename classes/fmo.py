@@ -32,6 +32,15 @@ class FMO:
         self.ledger = ledger
         self.pgi = pgi
 
+    def __execute_sql(self, sql):
+        if self.pgi is not None:
+            cur = self.pgi.conn.cursor()
+            cur.execute(sql)
+            cur.close()
+        else:
+            self.logger.warning('PostgreSQL interface not available, logging instead.')
+            self.logger.info('FMO unexecuted query: %s' % sql)
+        
     def add_entry_to_market_ledger(self, timeslot, player, portfolio, features):
         if portfolio is None:
             portfolio_id = 'none'
@@ -47,9 +56,7 @@ class FMO:
                (timeslot, player.cfg['id'], player.cfg['role'], portfolio_id, features['side'],
                 features['regulationType'], features['quantity'], 'MW', float(price),
                 self.cfg['orderSection']['mainSettings']['currency']))
-        cur = self.pgi.conn.cursor()
-        cur.execute(sql)
-        cur.close()
+        self.__execute_sql(sql)
         return True
 
     def add_entry_to_contract_request_ledger(self, player, market_name, request_data):
@@ -71,9 +78,7 @@ class FMO:
                 float(request_data['unitPrice']),
                 request_data['crontab'],
                 ))
-        cur = self.pgi.conn.cursor()
-        cur.execute(sql)
-        cur.close()
+        self.__execute_sql(sql)
         return True
 
     def add_entry_to_contract_proposal_ledger(self, player, organization_metadata, portfolio_metadata,
@@ -110,9 +115,7 @@ class FMO:
                 float(request_data['autoCreateExpiry']),
                 request_data['autoCreateExpiryRelativeTo']
                 ))
-        cur = self.pgi.conn.cursor()
-        cur.execute(sql)
-        cur.close()
+        self.__execute_sql(sql)
         return True
 
     def update_contract_request(self, contract_proposal, body):
