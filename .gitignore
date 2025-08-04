@@ -8,3 +8,4 @@ tkns/*
 .env
 .vscode
 __pycache__
+*.ipynb

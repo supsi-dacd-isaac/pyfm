@@ -3,6 +3,7 @@ import random
 import sys
 from datetime import datetime, timedelta
 from influxdb import DataFrameClient
+import pandas as pd
 
 from classes.nodes_interface import NODESInterface
 
@@ -99,11 +100,18 @@ class Player:
             demanded_flexibility = self.get_random_quantity()
         elif self.cfg['flexibilitySource'] == 'db':
             demanded_flexibility = self.get_quantity_from_db(dt_slot)
+        elif self.cfg['flexibilitySource'] == 'forecast':
+            demanded_flexibility = self.get_quantity_from_forecast(dt_slot)
         else:
             self.logger.error('Option \'%s\' not available for demanding flexibility '
                               'strategy' % self.cfg['flexibilitySource'])
             return False
 
+        # Check that demanded flexibility is not zero
+        if demanded_flexibility == 0.0:
+            self.logger.info('No flexibility demanded for slot %s' % dt_slot.strftime('%Y-%m-%dT%H:%M:%SZ'))
+            return False
+        
         # Get the node id configured to demand flexibility
         node_id = None
         for n in self.grid_nodes:
@@ -152,6 +160,33 @@ class Player:
         except Exception as e:
             self.logger.error('EXCEPTION: %s' % str(e))
             return False
+        
+    def get_quantity_from_forecast(self, dt_slot):
+        """Quantity is calculated based on the forecasted value and a threshold (cut).
+
+        Args:
+            dt_slot (_type_): time slot
+
+        Returns:
+            _type_: max(forecasted_value - cut_value, 0)
+        """
+        forecasted_value = 0.0
+        if self.cfg['orderSection']['quantities']['forecast']["source"] == 'file':
+            df = pd.read_csv(self.cfg['orderSection']['quantities']['forecast']["filename"], sep=',')
+            df['slot_dt'] = pd.to_datetime(df['slot'])
+            forecasted_value = df[df['slot_dt'] > datetime.now()].iloc[0]["quantity"]
+            pass
+        elif self.cfg['orderSection']['quantities']['forecast']["source"] == 'aem':
+            #TODO read from AEM db
+            pass
+        else:
+            self.logger.error('Option \'%s\' not available for forecasting input '
+                              % self.cfg['orderSection']['quantities']['forecast']["source"])
+            raise Exception('Option \'%s\' not available for forecasting input '
+                            % self.cfg['orderSection']['quantities']['forecast']["source"])
+        
+        cut_value = self.cfg['orderSection']['quantities']['forecast']["cut"]
+        return max(forecasted_value - cut_value, 0.0)
 
     def sell_flexibility(self, dt, p_id, dso_demand):
         selling_result = {}
