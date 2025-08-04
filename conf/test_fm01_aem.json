@@ -1,7 +1,7 @@
 {
   "connectionsFile": "../conf/private/conns.json",
   "baseline": {
-    "source": "db",
+    "source": "file",
     "shiftMinutes": 30,
     "fileSettings": {
       "profileFile": "../data/baselines/example01.csv"
@@ -13,7 +13,7 @@
   },
   "fm": {
     "granularity": 15,
-    "ordersTimeShift": 60,
+    "ordersTimeShift": 90,
     "marketName": "Opentunity-CH",
     "gridAreaName": "Switzerland",
     "actors": {
@@ -79,7 +79,7 @@
         },
         "supsi02": {
           "id": "SUPSI2",
-          "name": "SUPSI2",
+          "name": "SUPSI VIRTUELL",
           "role": "fsp",
           "baselines": {
             "tmpFolder": "../data/tmp",

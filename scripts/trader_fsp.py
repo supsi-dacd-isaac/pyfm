@@ -8,6 +8,8 @@ import datetime
 from datetime import datetime, timedelta
 import pandas as pd
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from classes.dso import DSO
 from classes.fsp import FSP
 from classes.fmo import FMO

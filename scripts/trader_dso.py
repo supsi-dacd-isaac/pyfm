@@ -5,6 +5,8 @@ import os
 import sys
 import json
 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from classes.dso import DSO
 from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface

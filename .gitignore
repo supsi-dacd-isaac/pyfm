@@ -5,3 +5,6 @@ data/tmp/*
 data/plots/*
 data/csv/*
 tkns/*
+.env
+.vscode
+__pycache__
