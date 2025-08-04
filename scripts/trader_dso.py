@@ -44,7 +44,11 @@ if __name__ == "__main__":
     logger.info('Starting program')
 
     # Database connection
-    pgi = PostgreSQLInterface(cfg['postgreSQL'], logger)
+    pgi = None
+    try:
+        pgi = PostgreSQLInterface(cfg['postgreSQL'], logger)
+    except Exception as e:
+        logger.error('Unable to connect to PostgreSQL: %s' % str(e))
 
     # Market main parameters
 
