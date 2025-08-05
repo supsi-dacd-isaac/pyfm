@@ -33,9 +33,9 @@
               "daysToGoBack": 7
             },
             "forecast": {
-              "source": "file",
+              "source": "aem",
               "filename": "../data/forecast/example01.csv",
-              "cut": 110.0
+              "cut": 90.0
             }
           },
           "mainSettings": {

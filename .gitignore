@@ -9,3 +9,4 @@ tkns/*
 .vscode
 __pycache__
 *.ipynb
+*.log

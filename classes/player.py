@@ -7,7 +7,6 @@ import pandas as pd
 
 from classes.nodes_interface import NODESInterface
 
-
 class Player:
     """
     Player (Flexibility Service Provider) class
@@ -174,11 +173,13 @@ class Player:
         if self.cfg['orderSection']['quantities']['forecast']["source"] == 'file':
             df = pd.read_csv(self.cfg['orderSection']['quantities']['forecast']["filename"], sep=',')
             df['slot_dt'] = pd.to_datetime(df['slot'])
-            forecasted_value = df[df['slot_dt'] > datetime.now()].iloc[0]["quantity"]
-            pass
+            forecasted_value = df[df['slot_dt'] >= dt_slot].iloc[0]["quantity"]
         elif self.cfg['orderSection']['quantities']['forecast']["source"] == 'aem':
-            #TODO read from AEM db
-            pass
+            from aemDataManagement.data_storage.influxdb import Influx
+            aemInflux = Influx(config=self.main_cfg['aemInfluxDB'])
+            start = dt_slot - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
+            end = start + timedelta(minutes=self.main_cfg['fm']['granularity'])
+            forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL3")["value"].mean() #TODO update when available 
         else:
             self.logger.error('Option \'%s\' not available for forecasting input '
                               % self.cfg['orderSection']['quantities']['forecast']["source"])
@@ -186,7 +187,8 @@ class Player:
                             % self.cfg['orderSection']['quantities']['forecast']["source"])
         
         cut_value = self.cfg['orderSection']['quantities']['forecast']["cut"]
-        return max(forecasted_value - cut_value, 0.0)
+        self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
+        return max(forecasted_value - cut_value, 0.0)/1000 # We work with kW, nodes work with MW
 
     def sell_flexibility(self, dt, p_id, dso_demand):
         selling_result = {}
