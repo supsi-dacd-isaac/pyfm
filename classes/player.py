@@ -176,10 +176,10 @@ class Player:
             forecasted_value = df[df['slot_dt'] >= dt_slot].iloc[0]["quantity"]
         elif self.cfg['orderSection']['quantities']['forecast']["source"] == 'aem':
             from aemDataManagement.data_storage.influxdb import Influx
-            aemInflux = Influx(config=self.main_cfg['aemInfluxDB'])
+            aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']["token"] , config=self.main_cfg['aemInfluxDB'])
             start = dt_slot - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
             end = start + timedelta(minutes=self.main_cfg['fm']['granularity'])
-            forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL3")["value"].mean() #TODO update when available 
+            forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].mean() #TODO update when available 
         else:
             self.logger.error('Option \'%s\' not available for forecasting input '
                               % self.cfg['orderSection']['quantities']['forecast']["source"])

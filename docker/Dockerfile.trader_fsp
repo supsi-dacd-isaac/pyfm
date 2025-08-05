@@ -1,0 +1,17 @@
+FROM python:3.11.4-slim-bookworm
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y gcc libpq-dev
+
+# install dependencies
+RUN pip install --upgrade pip
+COPY ./requirements.txt .
+RUN pip install -r requirements.txt
+
+# copy project
+COPY . .
+WORKDIR /app/scripts
+
+RUN chmod +x /app/scripts/trader_fsp.sh
+CMD ["/app/scripts/trader_fsp.sh"]

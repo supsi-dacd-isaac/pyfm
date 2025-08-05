@@ -1,0 +1,29 @@
+FROM python:3.11.4-slim-bookworm
+
+# Setup ssh for AEM git
+RUN apt update
+RUN apt install -y git
+RUN apt-get update && apt-get install -y gcc libpq-dev
+COPY credentials/ssh/id_rsa /root/.ssh/id_rsa
+COPY credentials/ssh/id_rsa.pub /root/.ssh/id_rsa.pub
+RUN git config --global user.name "aem.api"
+RUN git config --global user.email "api@aemsa.ch"
+RUN ssh-keyscan -t rsa github.com >> /root/.ssh/known_hosts
+RUN chmod 600 /root/.ssh/id_rsa
+
+WORKDIR /app
+
+# install dependencies
+RUN pip install --upgrade pip
+COPY ./requirements.txt .
+RUN pip install -r requirements.txt
+
+ARG CACHEBUST=0
+RUN pip install git+ssh://git@github.com/azienda-elettrica-massagno/AEM-RD-DataManagement.git@develop
+
+# copy project
+COPY . .
+WORKDIR /app/scripts
+
+RUN chmod +x /app/scripts/trader_dso.sh
+CMD ["/app/scripts/trader_dso.sh"]

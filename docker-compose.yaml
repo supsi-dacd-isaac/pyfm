@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  baseline_updater:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile.baseline_updater
+  trader_dso:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile.trader_dso
+  trader_fsp:
+    build:
+      context: .
+      dockerfile: ./docker/Dockerfile.trader_fsp

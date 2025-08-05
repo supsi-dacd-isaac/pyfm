@@ -10,3 +10,4 @@ tkns/*
 __pycache__
 *.ipynb
 *.log
+credentials
