@@ -159,7 +159,7 @@ class Player:
         except Exception as e:
             self.logger.error('EXCEPTION: %s' % str(e))
             return False
-        
+    
     def get_quantity_from_forecast(self, dt_slot):
         """Quantity is calculated based on the forecasted value and a threshold (cut).
 
@@ -170,13 +170,13 @@ class Player:
             _type_: max(forecasted_value - cut_value, 0)
         """
         forecasted_value = 0.0
-        if self.cfg['orderSection']['quantities']['forecast']["source"] == 'file':
-            df = pd.read_csv(self.cfg['orderSection']['quantities']['forecast']["filename"], sep=',')
+        if self.cfg['orderSection']['quantities']['forecast']['source'] == 'file':
+            df = pd.read_csv(self.cfg['orderSection']['quantities']['forecast']['filename'], sep=',')
             df['slot_dt'] = pd.to_datetime(df['slot'])
             forecasted_value = df[df['slot_dt'] >= dt_slot].iloc[0]["quantity"]
-        elif self.cfg['orderSection']['quantities']['forecast']["source"] == 'aem':
+        elif self.cfg['orderSection']['quantities']['forecast']['source'] == 'aem':
             from aemDataManagement.data_storage.influxdb import Influx
-            aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']["token"] , config=self.main_cfg['aemInfluxDB'])
+            aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']['token'] , config=self.main_cfg['aemInfluxDB'])
             start = dt_slot - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
             end = start + timedelta(minutes=self.main_cfg['fm']['granularity'])
             forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].mean() #TODO update when available 
@@ -190,9 +190,43 @@ class Player:
         self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
         return max(forecasted_value - cut_value, 0.0)/1000 # We work with kW, nodes work with MW
 
+    def check_demand_price(self, dt, demand, quantity_to_sell):
+        """
+        Check if the demand price is acceptable for the player to sell flexibility.
+        """
+        # potential based on forecasting
+        
+        if self.cfg['orderSection']['mainSettings']['forecast']['source'] == 'file':
+            df = pd.read_csv(self.cfg['orderSection']['mainSettings']['forecast']['filename'], sep=',')
+            df['slot_dt'] = pd.to_datetime(df['slot'])
+            forecasted_value = df[df['slot_dt'] >= dt].iloc[0]["quantity"]
+            forecasting = df["quantity"]
+        elif self.cfg['orderSection']['mainSettings']['forecast']['source'] == 'aem':
+            from aemDataManagement.data_storage.influxdb import Influx
+            aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']["token"] , config=self.main_cfg['aemInfluxDB'])
+            start = dt - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
+            end = start + timedelta(minutes=self.main_cfg['fm']['granularity'])
+            forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].mean() #TODO update when available
+            forecasting = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].resample('15T').to_list() #TODO update when available
+        
+        forecasting_min = min(forecasting)
+        forecasting_max = max(forecasting)
+        forecasting_dt = forecasted_value
+        potential_ratio = (forecasting_dt - forecasting_min) / (forecasting_max - forecasting_min) 
+        potential = potential_ratio * quantity_to_sell * self.cfg['orderSection']['mainSettings']['potentialMultiplier']
+        min_price = self.cfg['orderSection']['mainSettings']['activationCost'] + potential
+        if demand['unitPrice'] < min_price:
+            self.logger.info('Demand price %.3f is lower than the minimum acceptable price %.3f, order not accepted.' %
+                             (demand['unitPrice'], min_price))
+            return False
+        self.logger.info('Demand price %.3f is acceptable, potential %.3f, minimum price %.3f' %
+                         (demand['unitPrice'], potential, min_price))
+        return True    
+
+
     def sell_flexibility(self, dt, p_id, dso_demand):
         selling_result = {}
-        for k_regulation_type in dso_demand.keys():
+        for k_regulation_type in ["Up", "Down"]:
             quantity_to_sell = self.calculate_quantity_to_sell_basic(dt, dso_demand[k_regulation_type],
                                                                      self.baselines[p_id]['quantity'])
 
@@ -217,6 +251,10 @@ class Player:
                     selling_result[k_regulation_type] = False
             else:
                 selling_result[k_regulation_type] = False
+            if selling_result[k_regulation_type] is not False:
+                # If demand price is too low we don't accept the order
+                if not self.check_demand_price(dt, dso_demand, quantity_to_sell):
+                    selling_result[k_regulation_type] = False
         return selling_result
 
     def print_user_info(self, user_info):
@@ -230,6 +268,7 @@ class Player:
         self.logger.info('market name: %s' % self.markets[0]['name'])
 
     def get_flexibility_quantities(self, slot_time, granularity, order_type, quantity_type):
+        # Deprecated method, get_flexibility_requests should be used instead (return a list of requests instad of a sum)
         filter_dict = {
             'ownerOrganizationId': self.organization['id'],
             'periodFrom': slot_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -255,6 +294,35 @@ class Player:
                                                                                                  quantity_up,
                                                                                                  quantity_dn))
         return {'Up': quantity_up, 'Down': quantity_dn}
+    
+    def get_flexibility_requests(self, slot_time, granularity, order_type, quantity_type):
+        # Deprecated method
+        filter_dict = {
+            'ownerOrganizationId': self.organization['id'],
+            'periodFrom': slot_time.strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'periodTo': (slot_time + timedelta(minutes=granularity)).strftime('%Y-%m-%dT%H:%M:%SZ'),
+            'type': order_type,
+            'quantityType': quantity_type,
+        }
+        orders = self.get_orders(filter_dict=filter_dict)
+
+        requests = []
+        for order in orders:
+            request = {}
+            # Only not-settled order will be considered
+            if order['completionType'] is None:
+                if order['regulationType'] == 'Down':
+                    request["Down"] = float(order['quantity'])
+                    request["Up"] = 0.0
+                elif order['regulationType'] == 'Up':
+                    request["Up"] = float(order['quantity'])
+                    request["Down"] = 0.0
+                request["unitPrice"] = float(order['unitPrice'])
+                requests.append(request)
+                self.logger.info('Flexibility demanded by the DSO (%s): Up = %.3f MW, Down = %.3f MW, Price = %.3f' % (quantity_type,
+                                                                                                 request["Up"] ,
+                                                                                                 request["Down"], request["unitPrice"]))
+        return requests
 
     def calculate_quantity_to_sell_basic(self, timeslot, demand, baseline_time_series):
         if demand > 0:

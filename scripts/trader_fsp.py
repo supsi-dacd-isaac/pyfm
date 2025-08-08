@@ -70,9 +70,13 @@ if __name__ == "__main__":
     fsp_identifier = args.fsp
 
     logger.info('Starting program')
-
+    
     # Database connection
-    pgi = PostgreSQLInterface(cfg['postgreSQL'], logger)
+    pgi = None
+    try:
+        pgi = PostgreSQLInterface(cfg['postgreSQL'], logger)
+    except Exception as e:
+        logger.error('Unable to connect to PostgreSQL: %s' % str(e))
 
     # Actors definition
     # DSO
@@ -91,7 +95,8 @@ if __name__ == "__main__":
     logger.info('market name: %s' % fsp.markets[0]['name'])
 
     # Get quantities demanded by the DSO in the
-    dso_demand = dso.get_flexibility_quantities(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
+    # dso_demand = dso.get_flexibility_quantities(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
+    dso_demands = dso.get_flexibility_requests(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
 
     # Set current baselines for FSP
     fsp.download_baselines(slot_time)
@@ -100,13 +105,14 @@ if __name__ == "__main__":
     fmo = FMO(fsp.cfg, logger, pgi)
 
     # Place orders
-    for p_k in fsp.portfolios.keys():
-        resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
-        for k in resp_selling.keys():
-            if resp_selling[k] is not False:
-                fmo.add_entry_to_market_ledger(timeslot=slot_time,
-                                               player=fsp,
-                                               portfolio=fsp.portfolios[p_k].metadata['name'],
-                                               features=resp_selling[k])
+    for dso_demand in dso_demands:
+        for p_k in fsp.portfolios.keys():
+            resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
+            for k in resp_selling.keys():
+                if resp_selling[k] is not False:
+                    fmo.add_entry_to_market_ledger(timeslot=slot_time,
+                                                player=fsp,
+                                                portfolio=fsp.portfolios[p_k].metadata['name'],
+                                                features=resp_selling[k])
 
     logger.info('Ending program')

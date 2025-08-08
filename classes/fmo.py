@@ -119,27 +119,32 @@ class FMO:
         return True
 
     def update_contract_request(self, contract_proposal, body):
-        select_query = 'SELECT id FROM contract_proposal_ledger WHERE contract_name = %s;'
+        if self.pgi is not None:
+            select_query = 'SELECT id FROM contract_proposal_ledger WHERE contract_name = %s;'
 
-        cur = self.pgi.conn.cursor()
-        cur.execute(select_query, (contract_proposal['name'],))
+            cur = self.pgi.conn.cursor()
+            cur.execute(select_query, (contract_proposal['name'],))
 
-        # Fetch all results from the executed query
-        results = cur.fetchall()
+            # Fetch all results from the executed query
+            results = cur.fetchall()
 
-        signature = 1 if body['approvedByBuyer'] else 2
+            signature = 1 if body['approvedByBuyer'] else 2
 
-        if len(results) == 1:
-            update_query = '''
-                UPDATE contract_proposal_ledger
-                SET approved_by_buyer = %s, visibility = %s
-                WHERE id = %s;  -- Assuming 'id' is the primary key column
-            '''
+            if len(results) == 1:
+                update_query = '''
+                    UPDATE contract_proposal_ledger
+                    SET approved_by_buyer = %s, visibility = %s
+                    WHERE id = %s;  -- Assuming 'id' is the primary key column
+                '''
 
-            new_values = (signature, body['visibility'], results[0][0])
-            cur.execute(update_query, new_values)
-            self.pgi.conn.commit()
-            return True
+                new_values = (signature, body['visibility'], results[0][0])
+                cur.execute(update_query, new_values)
+                self.pgi.conn.commit()
+                return True
+            else:
+                self.logger.warning('Found %i contracts instead of 1' % len(results))
+                return False
         else:
-            self.logger.warning('Found %i contracts instead of 1' % len(results))
+            self.logger.warning('PostgreSQL interface not available, logging instead.')
+            self.logger.info('FMO unexecuted query: %s' % body)
             return False

@@ -33,9 +33,9 @@
               "daysToGoBack": 7
             },
             "forecast": {
-              "source": "aem",
+              "source": "file",
               "filename": "../data/forecast/example01.csv",
-              "cut": 65.0
+              "cut": 20.0
             }
           },
           "mainSettings": {
@@ -73,7 +73,14 @@
               "unitPrice": 10,
               "priceType": "Limit",
               "currency": "CHF",
-              "fillType": "Normal"
+              "fillType": "Normal",
+              "activationCost": 1,
+              "potentialMultiplier": 1.0,
+              "forecast": {
+                "source": "file",
+                "filename": "../data/forecast/example01.csv",
+                "cut": 20.0
+              }
             }
           },
           "contractSection": {
@@ -98,7 +105,9 @@
               "unitPrice": 10,
               "priceType": "Limit",
               "currency": "CHF",
-              "fillType": "Normal"
+              "fillType": "Normal",
+              "activationCost": 1.0,
+              "potentialMultiplier": 1.0
             }
           }
         }
