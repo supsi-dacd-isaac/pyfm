@@ -32,16 +32,20 @@
               "device": "sgim",
               "daysToGoBack": 7
             },
-            "forecast": {
+            "forecasting_cut": 20.0
+          },
+          "unitPrice":{
+            "source": "constant",
+            "constant": 0.1,
+            "forecasting_multiplier": 10.0
+          },
+          "forecast":{
               "source": "file",
-              "filename": "../data/forecast/example01.csv",
-              "cut": 20.0
-            }
+              "filename": "../data/forecast/example01.csv"
           },
           "mainSettings": {
             "side": "Buy",
             "regulationType": "Up",
-            "unitPrice": 10,
             "priceType": "Limit",
             "currency": "CHF",
             "fillType": "Normal"
@@ -73,15 +77,18 @@
               "unitPrice": 10,
               "priceType": "Limit",
               "currency": "CHF",
-              "fillType": "Normal",
-              "activationCost": 1,
-              "potentialMultiplier": 1.0,
-              "forecast": {
-                "source": "file",
-                "filename": "../data/forecast/example01.csv",
-                "cut": 20.0
-              }
+              "fillType": "Normal"
             }
+          },
+          "pricing": {
+            "source": "constant",
+            "constant": 5.0,
+            "forecasting_multiplier": 1.0,
+            "activationCost": 1.0
+          },
+          "forecast":{
+            "source": "file",
+            "filename": "../data/forecast/example01.csv"
           },
           "contractSection": {
             "mainSettings": {

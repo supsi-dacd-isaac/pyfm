@@ -93,6 +93,18 @@ class Player:
         else:
             return []
 
+
+    def calculate_unit_price(self):
+        if self.cfg['orderSection']['unitPrice']['source'] == 'constant':
+            return self.cfg['orderSection']['unitPrice']['constant']
+        elif self.cfg['orderSection']['unitPrice']['source'] == 'forecast':
+            # TODO
+            return 0.0
+        else:
+            self.logger.error('Option \'%s\' not available for unit price calculation' % self.cfg['orderSection']['unitPrice']['source'])
+            return 0.0
+
+
     def demand_flexibility(self, dt_slot):
         # Get demanded quantity
         if self.cfg['flexibilitySource'] == 'random':
@@ -125,6 +137,7 @@ class Player:
             "marketId": self.markets[0]['id'],
             "gridNodeId": node_id,
             "quantity": demanded_flexibility,
+            "unitPrice": self.calculate_unit_price(),
         }
         body.update(self.cfg['orderSection']['mainSettings'])
         response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
@@ -160,21 +173,14 @@ class Player:
             self.logger.error('EXCEPTION: %s' % str(e))
             return False
     
-    def get_quantity_from_forecast(self, dt_slot):
-        """Quantity is calculated based on the forecasted value and a threshold (cut).
-
-        Args:
-            dt_slot (_type_): time slot
-
-        Returns:
-            _type_: max(forecasted_value - cut_value, 0)
+    def get_forecast(self, dt_slot):
+        """Get forecasting timeseries
         """
-        forecasted_value = 0.0
-        if self.cfg['orderSection']['quantities']['forecast']['source'] == 'file':
-            df = pd.read_csv(self.cfg['orderSection']['quantities']['forecast']['filename'], sep=',')
+        if self.cfg['orderSection']['forecast']['source'] == 'file':
+            df = pd.read_csv(self.cfg['orderSection']['forecast']['filename'], sep=',')
             df['slot_dt'] = pd.to_datetime(df['slot'])
             forecasted_value = df[df['slot_dt'] >= dt_slot].iloc[0]["quantity"]
-        elif self.cfg['orderSection']['quantities']['forecast']['source'] == 'aem':
+        elif self.cfg['orderSection']['forecast']['source'] == 'aem':
             from aemDataManagement.data_storage.influxdb import Influx
             aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']['token'] , config=self.main_cfg['aemInfluxDB'])
             start = dt_slot - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
@@ -182,26 +188,32 @@ class Player:
             forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].mean() #TODO update when available 
         else:
             self.logger.error('Option \'%s\' not available for forecasting input '
-                              % self.cfg['orderSection']['quantities']['forecast']["source"])
+                              % self.cfg['orderSection']['forecast']["source"])
             raise Exception('Option \'%s\' not available for forecasting input '
-                            % self.cfg['orderSection']['quantities']['forecast']["source"])
+                            % self.cfg['orderSection']['forecast']["source"])
         
-        cut_value = self.cfg['orderSection']['quantities']['forecast']["cut"]
-        self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
-        return max(forecasted_value - cut_value, 0.0)/1000 # We work with kW, nodes work with MW
-
-    def check_demand_price(self, dt, demand, quantity_to_sell):
+        return forecasted_value
+    
+    def cut_forecasting(self, dt_slot):
+        """ Cut the forecasted value based on the configs.
         """
-        Check if the demand price is acceptable for the player to sell flexibility.
+        forecasted_value = self.get_forecast(dt_slot)
+        cut_value = self.cfg['orderSection']['quantities']['forecasting_cut']
+        self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
+        return max(forecasted_value - cut_value, 0.0)/1000 
+
+    def check_demand_price_forecasting(self, dt, demand, quantity_to_sell):
+        """
+        Check if the demand price is acceptable for the player to sell flexibility based on forecasted value for the day.
         """
         # potential based on forecasting
         
-        if self.cfg['orderSection']['mainSettings']['forecast']['source'] == 'file':
-            df = pd.read_csv(self.cfg['orderSection']['mainSettings']['forecast']['filename'], sep=',')
+        if self.cfg['forecast']['source'] == 'file':
+            df = pd.read_csv(self.cfg['forecast']['filename'], sep=',')
             df['slot_dt'] = pd.to_datetime(df['slot'])
             forecasted_value = df[df['slot_dt'] >= dt].iloc[0]["quantity"]
             forecasting = df["quantity"]
-        elif self.cfg['orderSection']['mainSettings']['forecast']['source'] == 'aem':
+        elif self.cfg['forecast']['source'] == 'aem':
             from aemDataManagement.data_storage.influxdb import Influx
             aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']["token"] , config=self.main_cfg['aemInfluxDB'])
             start = dt - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
@@ -213,15 +225,34 @@ class Player:
         forecasting_max = max(forecasting)
         forecasting_dt = forecasted_value
         potential_ratio = (forecasting_dt - forecasting_min) / (forecasting_max - forecasting_min) 
-        potential = potential_ratio * quantity_to_sell * self.cfg['orderSection']['mainSettings']['potentialMultiplier']
-        min_price = self.cfg['orderSection']['mainSettings']['activationCost'] + potential
-        if demand['unitPrice'] < min_price:
+        potential = potential_ratio * quantity_to_sell * self.cfg['orderSection']['pricing']['forecasting_multiplier']
+        min_price = self.cfg['orderSection']['pricing']['activationCost'] + potential
+        if demand['unitPrice'] * quantity_to_sell  < min_price:
             self.logger.info('Demand price %.3f is lower than the minimum acceptable price %.3f, order not accepted.' %
-                             (demand['unitPrice'], min_price))
+                             (demand['unitPrice'] * quantity_to_sell, min_price))
             return False
         self.logger.info('Demand price %.3f is acceptable, potential %.3f, minimum price %.3f' %
-                         (demand['unitPrice'], potential, min_price))
-        return True    
+                         (demand['unitPrice'] * quantity_to_sell, min_price))
+        return True
+    
+    def check_demand_price(self, dt, demand, quantity_to_sell):
+        """
+        Check if the demand price is acceptable for the player to sell flexibility.
+        """
+        if self.cfg['orderSection']['pricing']['source'] == 'constant':
+            min_price = self.cfg['orderSection']['pricing']['constant'] * quantity_to_sell
+            if demand['unitPrice'] * quantity_to_sell < min_price:
+                self.logger.info('Demand price %.3f is lower than the minimum acceptable price %.3f, order not accepted.' %
+                                 (demand['unitPrice'] * quantity_to_sell, min_price))
+                return False
+            self.logger.info('Demand price %.3f is acceptable, minimum price %.3f' %
+                             (demand['unitPrice'] * quantity_to_sell, min_price))
+            return True
+        elif self.cfg['orderSection']['pricing']['source'] == 'forecast':
+            return self.check_demand_price_forecasting(dt, demand, quantity_to_sell)
+        else:
+            self.logger.error('Option \'%s\' not available for demand price checking' % self.cfg['orderSection']['pricing']['source'])
+            return False
 
 
     def sell_flexibility(self, dt, p_id, dso_demand):
@@ -242,6 +273,7 @@ class Player:
                     "assetPortfolioId": p_id,
                     "regulationType": k_regulation_type,
                     "quantity": quantity_to_sell,
+                    "unitPrice": 0.01# TODO take from request
                 }
                 body.update(self.cfg['orderSection']['mainSettings'])
                 response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
