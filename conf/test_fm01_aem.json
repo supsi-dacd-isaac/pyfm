@@ -22,6 +22,10 @@
         "name": "Switzerland",
         "role": "dso",
         "flexibilitySource": "forecast",
+        "forecast":{
+          "source": "aem",
+          "filename": "../data/forecast/example01.csv"
+        },
         "orderSection": {
           "nodeName": "Massagno_1",
           "quantities": {
@@ -38,10 +42,6 @@
             "source": "constant",
             "constant": 0.1,
             "forecasting_multiplier": 10.0
-          },
-          "forecast":{
-              "source": "file",
-              "filename": "../data/forecast/example01.csv"
           },
           "mainSettings": {
             "side": "Buy",
@@ -87,7 +87,7 @@
             "activationCost": 1.0
           },
           "forecast":{
-            "source": "file",
+            "source": "aem",
             "filename": "../data/forecast/example01.csv"
           },
           "contractSection": {
@@ -116,6 +116,16 @@
               "activationCost": 1.0,
               "potentialMultiplier": 1.0
             }
+          },
+          "pricing": {
+            "source": "constant",
+            "constant": 5.0,
+            "forecasting_multiplier": 1.0,
+            "activationCost": 1.0
+          },
+          "forecast":{
+            "source": "aem",
+            "filename": "../data/forecast/example01.csv"
           }
         }
       }

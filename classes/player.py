@@ -173,60 +173,50 @@ class Player:
             self.logger.error('EXCEPTION: %s' % str(e))
             return False
     
-    def get_forecast(self, dt_slot):
-        """Get forecasting timeseries
+    def get_forecast(self):
+        """Get forecasting timeseries for the day.
         """
-        if self.cfg['orderSection']['forecast']['source'] == 'file':
-            df = pd.read_csv(self.cfg['orderSection']['forecast']['filename'], sep=',')
-            df['slot_dt'] = pd.to_datetime(df['slot'])
-            forecasted_value = df[df['slot_dt'] >= dt_slot].iloc[0]["quantity"]
-        elif self.cfg['orderSection']['forecast']['source'] == 'aem':
+        if self.cfg['forecast']['source'] == 'file':
+            df = pd.read_csv(self.cfg['forecast']['filename'], sep=',')
+            df['slot'] = pd.to_datetime(df['slot'])
+            df.set_index('slot', inplace=True)
+            forecasting = df['quantity']
+        elif self.cfg['forecast']['source'] == 'aem':
             from aemDataManagement.data_storage.influxdb import Influx
+            start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1) #TODO now we use previous day, update when forecasting will be available
+            end = start + timedelta(days=1)
             aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']['token'] , config=self.main_cfg['aemInfluxDB'])
-            start = dt_slot - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
-            end = start + timedelta(minutes=self.main_cfg['fm']['granularity'])
-            forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].mean() #TODO update when available 
+            forecasting = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].resample('15T').mean() #TODO update when forecasting will be available 
+            forecasting.index = forecasting.index + timedelta(days=1)  #TODO remove when forecasting will be available
         else:
             self.logger.error('Option \'%s\' not available for forecasting input '
-                              % self.cfg['orderSection']['forecast']["source"])
+                              % self.cfg['forecast']["source"])
             raise Exception('Option \'%s\' not available for forecasting input '
-                            % self.cfg['orderSection']['forecast']["source"])
-        
-        return forecasted_value
+                            % self.cfg['forecast']["source"])
+        return forecasting
     
-    def cut_forecasting(self, dt_slot):
+    def get_quantity_from_forecast(self, dt_slot):
         """ Cut the forecasted value based on the configs.
         """
-        forecasted_value = self.get_forecast(dt_slot)
+        forecasting = self.get_forecast()
+        dt_slot = pd.Timestamp(dt_slot).tz_localize('UTC')
+        forecasted_value = forecasting[forecasting.index >= dt_slot].iloc[0]
         cut_value = self.cfg['orderSection']['quantities']['forecasting_cut']
         self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
-        return max(forecasted_value - cut_value, 0.0)/1000 
+        return round(max(forecasted_value - cut_value, 0.0)/1000,3)
 
     def check_demand_price_forecasting(self, dt, demand, quantity_to_sell):
         """
         Check if the demand price is acceptable for the player to sell flexibility based on forecasted value for the day.
         """
-        # potential based on forecasting
-        
-        if self.cfg['forecast']['source'] == 'file':
-            df = pd.read_csv(self.cfg['forecast']['filename'], sep=',')
-            df['slot_dt'] = pd.to_datetime(df['slot'])
-            forecasted_value = df[df['slot_dt'] >= dt].iloc[0]["quantity"]
-            forecasting = df["quantity"]
-        elif self.cfg['forecast']['source'] == 'aem':
-            from aemDataManagement.data_storage.influxdb import Influx
-            aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']["token"] , config=self.main_cfg['aemInfluxDB'])
-            start = dt - timedelta(hours=24) # We take yesterdays data as a forecast #TODO update when forecasting is available
-            end = start + timedelta(minutes=self.main_cfg['fm']['granularity'])
-            forecasted_value = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].mean() #TODO update when available
-            forecasting = aemInflux.read_key(start, end, "sgim-aem003", "property","CH1ActivePowL1")["value"].resample('15T').to_list() #TODO update when available
+        forecasting = self.get_forecast()
         
         forecasting_min = min(forecasting)
         forecasting_max = max(forecasting)
-        forecasting_dt = forecasted_value
+        forecasting_dt = forecasting[forecasting.index >= dt].iloc[0]
         potential_ratio = (forecasting_dt - forecasting_min) / (forecasting_max - forecasting_min) 
-        potential = potential_ratio * quantity_to_sell * self.cfg['orderSection']['pricing']['forecasting_multiplier']
-        min_price = self.cfg['orderSection']['pricing']['activationCost'] + potential
+        potential = potential_ratio * quantity_to_sell * self.cfg['pricing']['forecasting_multiplier']
+        min_price = self.cfg['pricing']['activationCost'] + potential
         if demand['unitPrice'] * quantity_to_sell  < min_price:
             self.logger.info('Demand price %.3f is lower than the minimum acceptable price %.3f, order not accepted.' %
                              (demand['unitPrice'] * quantity_to_sell, min_price))
@@ -239,8 +229,8 @@ class Player:
         """
         Check if the demand price is acceptable for the player to sell flexibility.
         """
-        if self.cfg['orderSection']['pricing']['source'] == 'constant':
-            min_price = self.cfg['orderSection']['pricing']['constant'] * quantity_to_sell
+        if self.cfg['pricing']['source'] == 'constant':
+            min_price = self.cfg['pricing']['constant'] * quantity_to_sell
             if demand['unitPrice'] * quantity_to_sell < min_price:
                 self.logger.info('Demand price %.3f is lower than the minimum acceptable price %.3f, order not accepted.' %
                                  (demand['unitPrice'] * quantity_to_sell, min_price))
@@ -248,10 +238,10 @@ class Player:
             self.logger.info('Demand price %.3f is acceptable, minimum price %.3f' %
                              (demand['unitPrice'] * quantity_to_sell, min_price))
             return True
-        elif self.cfg['orderSection']['pricing']['source'] == 'forecast':
+        elif self.cfg['pricing']['source'] == 'forecast':
             return self.check_demand_price_forecasting(dt, demand, quantity_to_sell)
         else:
-            self.logger.error('Option \'%s\' not available for demand price checking' % self.cfg['orderSection']['pricing']['source'])
+            self.logger.error('Option \'%s\' not available for demand price checking' % self.cfg['pricing']['source'])
             return False
 
 
@@ -262,8 +252,9 @@ class Player:
                                                                      self.baselines[p_id]['quantity'])
 
             self.logger.info('Portfolio: %s, Regulation: %s, Bidded flexibility: %s' % (p_id, k_regulation_type,
-                                                                                        quantity_to_sell))
-            if quantity_to_sell > 0:
+                                                                                        quantity_to_sell))            
+            # Check if the quantity to sell is greater than zero and if the demand price is acceptable
+            if quantity_to_sell > 0 and self.check_demand_price(dt, dso_demand, quantity_to_sell):
                 body = {
                     "ownerOrganizationId": self.organization['id'],
                     "periodFrom": dt.strftime('%Y-%m-%dT%H:%M:%SZ'),
@@ -283,10 +274,6 @@ class Player:
                     selling_result[k_regulation_type] = False
             else:
                 selling_result[k_regulation_type] = False
-            if selling_result[k_regulation_type] is not False:
-                # If demand price is too low we don't accept the order
-                if not self.check_demand_price(dt, dso_demand, quantity_to_sell):
-                    selling_result[k_regulation_type] = False
         return selling_result
 
     def print_user_info(self, user_info):
