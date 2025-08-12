@@ -94,12 +94,16 @@ class Player:
             return []
 
 
-    def calculate_unit_price(self):
+    def calculate_unit_price(self, dt_slot):
         if self.cfg['orderSection']['unitPrice']['source'] == 'constant':
             return self.cfg['orderSection']['unitPrice']['constant']
         elif self.cfg['orderSection']['unitPrice']['source'] == 'forecast':
-            # TODO
-            return 0.0
+            forecasting = self.get_forecast()
+            forecasting_min = min(forecasting)
+            forecasting_max = max(forecasting)
+            forecasting_dt = forecasting[forecasting.index >= dt_slot].iloc[0]
+            ratio = (forecasting_dt - forecasting_min) / (forecasting_max - forecasting_min) 
+            return self.cfg['orderSection']['unitPrice']['forecast_base'] + ratio * self.cfg['orderSection']['unitPrice']['forecast_multiplier']
         else:
             self.logger.error('Option \'%s\' not available for unit price calculation' % self.cfg['orderSection']['unitPrice']['source'])
             return 0.0
@@ -137,7 +141,7 @@ class Player:
             "marketId": self.markets[0]['id'],
             "gridNodeId": node_id,
             "quantity": demanded_flexibility,
-            "unitPrice": self.calculate_unit_price(),
+            "unitPrice": self.calculate_unit_price(dt_slot),
         }
         body.update(self.cfg['orderSection']['mainSettings'])
         response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)
