@@ -36,7 +36,8 @@
               "device": "sgim",
               "daysToGoBack": 7
             },
-            "forecasting_cut": 20.0
+            "forecasting_cut": 20.0,
+            "cut_margin": 5.0
           },
           "unitPrice":{
             "source": "constant",

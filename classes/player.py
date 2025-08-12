@@ -202,6 +202,7 @@ class Player:
         dt_slot = pd.Timestamp(dt_slot).tz_localize('UTC')
         forecasted_value = forecasting[forecasting.index >= dt_slot].iloc[0]
         cut_value = self.cfg['orderSection']['quantities']['forecasting_cut']
+        cut_value -= self.cfg['orderSection']['quantities']['cut_margin'] # Safety margin
         self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
         return round(max(forecasted_value - cut_value, 0.0)/1000,3)
 
