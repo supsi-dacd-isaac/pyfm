@@ -293,7 +293,7 @@ class Player:
                     "assetPortfolioId": p_id,
                     "regulationType": k_regulation_type,
                     "quantity": quantity_to_sell,
-                    "unitPrice": 0.01# TODO take from request
+                    "unitPrice": dso_demand['unitPrice']
                 }
                 body.update(self.cfg['orderSection']['mainSettings'])
                 response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'orders'), body)

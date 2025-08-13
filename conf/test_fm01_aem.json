@@ -27,7 +27,7 @@
           "filename": "../data/forecast/example01.csv"
         },
         "peak": {
-            "source": "aem",
+            "source": "file",
             "filename": "../data/peak/example01.csv"
         },
         "orderSection": {
@@ -80,7 +80,6 @@
             "quantityPercBaseline": 50,
             "mainSettings": {
               "side": "Sell",
-              "unitPrice": 10,
               "priceType": "Limit",
               "currency": "CHF",
               "fillType": "Normal"
@@ -115,12 +114,9 @@
             "quantityPercBaseline": 50,
             "mainSettings": {
               "side": "Sell",
-              "unitPrice": 10,
               "priceType": "Limit",
               "currency": "CHF",
-              "fillType": "Normal",
-              "activationCost": 1.0,
-              "potentialMultiplier": 1.0
+              "fillType": "Normal"
             }
           },
           "pricing": {
