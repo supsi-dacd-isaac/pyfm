@@ -1,0 +1,5 @@
+slot,quantity,quantityType
+00:00,10,Power
+00:15,20,Power
+00:30,50,Power
+00:45,30,Power

@@ -96,14 +96,16 @@ class Player:
 
     def calculate_unit_price(self, dt_slot):
         if self.cfg['orderSection']['unitPrice']['source'] == 'constant':
-            return self.cfg['orderSection']['unitPrice']['constant']
+            return round(self.cfg['orderSection']['unitPrice']['constant'], 2)
         elif self.cfg['orderSection']['unitPrice']['source'] == 'forecast':
+            slot_utc = pd.Timestamp(dt_slot).tz_localize('UTC')
             forecasting = self.get_forecast()
             forecasting_min = min(forecasting)
             forecasting_max = max(forecasting)
-            forecasting_dt = forecasting[forecasting.index >= dt_slot].iloc[0]
+            forecasting_dt = forecasting[forecasting.index >= slot_utc].iloc[0]
             ratio = (forecasting_dt - forecasting_min) / (forecasting_max - forecasting_min) 
-            return self.cfg['orderSection']['unitPrice']['forecast_base'] + ratio * self.cfg['orderSection']['unitPrice']['forecast_multiplier']
+            price = self.cfg['orderSection']['unitPrice']['forecast_base'] + ratio * self.cfg['orderSection']['unitPrice']['forecast_multiplier']
+            return round(price, 2)
         else:
             self.logger.error('Option \'%s\' not available for unit price calculation' % self.cfg['orderSection']['unitPrice']['source'])
             return 0.0
@@ -185,6 +187,7 @@ class Player:
             df['slot'] = pd.to_datetime(df['slot'])
             df.set_index('slot', inplace=True)
             forecasting = df['quantity']
+            forecasting.index = forecasting.index.tz_localize('UTC')
         elif self.cfg['forecast']['source'] == 'aem':
             from aemDataManagement.data_storage.influxdb import Influx
             start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1) #TODO now we use previous day, update when forecasting will be available
@@ -199,13 +202,34 @@ class Player:
                             % self.cfg['forecast']["source"])
         return forecasting
     
+    def get_monthly_peak(self):
+        """Get the peak value for the current month, supporting multiple sources (file, aem)."""
+        if self.cfg['peak']['source'] == 'file':
+            df = pd.read_csv(self.cfg['peak']['filename'], sep=',')
+            peak_value = df['quantity'].max()
+        elif self.cfg['peak']['source'] == 'aem':
+            from aemDataManagement.data_storage.influxdb import Influx
+            start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = datetime.utcnow()
+            aemInflux = Influx(influxdb_credentials=self.main_cfg['aemInfluxDB']['token'], config=self.main_cfg['aemInfluxDB'])
+            history = aemInflux.read_key(start, end, "sgim-aem003", "property", "CH1ActivePowL1")["value"].resample('15T').mean()
+            peak_value = history.max()
+        else:
+            self.logger.error('Option "%s" not available for peak input ' % self.cfg['peak']['source'])
+            raise Exception('Option "%s" not available for peak input ' % self.cfg['peak']['source'])
+        return peak_value
+    
     def get_quantity_from_forecast(self, dt_slot):
-        """ Cut the forecasted value based on the configs.
+        """ Cut the forecasted value based on the configs or monthly peak.
         """
         forecasting = self.get_forecast()
-        dt_slot = pd.Timestamp(dt_slot).tz_localize('UTC')
-        forecasted_value = forecasting[forecasting.index >= dt_slot].iloc[0]
+        slot_utc = pd.Timestamp(dt_slot).tz_localize('UTC')
+        forecasted_value = forecasting[forecasting.index >= slot_utc].iloc[0]
         cut_value = self.cfg['orderSection']['quantities']['forecasting_cut']
+        monthly_peak = self.get_monthly_peak() 
+        if monthly_peak > cut_value:
+            self.logger.info('Monthly peak %s kW is greater than cut value %s kW, using monthly peak.' % (monthly_peak, cut_value))
+            cut_value = monthly_peak
         cut_value -= self.cfg['orderSection']['quantities']['cut_margin'] # Safety margin
         self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
         return round(max(forecasted_value - cut_value, 0.0)/1000,3)

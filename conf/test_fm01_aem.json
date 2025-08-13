@@ -26,6 +26,10 @@
           "source": "aem",
           "filename": "../data/forecast/example01.csv"
         },
+        "peak": {
+            "source": "aem",
+            "filename": "../data/peak/example01.csv"
+        },
         "orderSection": {
           "nodeName": "Massagno_1",
           "quantities": {
