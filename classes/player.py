@@ -95,8 +95,9 @@ class Player:
 
 
     def calculate_unit_price(self, dt_slot):
+        price = 0.0
         if self.cfg['orderSection']['unitPrice']['source'] == 'constant':
-            return round(self.cfg['orderSection']['unitPrice']['constant'], 2)
+            price = self.cfg['orderSection']['unitPrice']['constant']
         elif self.cfg['orderSection']['unitPrice']['source'] == 'forecast':
             slot_utc = pd.Timestamp(dt_slot).tz_localize('UTC')
             forecasting = self.get_forecast()
@@ -105,10 +106,17 @@ class Player:
             forecasting_dt = forecasting[forecasting.index >= slot_utc].iloc[0]
             ratio = (forecasting_dt - forecasting_min) / (forecasting_max - forecasting_min) 
             price = self.cfg['orderSection']['unitPrice']['forecast_base'] + ratio * self.cfg['orderSection']['unitPrice']['forecast_multiplier']
-            return round(price, 2)
         else:
             self.logger.error('Option \'%s\' not available for unit price calculation' % self.cfg['orderSection']['unitPrice']['source'])
             return 0.0
+        
+        # As the month progresses risk of a peak is higher so we increase bidding price
+        if "day_of_month_max_increase" in self.cfg['orderSection']['unitPrice']:
+            month_days = (datetime(datetime.now().year, datetime.now().month % 12 + 1, 1) - timedelta(days=1)).day
+            current_day = datetime.now().day
+            day_of_month_max_increase = current_day/month_days * self.cfg['orderSection']['unitPrice']['day_of_month_max_increase']
+            price += day_of_month_max_increase
+        return round(price,2)
 
 
     def demand_flexibility(self, dt_slot):
@@ -231,6 +239,12 @@ class Player:
             self.logger.info('Monthly peak %s kW is greater than cut value %s kW, using monthly peak.' % (monthly_peak, cut_value))
             cut_value = monthly_peak
         cut_value -= self.cfg['orderSection']['quantities']['cut_margin'] # Safety margin
+        # As the month progresses risk of a peak is higher...
+        if "day_of_month_cut_max_increase" in self.cfg['orderSection']['quantities']:
+            month_days = (datetime(datetime.now().year, datetime.now().month % 12 + 1, 1) - timedelta(days=1)).day
+            current_day = datetime.now().day
+            cut_value -= current_day/month_days * self.cfg['orderSection']['quantities']['day_of_month_cut_max_increase']
+
         self.logger.info('Forecasted value: %.3f kW, Threshold cut value: %.3f kW' % (forecasted_value, cut_value))
         return round(max(forecasted_value - cut_value, 0.0)/1000,3)
 

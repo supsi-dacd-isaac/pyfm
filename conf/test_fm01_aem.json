@@ -41,13 +41,15 @@
               "daysToGoBack": 7
             },
             "forecasting_cut": 20.0,
-            "cut_margin": 5.0
+            "cut_margin": 5.0,
+            "day_of_month_cut_max_increase": 5.0
           },
           "unitPrice":{
             "source": "forecast",
             "constant": 10.0,
             "forecast_base": 1.0,
-            "forecast_multiplier": 10.0
+            "forecast_multiplier": 10.0,
+            "day_of_month_max_increase": 10.0
           },
           "mainSettings": {
             "side": "Buy",
