@@ -27,7 +27,7 @@
           "filename": "../data/forecast/example01.csv"
         },
         "peak": {
-            "source": "file",
+            "source": "aem",
             "filename": "../data/peak/example01.csv"
         },
         "orderSection": {

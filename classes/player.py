@@ -298,13 +298,28 @@ class Player:
                 influxdb_credentials=self.main_cfg["aemInfluxDB"]["token"],
                 config=self.main_cfg["aemInfluxDB"],
             )
-            history = (
+            history_1 = (
                 aemInflux.read_key(
                     start, end, "sgim-aem003", "property", "CH1ActivePowL1"
                 )["value"]
                 .resample("15T")
                 .mean()
             )
+            history_2 = (
+                aemInflux.read_key(
+                    start, end, "sgim-aem003", "property", "CH1ActivePowL2"
+                )["value"]
+                .resample("15T")
+                .mean()
+            )
+            history_3 = (
+                aemInflux.read_key(
+                    start, end, "sgim-aem003", "property", "CH1ActivePowL3"
+                )["value"]
+                .resample("15T")
+                .mean()
+            )
+            history = history_1 + history_2 + history_3
             peak_value = history.max()
         else:
             self.logger.error(
