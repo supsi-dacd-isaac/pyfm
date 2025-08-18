@@ -1,13 +1,26 @@
 import pandas as pd
 
+
 class Bidder:
     """
     A class representing a Bidder in a pay-as-bid market, with an adaptive strategy
     that uses memory, incremental price adjustments, and baseline consideration.
     """
 
-    def __init__(self, id, alpha=0.05, beta=0.05, gamma=0.5, L=7, w1=1.0, w2=1.0, w3=1.0,
-                 baseline=0.10, pow_req_ref=100.0, avg_acc_ref=50.0):
+    def __init__(
+        self,
+        id,
+        alpha=0.05,
+        beta=0.05,
+        gamma=0.5,
+        L=7,
+        w1=1.0,
+        w2=1.0,
+        w3=1.0,
+        baseline=0.10,
+        pow_req_ref=100.0,
+        avg_acc_ref=50.0,
+    ):
         """
         Initialize the bidder with the given parameters.
 
@@ -36,7 +49,9 @@ class Bidder:
 
         self.current_bidding = {}
 
-    def update_history(self, buyer_id, time_slot, offered_price, offered_power, accepted):
+    def update_history(
+        self, buyer_id, time_slot, offered_price, offered_power, accepted
+    ):
         """
         Store the result of an offer in the memory of this bidder.
 
@@ -50,12 +65,14 @@ class Bidder:
             self.memory[buyer_id] = []
 
         # Append this record
-        self.memory[buyer_id].append({
-            "time": time_slot,
-            "price": offered_price,
-            "power": offered_power,
-            "accepted": accepted
-        })
+        self.memory[buyer_id].append(
+            {
+                "time": time_slot,
+                "price": offered_price,
+                "power": offered_power,
+                "accepted": accepted,
+            }
+        )
 
         # Keep only the last L entries to avoid unbounded growth
         if len(self.memory[buyer_id]) > self.L:
@@ -80,9 +97,17 @@ class Bidder:
         rejected_prices = [r["price"] for r in records if not r["accepted"]]
 
         # Compute average accepted price
-        avg_acc = sum(accepted_prices) / len(accepted_prices) if len(accepted_prices) > 0 else 0.0
+        avg_acc = (
+            sum(accepted_prices) / len(accepted_prices)
+            if len(accepted_prices) > 0
+            else 0.0
+        )
         # Compute average rejected price
-        avg_rej = sum(rejected_prices) / len(rejected_prices) if len(rejected_prices) > 0 else 0.0
+        avg_rej = (
+            sum(rejected_prices) / len(rejected_prices)
+            if len(rejected_prices) > 0
+            else 0.0
+        )
         # Compute success ratio
         success_ratio = len(accepted_prices) / len(records)
         # Compute min and max of accepted prices
@@ -104,7 +129,11 @@ class Bidder:
         normalized_avg_acc = avg_acc / self.avg_acc_ref
 
         # Priority function:
-        pi_j = (self.w1 * normalized_pow_req) + (self.w2 * normalized_avg_acc) - (self.w3 * (1.0 - success_ratio))
+        pi_j = (
+            (self.w1 * normalized_pow_req)
+            + (self.w2 * normalized_avg_acc)
+            - (self.w3 * (1.0 - success_ratio))
+        )
         return pi_j
 
     def select_buyer(self, buyers_info):
@@ -130,7 +159,9 @@ class Bidder:
         best_priority = float("-inf")
 
         for buyer_info in buyers_info:
-            prio = self.compute_priority(buyer_info["id"], buyer_info["requested_power"], buyer_info["wtp"])
+            prio = self.compute_priority(
+                buyer_info["id"], buyer_info["requested_power"], buyer_info["wtp"]
+            )
             if prio > best_priority:
                 best_priority = prio
                 best_buyer = buyer_info
@@ -159,9 +190,9 @@ class Bidder:
 
         # Adjust price based on success ratio
         if success_ratio > 0.7:
-            p_start *= (1.0 + self.gamma * 0.5)
+            p_start *= 1.0 + self.gamma * 0.5
         elif success_ratio < 0.3:
-            p_start *= (1.0 - self.gamma * 0.5)
+            p_start *= 1.0 - self.gamma * 0.5
 
         # Check if we have a record from the last known offer to this buyer
         last_record = self.get_last_record(buyer_id)
@@ -223,4 +254,4 @@ class Bidder:
         :param time_slot: The time (or slot) of the market session
         :param value: The actual value to be added
         """
-        self.actual_values.loc[time_slot, 'value'] = value
+        self.actual_values.loc[time_slot, "value"] = value

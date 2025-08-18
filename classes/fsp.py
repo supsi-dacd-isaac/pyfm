@@ -22,17 +22,17 @@ class FSP(Player):
 
         # Get identifier of NODES platform
         res = self.get_organization_id()
-        self.nodes_id = res['items'][0]['id']
+        self.nodes_id = res["items"][0]["id"]
 
         # Portfolios owned by the FSP
         self.portfolios = {}
-        for p in self.get_portfolios()['items']:
-            self.portfolios[p['id']] = Portfolio(p['id'], p)
+        for p in self.get_portfolios()["items"]:
+            self.portfolios[p["id"]] = Portfolio(p["id"], p)
 
         # Asset owned by the FSP
         self.assets = {}
-        for a in self.get_assets()['items']:
-            self.assets[a['id']] = Asset(a['id'], a)
+        for a in self.get_assets()["items"]:
+            self.assets[a["id"]] = Asset(a["id"], a)
 
         # Get asset assigned to portfolios
         self.assets_ids, self.assets_mpids = self.get_assets_portfolios_assignments()
@@ -59,47 +59,72 @@ class FSP(Player):
             self.portfolios[k_p].set_assets(tmp_assets)
 
     def download_baselines(self, slot_time):
-        slot_time_from = slot_time - timedelta(hours=self.cfg['baselines']['fromBeforeNowHours'])
-        slot_time_to = slot_time + timedelta(hours=self.cfg['baselines']['toAfterNowHours'])
+        slot_time_from = slot_time - timedelta(
+            hours=self.cfg["baselines"]["fromBeforeNowHours"]
+        )
+        slot_time_to = slot_time + timedelta(
+            hours=self.cfg["baselines"]["toAfterNowHours"]
+        )
 
-        from_str = slot_time_from.strftime('%Y-%m-%dT%H:%M:%SZ')
-        to_str = slot_time_to.strftime('%Y-%m-%dT%H:%M:%SZ')
+        from_str = slot_time_from.strftime("%Y-%m-%dT%H:%M:%SZ")
+        to_str = slot_time_to.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         bs = {}
         for p_k in self.portfolios.keys():
-            res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                             'BaselineIntervals/portfoliobaseline?'
-                                                             'assetPortfolioId=%s&'
-                                                             'periodFrom=%s&'
-                                                             'periodTo=%s&'
-                                                             'resolutionInMinutes=%i' % (p_k, from_str, to_str,
-                                                                                         self.main_cfg['fm']['granularity'])))
+            res = self.nodes_interface.get_request(
+                "%s%s"
+                % (
+                    self.nodes_interface.cfg["mainEndpoint"],
+                    "BaselineIntervals/portfoliobaseline?"
+                    "assetPortfolioId=%s&"
+                    "periodFrom=%s&"
+                    "periodTo=%s&"
+                    "resolutionInMinutes=%i"
+                    % (p_k, from_str, to_str, self.main_cfg["fm"]["granularity"]),
+                )
+            )
             df = pd.DataFrame(res)
-            df['periodFrom'] = pd.to_datetime(df['periodFrom'], utc=True).dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-            df.set_index('periodFrom', inplace=True)
+            df["periodFrom"] = pd.to_datetime(df["periodFrom"], utc=True).dt.strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            df.set_index("periodFrom", inplace=True)
 
             bs[p_k] = df
         self.baselines = bs
 
     def update_portfolio_baseline(self, portfolio_id, baseline_dataframe):
-        tmp_baseline_file = '%s%s%s.csv' % (self.cfg['baselines']['tmpFolder'], os.sep, portfolio_id)
+        tmp_baseline_file = "%s%s%s.csv" % (
+            self.cfg["baselines"]["tmpFolder"],
+            os.sep,
+            portfolio_id,
+        )
         baseline_dataframe.to_csv(tmp_baseline_file, index=False)
 
-        self.logger.info('Update baseline of portfolio %s, period [%s-%s]' % (portfolio_id,
-                                                                              baseline_dataframe['periodTo'].iloc[0],
-                                                                              baseline_dataframe['periodTo'].iloc[-1]))
+        self.logger.info(
+            "Update baseline of portfolio %s, period [%s-%s]"
+            % (
+                portfolio_id,
+                baseline_dataframe["periodTo"].iloc[0],
+                baseline_dataframe["periodTo"].iloc[-1],
+            )
+        )
 
-        endpoint = '%s%s' % (self.nodes_interface.cfg['mainEndpoint'], 'BaselineIntervals/import')
+        endpoint = "%s%s" % (
+            self.nodes_interface.cfg["mainEndpoint"],
+            "BaselineIntervals/import",
+        )
         return self.nodes_interface.post_csv_file_request(endpoint, tmp_baseline_file)
 
     def get_assets_portfolios_assignments(self):
         tmp_assets_grid_assignments = {}
-        for elem in self.get_assets_grid_assignments()['items']:
-            tmp_assets_grid_assignments[elem['id']] = elem
+        for elem in self.get_assets_grid_assignments()["items"]:
+            tmp_assets_grid_assignments[elem["id"]] = elem
 
         tmp_assets_portfolios_assignments = {}
         for p_k in self.portfolios.keys():
-            tmp_assets_portfolios_assignments[p_k] = self.get_assets_assigned_to_portfolio(p_k)
+            tmp_assets_portfolios_assignments[
+                p_k
+            ] = self.get_assets_assigned_to_portfolio(p_k)
 
         # Cycle over the portfolios that have at least an assignment
         # assets_portfolios_assignments = {}
@@ -109,44 +134,74 @@ class FSP(Player):
             assets_mpids[k_p] = {}
             assets_ids[k_p] = []
             # Cycle over the asset assigned to the portfolio
-            for p_assignment in tmp_assets_portfolios_assignments[k_p]['items']:
-                asset_id = tmp_assets_grid_assignments[p_assignment['assetGridAssignmentId']]['assetId']
+            for p_assignment in tmp_assets_portfolios_assignments[k_p]["items"]:
+                asset_id = tmp_assets_grid_assignments[
+                    p_assignment["assetGridAssignmentId"]
+                ]["assetId"]
                 # assets_portfolios_assignments[asset_id] = k_p
                 # assets_mpids[k_p].append(tmp_assets_grid_assignments[p_assignment['assetGridAssignmentId']]['mpid'])
-                assets_mpids[k_p][asset_id] = tmp_assets_grid_assignments[p_assignment['assetGridAssignmentId']]['mpid']
+                assets_mpids[k_p][asset_id] = tmp_assets_grid_assignments[
+                    p_assignment["assetGridAssignmentId"]
+                ]["mpid"]
                 assets_ids[k_p].append(asset_id)
         return assets_ids, assets_mpids
 
     def get_organization_id(self):
-        res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                         'organizations?name=%s' % self.cfg['name']))
+        res = self.nodes_interface.get_request(
+            "%s%s"
+            % (
+                self.nodes_interface.cfg["mainEndpoint"],
+                "organizations?name=%s" % self.cfg["name"],
+            )
+        )
         return res
 
     def get_assets(self):
-        res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                         'assets?operatedByOrganizationId=%s' % self.nodes_id))
+        res = self.nodes_interface.get_request(
+            "%s%s"
+            % (
+                self.nodes_interface.cfg["mainEndpoint"],
+                "assets?operatedByOrganizationId=%s" % self.nodes_id,
+            )
+        )
         return res
 
     def get_portfolios(self):
-        res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                         'AssetPortfolios?managedByOrganizationId=%s' % self.nodes_id))
+        res = self.nodes_interface.get_request(
+            "%s%s"
+            % (
+                self.nodes_interface.cfg["mainEndpoint"],
+                "AssetPortfolios?managedByOrganizationId=%s" % self.nodes_id,
+            )
+        )
         return res
 
     def get_assets_assigned_to_portfolio(self, portfolio_id):
-        res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                         'assetportfolioassignments?assetPortfolioId=%s' % portfolio_id))
+        res = self.nodes_interface.get_request(
+            "%s%s"
+            % (
+                self.nodes_interface.cfg["mainEndpoint"],
+                "assetportfolioassignments?assetPortfolioId=%s" % portfolio_id,
+            )
+        )
         return res
 
     def get_assets_grid_assignments(self):
-        res = self.nodes_interface.get_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                         'assetgridassignments?managedByOrganizationId=%s' % self.nodes_id))
+        res = self.nodes_interface.get_request(
+            "%s%s"
+            % (
+                self.nodes_interface.cfg["mainEndpoint"],
+                "assetgridassignments?managedByOrganizationId=%s" % self.nodes_id,
+            )
+        )
         return res
 
     def delete_baseline_interval(self, portfolio_id, from_period, to_period):
-        endpoint = '%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                             'BaselineIntervals?assetPortfolioId=%s&periodFrom=%s&periodTo=%s' % (portfolio_id,
-                                                                                                  from_period,
-                                                                                                  to_period))
+        endpoint = "%s%s" % (
+            self.nodes_interface.cfg["mainEndpoint"],
+            "BaselineIntervals?assetPortfolioId=%s&periodFrom=%s&periodTo=%s"
+            % (portfolio_id, from_period, to_period),
+        )
         res = self.nodes_interface.delete_request(endpoint)
         return res
 
@@ -154,82 +209,117 @@ class FSP(Player):
     def calc_from_to_period(days):
         from_dt = datetime.utcnow()
         to_dt = from_dt + timedelta(days=days)
-        return from_dt.strftime('%Y-%m-%dT%H:%M:%SZ'), to_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        return from_dt.strftime("%Y-%m-%dT%H:%M:%SZ"), to_dt.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
     def update_baselines(self, bs_cfg):
         current_time = datetime.utcnow()
-        adjusted_time = (current_time.replace(minute=(current_time.minute // 15) * 15, second=0, microsecond=0) +
-                         timedelta(minutes=bs_cfg['shiftMinutes']))
+        adjusted_time = current_time.replace(
+            minute=(current_time.minute // 15) * 15, second=0, microsecond=0
+        ) + timedelta(minutes=bs_cfg["shiftMinutes"])
 
         # Cycle over the portfolios
         for k_p in self.portfolios.keys():
-
-            if bs_cfg['source'] == 'file':
-                df = self.create_df_baseline_from_file(self.portfolios[k_p], adjusted_time, bs_cfg['fileSettings'])
-            elif bs_cfg['source'] == 'db':
-                df = self.create_df_baseline_from_db(self.portfolios[k_p], adjusted_time, bs_cfg['dbSettings'])
+            if bs_cfg["source"] == "file":
+                df = self.create_df_baseline_from_file(
+                    self.portfolios[k_p], adjusted_time, bs_cfg["fileSettings"]
+                )
+            elif bs_cfg["source"] == "db":
+                df = self.create_df_baseline_from_db(
+                    self.portfolios[k_p], adjusted_time, bs_cfg["dbSettings"]
+                )
             else:
-                self.logger.error('Baseline source option \'%s\' not available' % bs_cfg['source'])
+                self.logger.error(
+                    "Baseline source option '%s' not available" % bs_cfg["source"]
+                )
                 return False
             self.update_portfolio_baseline(k_p, df)
         return True
 
     def create_df_baseline_from_db(self, portfolio, adjusted_time, bs_cfg):
-        start_dt = adjusted_time - timedelta(days=bs_cfg['daysToGoBack'])
-        start_dt_str = start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-        end_dt_str = (start_dt+timedelta(hours=bs_cfg['upcomingHoursToQuery'])).strftime('%Y-%m-%dT%H:%M:%SZ')
-        str_mpids = '('
+        start_dt = adjusted_time - timedelta(days=bs_cfg["daysToGoBack"])
+        start_dt_str = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_dt_str = (
+            start_dt + timedelta(hours=bs_cfg["upcomingHoursToQuery"])
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        str_mpids = "("
         for mpid in portfolio.get_assets_mpids():
-            str_mpids = '%s OR site_name=\'%s\'' % (str_mpids, mpid)
-        str_mpids = '%s)' % str_mpids.replace('( OR ', '(')
+            str_mpids = "%s OR site_name='%s'" % (str_mpids, mpid)
+        str_mpids = "%s)" % str_mpids.replace("( OR ", "(")
 
-        query = ("SELECT sum(import) AS portfolio_cons, sum(export) AS portfolio_exp from %s WHERE "
-                 "time>='%s' AND time<'%s' AND %s GROUP BY time(%im)") % (self.main_cfg['influxDB']['measurement'],
-                                                                          start_dt_str, end_dt_str, str_mpids,
-                                                                          self.main_cfg['fm']['granularity'])
-        self.logger.info('Query: %s' % query)
+        query = (
+            "SELECT sum(import) AS portfolio_cons, sum(export) AS portfolio_exp from %s WHERE "
+            "time>='%s' AND time<'%s' AND %s GROUP BY time(%im)"
+        ) % (
+            self.main_cfg["influxDB"]["measurement"],
+            start_dt_str,
+            end_dt_str,
+            str_mpids,
+            self.main_cfg["fm"]["granularity"],
+        )
+        self.logger.info("Query: %s" % query)
         try:
             res = self.influx_client.query(query)
-            df_data = res[self.main_cfg['influxDB']['measurement']]
+            df_data = res[self.main_cfg["influxDB"]["measurement"]]
             df_data_bs = copy.deepcopy(df_data)
-            df_data_bs.index = df_data_bs.index + pd.DateOffset(days=bs_cfg['daysToGoBack'])
+            df_data_bs.index = df_data_bs.index + pd.DateOffset(
+                days=bs_cfg["daysToGoBack"]
+            )
 
             # Handle columns and indexes
-            df_data_bs['periodFrom'] = df_data_bs.index
-            df_data_bs['periodTo'] = df_data_bs['periodFrom'] + pd.Timedelta(minutes=self.main_cfg['fm']['granularity'])
-            df_data_bs.insert(loc=0, column='assetPortfolioId', value=portfolio.id)
-            df_data_bs.insert(loc=1, column='quantityType', value='Power')
-            df_data_bs.rename(columns={'portfolio_cons': 'quantity'}, inplace=True)
-            df_data_bs['quantity'] = df_data_bs['quantity'] / 1e3
+            df_data_bs["periodFrom"] = df_data_bs.index
+            df_data_bs["periodTo"] = df_data_bs["periodFrom"] + pd.Timedelta(
+                minutes=self.main_cfg["fm"]["granularity"]
+            )
+            df_data_bs.insert(loc=0, column="assetPortfolioId", value=portfolio.id)
+            df_data_bs.insert(loc=1, column="quantityType", value="Power")
+            df_data_bs.rename(columns={"portfolio_cons": "quantity"}, inplace=True)
+            df_data_bs["quantity"] = df_data_bs["quantity"] / 1e3
             df_data_bs.reset_index(drop=True, inplace=True)
 
-            df_data_bs = df_data_bs[['assetPortfolioId', 'periodFrom', 'periodTo', 'quantity', 'quantityType']]
+            df_data_bs = df_data_bs[
+                [
+                    "assetPortfolioId",
+                    "periodFrom",
+                    "periodTo",
+                    "quantity",
+                    "quantityType",
+                ]
+            ]
             return df_data_bs
         except Exception as e:
-            self.logger.error('EXCEPTION: %s' % str(e))
+            self.logger.error("EXCEPTION: %s" % str(e))
             return None
 
     def create_df_baseline_from_file(self, portfolio, adjusted_time, bs_file_cfg):
-        df = pd.read_csv(bs_file_cfg['profileFile'])
+        df = pd.read_csv(bs_file_cfg["profileFile"])
 
-        df['slot_dt'] = pd.to_datetime(df['slot'], format='%H:%M')
-        df['minutes_in_day'] = df['slot_dt'].dt.hour * 60 + df['slot_dt'].dt.minute
+        df["slot_dt"] = pd.to_datetime(df["slot"], format="%H:%M")
+        df["minutes_in_day"] = df["slot_dt"].dt.hour * 60 + df["slot_dt"].dt.minute
         current_daily_minutes = adjusted_time.hour * 60 + adjusted_time.minute
 
-        df_today = df[df['minutes_in_day'] >= current_daily_minutes]
+        df_today = df[df["minutes_in_day"] >= current_daily_minutes]
         df_today = df_today.copy()
-        df_today.loc[:, 'periodFrom'] = pd.to_datetime(adjusted_time.strftime('%Y-%m-%d ') + df_today['slot'])
+        df_today.loc[:, "periodFrom"] = pd.to_datetime(
+            adjusted_time.strftime("%Y-%m-%d ") + df_today["slot"]
+        )
 
-        df_tomorrow = df[df['minutes_in_day'] < current_daily_minutes]
+        df_tomorrow = df[df["minutes_in_day"] < current_daily_minutes]
         df_tomorrow = df_tomorrow.copy()
-        df_tomorrow.loc[:, 'periodFrom'] = pd.to_datetime((adjusted_time+timedelta(days=1)).strftime('%Y-%m-%d ') + df_tomorrow['slot'])
+        df_tomorrow.loc[:, "periodFrom"] = pd.to_datetime(
+            (adjusted_time + timedelta(days=1)).strftime("%Y-%m-%d ")
+            + df_tomorrow["slot"]
+        )
 
         df = pd.concat([df_today, df_tomorrow], ignore_index=True)
-        df['periodTo'] = df['periodFrom'] + pd.Timedelta(minutes=15)
-        df.insert(loc=0, column='assetPortfolioId', value=portfolio.id)
+        df["periodTo"] = df["periodFrom"] + pd.Timedelta(minutes=15)
+        df.insert(loc=0, column="assetPortfolioId", value=portfolio.id)
 
         # assetPortfolioId, periodFrom, periodTo, quantity, quantityType
-        df = df[['assetPortfolioId', 'periodFrom', 'periodTo', 'quantity', 'quantityType']]
+        df = df[
+            ["assetPortfolioId", "periodFrom", "periodTo", "quantity", "quantityType"]
+        ]
 
         return df
 
@@ -238,26 +328,35 @@ class FSP(Player):
             "approvedBySeller": True,
             "autoCreateOrders": True,
             "autoCreateExpiryRelativeTo": "PeriodFrom",
-            "quantity": contract_request['quantity'],
-            "unitPrice": contract_request['unitPrice'],
-            "availabilityPrice": contract_request['availabilityPrice'],
-            "autoCreateExpiry": self.cfg['contractSection']['mainSettings']['autoCreateExpiry'],
-            "baseContractId": contract_request['id'],
-            "name": 'contract_proposal_%s_%s' % (self.cfg['id'], dt_slot.strftime('%Y%m%d')),
+            "quantity": contract_request["quantity"],
+            "unitPrice": contract_request["unitPrice"],
+            "availabilityPrice": contract_request["availabilityPrice"],
+            "autoCreateExpiry": self.cfg["contractSection"]["mainSettings"][
+                "autoCreateExpiry"
+            ],
+            "baseContractId": contract_request["id"],
+            "name": "contract_proposal_%s_%s"
+            % (self.cfg["id"], dt_slot.strftime("%Y%m%d")),
             "comments": "",
-            "periodFrom": contract_request['periodFrom'],
-            "periodTo": contract_request['periodTo'],
-            "sellerOrganizationId": self.organization['id'],
+            "periodFrom": contract_request["periodFrom"],
+            "periodTo": contract_request["periodTo"],
+            "sellerOrganizationId": self.organization["id"],
             "assetPortfolioId": list(self.portfolios.keys())[0],
-            "crontab": contract_request['crontab']
+            "crontab": contract_request["crontab"],
         }
 
-        response = self.nodes_interface.post_request('%s%s' % (self.nodes_interface.cfg['mainEndpoint'],
-                                                               'longflexcontracts'), body)
+        response = self.nodes_interface.post_request(
+            "%s%s" % (self.nodes_interface.cfg["mainEndpoint"], "longflexcontracts"),
+            body,
+        )
         result = self.handle_response(response, body)
         if result is not False:
             # The delivery of the request has been successful, save the data in the ledger
-            fmo.add_entry_to_contract_proposal_ledger(self.cfg, self.organization,
-                                                      self.portfolios[list(self.portfolios.keys())[0]].metadata,
-                                                      contract_request, body)
+            fmo.add_entry_to_contract_proposal_ledger(
+                self.cfg,
+                self.organization,
+                self.portfolios[list(self.portfolios.keys())[0]].metadata,
+                contract_request,
+                body,
+            )
         return result

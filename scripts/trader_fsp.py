@@ -8,7 +8,7 @@ import datetime
 from datetime import datetime, timedelta
 import pandas as pd
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from classes.dso import DSO
 from classes.fsp import FSP
@@ -18,8 +18,9 @@ from classes.postgresql_interface import PostgreSQLInterface
 
 def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
     current_time = datetime.utcnow()
-    adjusted_time = (current_time.replace(minute=(current_time.minute // 15) * 15, second=0, microsecond=0) +
-                     timedelta(minutes=30))
+    adjusted_time = current_time.replace(
+        minute=(current_time.minute // 15) * 15, second=0, microsecond=0
+    ) + timedelta(minutes=30)
     time_step = timedelta(minutes=15)
 
     df = pd.read_csv(data_file_path)
@@ -41,20 +42,22 @@ if __name__ == "__main__":
     # Configuration file
     # --------------------------------------------------------------------------- #
     arg_parser = argparse.ArgumentParser()
-    arg_parser.add_argument('--config_file', help='configuration file')
-    arg_parser.add_argument('--fsp', help='FSP identifier')
-    arg_parser.add_argument('--log_file', help='log file (optional, if empty log redirected on stdout)')
+    arg_parser.add_argument("--config_file", help="configuration file")
+    arg_parser.add_argument("--fsp", help="FSP identifier")
+    arg_parser.add_argument(
+        "--log_file", help="log file (optional, if empty log redirected on stdout)"
+    )
     args = arg_parser.parse_args()
 
     # Load the main parameters
     config_file = args.config_file
     if os.path.isfile(config_file) is False:
-        print('\nATTENTION! Unable to open configuration file %s\n' % config_file)
+        print("\nATTENTION! Unable to open configuration file %s\n" % config_file)
         sys.exit(1)
 
     # Load configuration
     cfg = json.loads(open(config_file).read())
-    cfg_conns = json.loads(open(cfg['connectionsFile']).read())
+    cfg_conns = json.loads(open(cfg["connectionsFile"]).read())
     cfg.update(cfg_conns)
 
     # Logger object
@@ -63,40 +66,47 @@ if __name__ == "__main__":
     else:
         log_file = args.log_file
     logger = logging.getLogger()
-    logging.basicConfig(format='%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s', level=logging.INFO,
-                        filename=log_file)
+    logging.basicConfig(
+        format="%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s",
+        level=logging.INFO,
+        filename=log_file,
+    )
 
     # FSP identifier
     fsp_identifier = args.fsp
 
-    logger.info('Starting program')
-    
+    logger.info("Starting program")
+
     # Database connection
     pgi = None
     try:
-        pgi = PostgreSQLInterface(cfg['postgreSQL'], logger)
+        pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
     except Exception as e:
-        logger.error('Unable to connect to PostgreSQL: %s' % str(e))
+        logger.error("Unable to connect to PostgreSQL: %s" % str(e))
 
     # Actors definition
     # DSO
-    dso = DSO(cfg['fm']['actors']['dso'], cfg, logger)
-    dso.set_organization(filter_dict={'name': dso.cfg['id']})
-    slot_time = dso.get_adjusted_time(cfg['fm']['granularity'], cfg['fm']['ordersTimeShift'])
+    dso = DSO(cfg["fm"]["actors"]["dso"], cfg, logger)
+    dso.set_organization(filter_dict={"name": dso.cfg["id"]})
+    slot_time = dso.get_adjusted_time(
+        cfg["fm"]["granularity"], cfg["fm"]["ordersTimeShift"]
+    )
 
     # FSP
-    fsp = FSP(cfg['fm']['actors']['fsps'][fsp_identifier], cfg, logger)
+    fsp = FSP(cfg["fm"]["actors"]["fsps"][fsp_identifier], cfg, logger)
     user_info = fsp.nodes_interface.get_user_info()
 
-    fsp.set_markets(filter_dict={'name': cfg['fm']['marketName']})
-    fsp.set_organization(filter_dict={'name': fsp.cfg['id']})
+    fsp.set_markets(filter_dict={"name": cfg["fm"]["marketName"]})
+    fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
 
-    logger.info('market id: %s' % fsp.markets[0]['id'])
-    logger.info('market name: %s' % fsp.markets[0]['name'])
+    logger.info("market id: %s" % fsp.markets[0]["id"])
+    logger.info("market name: %s" % fsp.markets[0]["name"])
 
     # Get quantities demanded by the DSO in the
     # dso_demand = dso.get_flexibility_quantities(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
-    dso_demands = dso.get_flexibility_requests(slot_time, cfg['fm']['granularity'], 'Buy', 'Power')
+    dso_demands = dso.get_flexibility_requests(
+        slot_time, cfg["fm"]["granularity"], "Buy", "Power"
+    )
 
     # Set current baselines for FSP
     fsp.download_baselines(slot_time)
@@ -110,9 +120,11 @@ if __name__ == "__main__":
             resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
             for k in resp_selling.keys():
                 if resp_selling[k] is not False:
-                    fmo.add_entry_to_market_ledger(timeslot=slot_time,
-                                                player=fsp,
-                                                portfolio=fsp.portfolios[p_k].metadata['name'],
-                                                features=resp_selling[k])
+                    fmo.add_entry_to_market_ledger(
+                        timeslot=slot_time,
+                        player=fsp,
+                        portfolio=fsp.portfolios[p_k].metadata["name"],
+                        features=resp_selling[k],
+                    )
 
-    logger.info('Ending program')
+    logger.info("Ending program")

@@ -1,10 +1,12 @@
 # import section
 from classes.asset import Asset
 
+
 class Portfolio:
     """
     Portfolio class
     """
+
     def __init__(self, identifier, metadata):
         """
         Constructor

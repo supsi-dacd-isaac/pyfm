@@ -23,10 +23,6 @@ def read_item(item_id: int, q: Union[str, None] = None):
     return {"item_id": item_id, "q": q}
 
 
-
 @app.put("/order/{item_id}")
 def update_item(item_id: int, item: Item):
     return {"item_id": item_id, "item_name": item.name, "price": item.price}
-
-
-

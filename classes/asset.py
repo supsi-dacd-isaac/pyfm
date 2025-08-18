@@ -1,9 +1,11 @@
 # import section
 
+
 class Asset:
     """
     Asset (generic asset able to sell flexibility) class
     """
+
     def __init__(self, identifier, metadata):
         """
         Constructor

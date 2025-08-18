@@ -1,5 +1,6 @@
 import pandas as pd
 
+
 class MeteringAgent:
     """
     A class to gather and store energy measures for each metering point.
@@ -18,7 +19,7 @@ class MeteringAgent:
         :param metering_point_id: Identifier of the metering point
         """
         if metering_point_id not in self.data:
-            self.data[metering_point_id] = pd.DataFrame(columns=['energy'])
+            self.data[metering_point_id] = pd.DataFrame(columns=["energy"])
 
     def add_energy_measure(self, metering_point_id, time_slot, energy):
         """
@@ -30,7 +31,7 @@ class MeteringAgent:
         """
         if metering_point_id not in self.data:
             self.add_metering_point(metering_point_id)
-        self.data[metering_point_id].loc[time_slot, 'energy'] = energy
+        self.data[metering_point_id].loc[time_slot, "energy"] = energy
 
     def get_energy_data(self, metering_point_id):
         """
@@ -39,4 +40,4 @@ class MeteringAgent:
         :param metering_point_id: Identifier of the metering point
         :return: A DataFrame with the energy data for the specified metering point
         """
-        return self.data.get(metering_point_id, pd.DataFrame(columns=['energy']))
+        return self.data.get(metering_point_id, pd.DataFrame(columns=["energy"]))

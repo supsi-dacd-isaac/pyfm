@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 
+
 def generate_pattern(segments, time_index):
     vals = []
     for val, count in segments:
@@ -10,7 +11,8 @@ def generate_pattern(segments, time_index):
     while len(vals) < len(time_index):
         vals.extend(vals)
 
-    return pd.DataFrame({"value": vals[:len(time_index)]}, index=time_index)
+    return pd.DataFrame({"value": vals[: len(time_index)]}, index=time_index)
+
 
 ###############################################################################
 # Residential-like pattern
@@ -25,6 +27,7 @@ def create_residential_like_pattern(time_index):
     ]
     return generate_pattern(segments, time_index)
 
+
 ###############################################################################
 # Office-like pattern
 ###############################################################################
@@ -37,6 +40,7 @@ def create_office_like_pattern(time_index):
         (0.10, 4 * 4),  # 20:00–24:00
     ]
     return generate_pattern(segments, time_index)
+
 
 ###############################################################################
 # Commercial-like pattern 1
@@ -51,6 +55,7 @@ def create_commercial_like_pattern1(time_index):
     ]
     return generate_pattern(segments, time_index)
 
+
 ###############################################################################
 # Commercial-like pattern 2
 ###############################################################################
@@ -63,6 +68,7 @@ def create_commercial_like_pattern2(time_index):
         (0.15, 4 * 4),
     ]
     return generate_pattern(segments, time_index)
+
 
 ###############################################################################
 # Battery that can discharge (negative load)
@@ -77,6 +83,7 @@ def create_battery_pattern(time_index):
     ]
     return generate_pattern(segments, time_index)
 
+
 def create_duck_curve_pattern(time_index, num_days):
     """
     Create a duck curve pattern for the given time index and number of days.
@@ -85,19 +92,110 @@ def create_duck_curve_pattern(time_index, num_days):
     :param num_days: Number of days to repeat the pattern
     :return: Pandas DataFrame with the duck curve pattern
     """
-    duck_base = np.array([
-        0.4, 0.3, 0.25, 0.25, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.25,
-        0.3, 0.3, 0.35, 0.4, 0.45, 0.5, 0.6, 0.7, 0.8, 0.8, 0.8, 0.7,
-        0.6, 0.5, 0.4, 0.35, 0.3, 0.3, 0.3, 0.25, 0.2, 0.15, 0.1, 0.1,
-        0.1, 0.1, 0.2, 0.3, 0.4, 0.4, 0.5, 0.55, 0.6, 0.7, 0.8, 0.85,
-        0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.9, 0.8, 0.8,
-        0.7, 0.7, 0.7, 0.6, 0.5, 0.4, 0.4, 0.35, 0.3, 0.2, 0.2, 0.2,
-        0.25, 0.3, 0.3, 0.4, 0.5, 0.7, 0.9, 1.0, 1.1, 1.2, 1.2, 1.1,
-        1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.5, 0.4, 0.3, 0.2, 0.2, 0.2
-    ])
+    duck_base = np.array(
+        [
+            0.4,
+            0.3,
+            0.25,
+            0.25,
+            0.3,
+            0.3,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.25,
+            0.3,
+            0.3,
+            0.35,
+            0.4,
+            0.45,
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.8,
+            0.8,
+            0.7,
+            0.6,
+            0.5,
+            0.4,
+            0.35,
+            0.3,
+            0.3,
+            0.3,
+            0.25,
+            0.2,
+            0.15,
+            0.1,
+            0.1,
+            0.1,
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.4,
+            0.5,
+            0.55,
+            0.6,
+            0.7,
+            0.8,
+            0.85,
+            0.9,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            0.9,
+            0.9,
+            0.8,
+            0.8,
+            0.7,
+            0.7,
+            0.7,
+            0.6,
+            0.5,
+            0.4,
+            0.4,
+            0.35,
+            0.3,
+            0.2,
+            0.2,
+            0.2,
+            0.25,
+            0.3,
+            0.3,
+            0.4,
+            0.5,
+            0.7,
+            0.9,
+            1.0,
+            1.1,
+            1.2,
+            1.2,
+            1.1,
+            1.0,
+            0.9,
+            0.8,
+            0.7,
+            0.6,
+            0.5,
+            0.5,
+            0.4,
+            0.3,
+            0.2,
+            0.2,
+            0.2,
+        ]
+    )
     duck_base = np.tile(duck_base, num_days)
-    df_duck = pd.DataFrame({'demand': duck_base}, index=time_index)
+    df_duck = pd.DataFrame({"demand": duck_base}, index=time_index)
     return df_duck
+
 
 def create_bus_curve_pattern(time_index, num_days):
     """
@@ -107,16 +205,106 @@ def create_bus_curve_pattern(time_index, num_days):
     :param num_days: Number of days to repeat the pattern
     :return: Pandas DataFrame with the bus curve pattern
     """
-    bus_base = np.array([
-        0.0, 0.0, 0.0, 0.2, 0.5, 0.5, 0.5, 0.5, 0.3, 0.3, 0.3, 0.2,
-        0.2, 0.2, 0.3, 0.4, 0.5, 1.0, 1.2, 1.2, 1.2, 1.2, 1.2, 1.0,
-        0.8, 0.6, 0.3, 0.3, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.5, 0.5,
-        1.0, 1.5, 1.5, 1.5, 1.5, 1.2, 1.0, 0.8, 0.8, 0.8, 0.8, 0.8,
-        0.8, 0.8, 0.8, 0.8, 1.0, 1.0, 1.0, 1.0, 1.2, 1.2, 1.2, 1.0,
-        0.8, 0.6, 0.6, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.8, 1.0,
-        1.0, 1.2, 1.2, 1.2, 1.2, 1.0, 0.8, 0.6, 0.5, 0.5, 0.4, 0.3,
-        0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.4, 0.6, 0.8, 1.0
-    ])
+    bus_base = np.array(
+        [
+            0.0,
+            0.0,
+            0.0,
+            0.2,
+            0.5,
+            0.5,
+            0.5,
+            0.5,
+            0.3,
+            0.3,
+            0.3,
+            0.2,
+            0.2,
+            0.2,
+            0.3,
+            0.4,
+            0.5,
+            1.0,
+            1.2,
+            1.2,
+            1.2,
+            1.2,
+            1.2,
+            1.0,
+            0.8,
+            0.6,
+            0.3,
+            0.3,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.5,
+            0.5,
+            1.0,
+            1.5,
+            1.5,
+            1.5,
+            1.5,
+            1.2,
+            1.0,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            0.8,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.2,
+            1.2,
+            1.2,
+            1.0,
+            0.8,
+            0.6,
+            0.6,
+            0.5,
+            0.4,
+            0.4,
+            0.4,
+            0.4,
+            0.4,
+            0.4,
+            0.8,
+            1.0,
+            1.0,
+            1.2,
+            1.2,
+            1.2,
+            1.2,
+            1.0,
+            0.8,
+            0.6,
+            0.5,
+            0.5,
+            0.4,
+            0.3,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.2,
+            0.4,
+            0.6,
+            0.8,
+            1.0,
+        ]
+    )
     bus_base = np.tile(bus_base, num_days)
-    df_bus = pd.DataFrame({'demand': bus_base}, index=time_index)
+    df_bus = pd.DataFrame({"demand": bus_base}, index=time_index)
     return df_bus

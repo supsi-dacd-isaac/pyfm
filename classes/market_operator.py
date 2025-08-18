@@ -1,5 +1,6 @@
 import pandas as pd
 
+
 class MarketOperator:
     """
     A class representing the market operator that:
@@ -9,7 +10,16 @@ class MarketOperator:
       4) Settles/Remunerates based on the approach described in the attached PDF (Chapter 4).
     """
 
-    def __init__(self, alpha_rem, beta_rem, gamma_rem, threshold_rem, threshold_rem_bid_inf, power_ref, price_ref):
+    def __init__(
+        self,
+        alpha_rem,
+        beta_rem,
+        gamma_rem,
+        threshold_rem,
+        threshold_rem_bid_inf,
+        power_ref,
+        price_ref,
+    ):
         """
         Initialize the MarketOperator with remuneration parameters.
         """
@@ -68,7 +78,7 @@ class MarketOperator:
                   ... (and any other relevant fields)
                 }
         """
-        self.requested_powers.append(request_info['requested_power'])
+        self.requested_powers.append(request_info["requested_power"])
         if time_slot not in self.buyer_requests:
             self.buyer_requests[time_slot] = []
         self.buyer_requests[time_slot].append(request_info)
@@ -116,8 +126,11 @@ class MarketOperator:
         non_accepted_bids = {}
         clearing_results = {}
 
-        time_slots_to_clear = [ts for ts in sorted(self.buyer_requests.keys()) if not self.is_time_slot_cleared(ts)][
-                              -steps_to_clear:]
+        time_slots_to_clear = [
+            ts
+            for ts in sorted(self.buyer_requests.keys())
+            if not self.is_time_slot_cleared(ts)
+        ][-steps_to_clear:]
 
         for time_slot in time_slots_to_clear:
             bids_list = self.bidder_bids.get(time_slot, [])
@@ -127,56 +140,68 @@ class MarketOperator:
             non_accepted_bids[time_slot] = []
 
             for request in self.buyer_requests[time_slot]:
-                buyer_id = request['id']
-                demand = request['requested_power']
-                max_price = request['wtp']
+                buyer_id = request["id"]
+                demand = request["requested_power"]
+                max_price = request["wtp"]
 
                 if demand <= 0:
                     continue  # Skip buyers with zero demand
 
-                buyer_bids = [bid for bid in bids_list if bid['buyer_id'] == buyer_id and bid['price'] <= max_price]
-                buyer_bids.sort(key=lambda x: x['price'])
+                buyer_bids = [
+                    bid
+                    for bid in bids_list
+                    if bid["buyer_id"] == buyer_id and bid["price"] <= max_price
+                ]
+                buyer_bids.sort(key=lambda x: x["price"])
 
                 allocations = []
                 remaining_demand = demand
 
                 for bid in buyer_bids:
-                    baseline_value = self.get_bidder_baseline(bid['bidder_id'], time_slot)
-                    actual_value = self.get_bidder_actual(bid['bidder_id'], time_slot)
+                    baseline_value = self.get_bidder_baseline(
+                        bid["bidder_id"], time_slot
+                    )
+                    actual_value = self.get_bidder_actual(bid["bidder_id"], time_slot)
                     real_flexibility = baseline_value - actual_value
 
                     allocated_power = min(real_flexibility, remaining_demand)
                     if allocated_power > 0:
-                        bid['reward'] = self.calculate_reward(price=bid['price'],
-                                                              bidded_flexibility=bid['power'],
-                                                              provided_flexibility=real_flexibility,
-                                                              requested_flexibility=request['requested_power'])
-                        allocations.append({
-                            'bidder_id': bid['bidder_id'],
-                            'buyer_id': request['id'],
-                            'requested_flexibility': request['requested_power'],
-                            'bidded_flexibility': bid['power'],
-                            'provided_flexibility': real_flexibility,
-                            'allocated_flexibility': allocated_power,
-                            'baseline_value': baseline_value,
-                            'actual_value': actual_value,
-                            'remaining_demand': remaining_demand,
-                            'price': bid['price'],
-                            'reward': bid['reward']
-                        })
+                        bid["reward"] = self.calculate_reward(
+                            price=bid["price"],
+                            bidded_flexibility=bid["power"],
+                            provided_flexibility=real_flexibility,
+                            requested_flexibility=request["requested_power"],
+                        )
+                        allocations.append(
+                            {
+                                "bidder_id": bid["bidder_id"],
+                                "buyer_id": request["id"],
+                                "requested_flexibility": request["requested_power"],
+                                "bidded_flexibility": bid["power"],
+                                "provided_flexibility": real_flexibility,
+                                "allocated_flexibility": allocated_power,
+                                "baseline_value": baseline_value,
+                                "actual_value": actual_value,
+                                "remaining_demand": remaining_demand,
+                                "price": bid["price"],
+                                "reward": bid["reward"],
+                            }
+                        )
                         remaining_demand -= allocated_power
                         accepted_bids[time_slot].append(bid)
-                        self.accepted_prices.append(bid['price'])
+                        self.accepted_prices.append(bid["price"])
                         if remaining_demand <= 0:
                             break  # Demand is fully satisfied
                     else:
                         non_accepted_bids[time_slot].append(bid)
 
-                clearing_results[time_slot].append({
-                    'buyer_id': buyer_id,
-                    'allocations': allocations,
-                    'unfulfilled_demand': remaining_demand
-                })
+                clearing_results[time_slot].append(
+                    {
+                        "buyer_id": buyer_id,
+                        "allocations": allocations,
+                        "unfulfilled_demand": remaining_demand,
+                    }
+                )
 
             # Add remaining non-accepted bids
             for bid in bids_list:
@@ -284,7 +309,9 @@ class MarketOperator:
     def is_time_slot_cleared(self, time_slot):
         return time_slot in self.cleared_time_slots
 
-    def calculate_reward(self, price, bidded_flexibility, provided_flexibility, requested_flexibility):
+    def calculate_reward(
+        self, price, bidded_flexibility, provided_flexibility, requested_flexibility
+    ):
         """
         Calculate the reward for a given accepted bid based on the real flexibility amount and power requested.
 
@@ -304,11 +331,43 @@ class MarketOperator:
             The calculated reward.
         """
         base = min(requested_flexibility, provided_flexibility) * price
-        under_delivery_penalty = self.alpha_rem * max(requested_flexibility - provided_flexibility - (self.threshold_rem * requested_flexibility), 0) * price
-        over_delivery_adjustment = self.beta_rem * max(provided_flexibility - requested_flexibility - (self.threshold_rem * requested_flexibility), 0) * price
-        bid_inflation_penalty = self.gamma_rem * max(bidded_flexibility - requested_flexibility - (self.threshold_rem_bid_inf * bidded_flexibility), 0) * price
+        under_delivery_penalty = (
+            self.alpha_rem
+            * max(
+                requested_flexibility
+                - provided_flexibility
+                - (self.threshold_rem * requested_flexibility),
+                0,
+            )
+            * price
+        )
+        over_delivery_adjustment = (
+            self.beta_rem
+            * max(
+                provided_flexibility
+                - requested_flexibility
+                - (self.threshold_rem * requested_flexibility),
+                0,
+            )
+            * price
+        )
+        bid_inflation_penalty = (
+            self.gamma_rem
+            * max(
+                bidded_flexibility
+                - requested_flexibility
+                - (self.threshold_rem_bid_inf * bidded_flexibility),
+                0,
+            )
+            * price
+        )
 
-        return base - under_delivery_penalty + over_delivery_adjustment - bid_inflation_penalty
+        return (
+            base
+            - under_delivery_penalty
+            + over_delivery_adjustment
+            - bid_inflation_penalty
+        )
 
     def store_bidder_baseline(self, bidder_id, baseline):
         if isinstance(baseline, pd.DataFrame):
@@ -325,7 +384,7 @@ class MarketOperator:
 
     def store_bidder_actual(self, bidder_id, time_slot, actual_value):
         if bidder_id not in self.bidder_actuals:
-            self.bidder_actuals[bidder_id] = pd.DataFrame(columns=['actual_value'])
+            self.bidder_actuals[bidder_id] = pd.DataFrame(columns=["actual_value"])
         self.bidder_actuals[bidder_id].loc[time_slot] = actual_value
 
     def get_bidder_actual(self, bidder_id, time_slot):

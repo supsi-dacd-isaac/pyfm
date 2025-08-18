@@ -1,5 +1,6 @@
 import pandas as pd
 
+
 class Buyer:
     """
     Represents a buyer in the flexibility market.
@@ -62,7 +63,7 @@ class Buyer:
             timestamp = pd.to_datetime(timestamp)
 
         # If the row doesn't exist, this will create it; if it does, this updates it.
-        self.demand_curve.loc[timestamp, 'demand'] = demand_value
+        self.demand_curve.loc[timestamp, "demand"] = demand_value
         self.demand_curve.sort_index(inplace=True)
 
     def update_demand_entry(self, timestamp, demand_value):
@@ -76,7 +77,7 @@ class Buyer:
         if timestamp not in self.demand_curve.index:
             raise KeyError(f"Timestamp {timestamp} not found in demand_curve.")
 
-        self.demand_curve.at[timestamp, 'demand'] = demand_value
+        self.demand_curve.at[timestamp, "demand"] = demand_value
 
     def remove_demand_entry(self, timestamp):
         """
@@ -102,7 +103,7 @@ class Buyer:
         if not isinstance(timestamp, pd.Timestamp):
             timestamp = pd.to_datetime(timestamp)
 
-        self.willingness_to_pay.loc[timestamp, 'price'] = price_value
+        self.willingness_to_pay.loc[timestamp, "price"] = price_value
         self.willingness_to_pay.sort_index(inplace=True)
 
     def update_willingness_entry(self, timestamp, price_value):
@@ -116,7 +117,7 @@ class Buyer:
         if timestamp not in self.willingness_to_pay.index:
             raise KeyError(f"Timestamp {timestamp} not found in willingness_to_pay.")
 
-        self.willingness_to_pay.at[timestamp, 'price'] = price_value
+        self.willingness_to_pay.at[timestamp, "price"] = price_value
 
     def remove_willingness_entry(self, timestamp):
         """
@@ -143,18 +144,18 @@ class Buyer:
 
         # If the retrieved data is a DataFrame (multiple rows), we aggregate
         if isinstance(demand_data, pd.DataFrame):
-            total_demand = demand_data['demand'].sum()
+            total_demand = demand_data["demand"].sum()
         else:
-            total_demand = demand_data['demand']
+            total_demand = demand_data["demand"]
 
         if isinstance(price_data, pd.DataFrame):
-            avg_price = price_data['price'].mean()
+            avg_price = price_data["price"].mean()
         else:
-            avg_price = price_data['price']
+            avg_price = price_data["price"]
 
         return {
             "buyer_id": self.id,
             "time_window": (start_time, end_time),
             "total_demand": total_demand,
-            "average_price_limit": avg_price
+            "average_price_limit": avg_price,
         }
