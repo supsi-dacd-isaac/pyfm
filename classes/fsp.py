@@ -244,8 +244,8 @@ class FSP(Player):
             start_dt + timedelta(hours=bs_cfg["upcomingHoursToQuery"])
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
         str_mpids = "("
-        for mpid in portfolio.get_assets_mpids():
-            str_mpids = "%s OR site_name='%s'" % (str_mpids, mpid)
+        for mpid in list(set(portfolio.get_assets_mpids())):
+            str_mpids = "%s OR site='%s'" % (str_mpids, mpid)
         str_mpids = "%s)" % str_mpids.replace("( OR ", "(")
 
         query = (
