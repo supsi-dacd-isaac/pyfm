@@ -25,7 +25,7 @@ class NODESInterface:
         self.headers = None
 
     def set_token(self, player_cfg):
-        tkn_file_name = '%s%s%s_%s.json' % (self.cfg['tokenFilesFolder'], os.sep, player_cfg['role'], player_cfg['id'])
+        tkn_file_name = '%s%s%s_%s.json' % (self.cfg['tokenFilesFolder'], os.sep, player_cfg['role'], player_cfg['id'].replace(' ', '_'))
         if os.path.exists(tkn_file_name):
             self.get_local_token(tkn_file_name)
 
