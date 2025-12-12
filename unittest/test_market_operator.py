@@ -371,7 +371,10 @@ class TestMarketOperator(unittest.TestCase):
     def test_calculate_reward(self):
         price = self.bid["price"]
         reward = self.market_operator.calculate_reward(
-            price, self.real_flexibility, self.power_requested
+            price,
+            self.bid["power"],
+            self.real_flexibility,
+            self.power_requested,
         )
         expected_reward = (
             min(self.power_requested, self.real_flexibility) * price

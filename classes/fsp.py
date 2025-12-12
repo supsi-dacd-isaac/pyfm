@@ -1,6 +1,7 @@
 # import section
 import os
 import copy
+import math
 import pandas as pd
 from datetime import datetime, timedelta
 
@@ -234,8 +235,44 @@ class FSP(Player):
                     "Baseline source option '%s' not available" % bs_cfg["source"]
                 )
                 return False
+            if df is None:
+                self.logger.warning(
+                    "Skipping baseline update for portfolio %s: no data available",
+                    k_p,
+                )
+                continue
             self.update_portfolio_baseline(k_p, df)
         return True
+
+    def _build_zero_baseline_dataframe(self, portfolio, adjusted_time, bs_cfg):
+        """
+        Build a baseline DataFrame with zero quantities for portfolios with no assets.
+        
+        :param portfolio: Portfolio object
+        :param adjusted_time: Adjusted start time (already shifted to current time)
+        :param bs_cfg: Baseline configuration settings
+        :return: DataFrame with zero baseline values
+        """
+        # Start from adjusted_time (current time), not from the past
+        start_dt = adjusted_time
+        end_dt = start_dt + timedelta(hours=bs_cfg["upcomingHoursToQuery"])
+        granularity = self.main_cfg["fm"]["granularity"]
+        
+        # Generate time slots for FUTURE dates
+        rows = []
+        current_dt = start_dt
+        while current_dt < end_dt:
+            next_dt = current_dt + timedelta(minutes=granularity)
+            rows.append({
+                "assetPortfolioId": portfolio.id,
+                "periodFrom": current_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "periodTo": next_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "quantity": 0.0,
+                "quantityType": "Power",
+            })
+            current_dt = next_dt
+        
+        return pd.DataFrame(rows)
 
     def create_df_baseline_from_db(self, portfolio, adjusted_time, bs_cfg):
         start_dt = adjusted_time - timedelta(days=bs_cfg["daysToGoBack"])
@@ -243,11 +280,19 @@ class FSP(Player):
         end_dt_str = (
             start_dt + timedelta(hours=bs_cfg["upcomingHoursToQuery"])
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        mpids = [mpid for mpid in set(portfolio.get_assets_mpids()) if mpid]
+        if not mpids:
+            self.logger.info(
+                "Portfolio %s has no assets; using zero baseline", portfolio.id
+            )
+            return self._build_zero_baseline_dataframe(portfolio, adjusted_time, bs_cfg)
+        
+        # Build site filter from MPIDs
         str_mpids = "("
         for mpid in list(set(portfolio.get_assets_mpids())):
             str_mpids = "%s OR site='%s'" % (str_mpids, mpid)
         str_mpids = "%s)" % str_mpids.replace("( OR ", "(")
-
+        
         query = (
             "SELECT sum(import) AS portfolio_cons, sum(export) AS portfolio_exp from %s WHERE "
             "time>='%s' AND time<'%s' AND %s GROUP BY time(%im)"
@@ -259,10 +304,19 @@ class FSP(Player):
             self.main_cfg["fm"]["granularity"],
         )
         self.logger.info("Query: %s" % query)
+        
         try:
             res = self.influx_client.query(query)
+            if not res:
+                self.logger.warning(
+                    "No data returned from InfluxDB for portfolio %s", portfolio.id
+                )
+                return None
+            
             df_data = res[self.main_cfg["influxDB"]["measurement"]]
             df_data_bs = copy.deepcopy(df_data)
+            
+            # CRITICAL: Shift timestamps from past to future (persistence model)
             df_data_bs.index = df_data_bs.index + pd.DateOffset(
                 days=bs_cfg["daysToGoBack"]
             )
@@ -291,72 +345,3 @@ class FSP(Player):
         except Exception as e:
             self.logger.error("EXCEPTION: %s" % str(e))
             return None
-
-    def create_df_baseline_from_file(self, portfolio, adjusted_time, bs_file_cfg):
-        df = pd.read_csv(bs_file_cfg["profileFile"])
-
-        df["slot_dt"] = pd.to_datetime(df["slot"], format="%H:%M")
-        df["minutes_in_day"] = df["slot_dt"].dt.hour * 60 + df["slot_dt"].dt.minute
-        current_daily_minutes = adjusted_time.hour * 60 + adjusted_time.minute
-
-        df_today = df[df["minutes_in_day"] >= current_daily_minutes]
-        df_today = df_today.copy()
-        df_today.loc[:, "periodFrom"] = pd.to_datetime(
-            adjusted_time.strftime("%Y-%m-%d ") + df_today["slot"]
-        )
-
-        df_tomorrow = df[df["minutes_in_day"] < current_daily_minutes]
-        df_tomorrow = df_tomorrow.copy()
-        df_tomorrow.loc[:, "periodFrom"] = pd.to_datetime(
-            (adjusted_time + timedelta(days=1)).strftime("%Y-%m-%d ")
-            + df_tomorrow["slot"]
-        )
-
-        df = pd.concat([df_today, df_tomorrow], ignore_index=True)
-        df["periodTo"] = df["periodFrom"] + pd.Timedelta(minutes=15)
-        df.insert(loc=0, column="assetPortfolioId", value=portfolio.id)
-
-        # assetPortfolioId, periodFrom, periodTo, quantity, quantityType
-        df = df[
-            ["assetPortfolioId", "periodFrom", "periodTo", "quantity", "quantityType"]
-        ]
-
-        return df
-
-    def propose_contract(self, dt_slot, contract_request, fmo):
-        body = {
-            "approvedBySeller": True,
-            "autoCreateOrders": True,
-            "autoCreateExpiryRelativeTo": "PeriodFrom",
-            "quantity": contract_request["quantity"],
-            "unitPrice": contract_request["unitPrice"],
-            "availabilityPrice": contract_request["availabilityPrice"],
-            "autoCreateExpiry": self.cfg["contractSection"]["mainSettings"][
-                "autoCreateExpiry"
-            ],
-            "baseContractId": contract_request["id"],
-            "name": "contract_proposal_%s_%s"
-            % (self.cfg["id"], dt_slot.strftime("%Y%m%d")),
-            "comments": "",
-            "periodFrom": contract_request["periodFrom"],
-            "periodTo": contract_request["periodTo"],
-            "sellerOrganizationId": self.organization["id"],
-            "assetPortfolioId": list(self.portfolios.keys())[0],
-            "crontab": contract_request["crontab"],
-        }
-
-        response = self.nodes_interface.post_request(
-            "%s%s" % (self.nodes_interface.cfg["mainEndpoint"], "longflexcontracts"),
-            body,
-        )
-        result = self.handle_response(response, body)
-        if result is not False:
-            # The delivery of the request has been successful, save the data in the ledger
-            fmo.add_entry_to_contract_proposal_ledger(
-                self.cfg,
-                self.organization,
-                self.portfolios[list(self.portfolios.keys())[0]].metadata,
-                contract_request,
-                body,
-            )
-        return result

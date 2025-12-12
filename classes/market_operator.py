@@ -14,11 +14,11 @@ class MarketOperator:
         self,
         alpha_rem,
         beta_rem,
-        gamma_rem,
-        threshold_rem,
-        threshold_rem_bid_inf,
-        power_ref,
-        price_ref,
+        gamma_rem=0.0,
+        threshold_rem=0.0,
+        threshold_rem_bid_inf=0.0,
+        power_ref=0.0,
+        price_ref=0.0,
     ):
         """
         Initialize the MarketOperator with remuneration parameters.
