@@ -280,68 +280,118 @@ class FSP(Player):
         end_dt_str = (
             start_dt + timedelta(hours=bs_cfg["upcomingHoursToQuery"])
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
-        mpids = [mpid for mpid in set(portfolio.get_assets_mpids()) if mpid]
-        if not mpids:
+        
+        # Get asset mapping from root config (not dbSettings)
+        asset_mapping = self.main_cfg.get("asset_mapping", {})
+        
+        # Build list of assets with their mapping info
+        # Each entry: (site, device_name, field)
+        asset_queries = []
+        for asset in portfolio.assets:
+            asset_name = asset.metadata.get("name")
+            if asset_name and asset_name in asset_mapping:
+                mapping = asset_mapping[asset_name]
+                # Support both old format (string) and new format (dict)
+                if isinstance(mapping, dict):
+                    device_name = mapping.get("device_name_tag")
+                    field = mapping.get("field", "active_power")
+                else:
+                    # Old format: mapping is just the device_name string
+                    device_name = mapping
+                    field = "active_power"
+                
+                # Site is the MPID (e.g., ECM63)
+                site = asset.mpid
+                if site and device_name:
+                    asset_queries.append((site, device_name, field, asset_name))
+                    self.logger.info(
+                        "Asset %s -> site=%s, device=%s, field=%s",
+                        asset_name, site, device_name, field
+                    )
+        
+        if not asset_queries:
             self.logger.info(
-                "Portfolio %s has no assets; using zero baseline", portfolio.id
+                "Portfolio %s has no mapped assets; using zero baseline", portfolio.id
             )
             return self._build_zero_baseline_dataframe(portfolio, adjusted_time, bs_cfg)
         
-        # Build site filter from MPIDs
-        str_mpids = "("
-        for mpid in list(set(portfolio.get_assets_mpids())):
-            str_mpids = "%s OR site='%s'" % (str_mpids, mpid)
-        str_mpids = "%s)" % str_mpids.replace("( OR ", "(")
+        # Query each asset individually (different assets may have different fields)
+        aggregated_data = {}
         
-        query = (
-            "SELECT sum(import) AS portfolio_cons, sum(export) AS portfolio_exp from %s WHERE "
-            "time>='%s' AND time<'%s' AND %s GROUP BY time(%im)"
-        ) % (
-            self.main_cfg["influxDB"]["measurement"],
-            start_dt_str,
-            end_dt_str,
-            str_mpids,
-            self.main_cfg["fm"]["granularity"],
-        )
-        self.logger.info("Query: %s" % query)
-        
-        try:
-            res = self.influx_client.query(query)
-            if not res:
-                self.logger.warning(
-                    "No data returned from InfluxDB for portfolio %s", portfolio.id
+        for site, device_name, field, asset_name in asset_queries:
+            query = (
+                "SELECT MEAN(%s) FROM assets_data WHERE "
+                "time>='%s' AND time<'%s' AND site='%s' AND device_name='%s' "
+                "GROUP BY time(%im)"
+            ) % (
+                field,
+                start_dt_str,
+                end_dt_str,
+                site,
+                device_name,
+                self.main_cfg["fm"]["granularity"],
+            )
+            self.logger.info("Query for %s: %s" % (asset_name, query))
+            
+            try:
+                res = self.influx_client.query(query)
+                if res:
+                    for key, df_data in res.items():
+                        for idx in df_data.index:
+                            timestamp = idx
+                            value = df_data.loc[idx, "mean"]
+                            if pd.notna(value):
+                                if timestamp not in aggregated_data:
+                                    aggregated_data[timestamp] = 0.0
+                                aggregated_data[timestamp] += value
+                                self.logger.debug(
+                                    "  %s @ %s: %.2f W",
+                                    asset_name, timestamp, value
+                                )
+            except Exception as e:
+                self.logger.error(
+                    "Error querying asset %s: %s", asset_name, str(e)
                 )
-                return None
-            
-            df_data = res[self.main_cfg["influxDB"]["measurement"]]
-            df_data_bs = copy.deepcopy(df_data)
-            
-            # CRITICAL: Shift timestamps from past to future (persistence model)
-            df_data_bs.index = df_data_bs.index + pd.DateOffset(
-                days=bs_cfg["daysToGoBack"]
+                continue
+        
+        if not aggregated_data:
+            self.logger.warning(
+                "No valid data after aggregation for portfolio %s", portfolio.id
             )
-
-            # Handle columns and indexes
-            df_data_bs["periodFrom"] = df_data_bs.index
-            df_data_bs["periodTo"] = df_data_bs["periodFrom"] + pd.Timedelta(
-                minutes=self.main_cfg["fm"]["granularity"]
-            )
-            df_data_bs.insert(loc=0, column="assetPortfolioId", value=portfolio.id)
-            df_data_bs.insert(loc=1, column="quantityType", value="Power")
-            df_data_bs.rename(columns={"portfolio_cons": "quantity"}, inplace=True)
-            df_data_bs["quantity"] = df_data_bs["quantity"] / 1e3
-            df_data_bs.reset_index(drop=True, inplace=True)
-
-            df_data_bs = df_data_bs[
-                [
-                    "assetPortfolioId",
-                    "periodFrom",
-                    "periodTo",
-                    "quantity",
-                    "quantityType",
-                ]
-            ]
-            return df_data_bs
-        except Exception as e:
-            self.logger.error("EXCEPTION: %s" % str(e))
             return None
+        
+        # Build DataFrame from aggregated data
+        timestamps = sorted(aggregated_data.keys())
+        df_data_bs = pd.DataFrame({
+            "timestamp": timestamps,
+            "quantity": [aggregated_data[ts] for ts in timestamps]
+        })
+        df_data_bs.set_index("timestamp", inplace=True)
+        
+        # CRITICAL: Shift timestamps from past to future (persistence model)
+        df_data_bs.index = df_data_bs.index + pd.DateOffset(
+            days=bs_cfg["daysToGoBack"]
+        )
+
+        # Handle columns and indexes
+        df_data_bs["periodFrom"] = df_data_bs.index
+        df_data_bs["periodTo"] = df_data_bs["periodFrom"] + pd.Timedelta(
+            minutes=self.main_cfg["fm"]["granularity"]
+        )
+        df_data_bs.insert(loc=0, column="assetPortfolioId", value=portfolio.id)
+        df_data_bs.insert(loc=1, column="quantityType", value="Power")
+        
+        # Convert from W to MW (divide by 1e6)
+        df_data_bs["quantity"] = df_data_bs["quantity"] / 1e6
+        df_data_bs.reset_index(drop=True, inplace=True)
+
+        df_data_bs = df_data_bs[
+            [
+                "assetPortfolioId",
+                "periodFrom",
+                "periodTo",
+                "quantity",
+                "quantityType",
+            ]
+        ]
+        return df_data_bs
