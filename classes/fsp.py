@@ -109,6 +109,25 @@ class FSP(Player):
                 baseline_dataframe["periodTo"].iloc[-1],
             )
         )
+        
+        # Print baseline summary before uploading
+        quantities = baseline_dataframe["quantity"].values
+        times = pd.to_datetime(baseline_dataframe["periodFrom"]).dt.strftime("%H:%M")
+        self.logger.info(
+            "Baseline times: [%s]",
+            ", ".join(times)
+        )
+        self.logger.info(
+            "Baseline values (MW): [%s]",
+            ", ".join([f"{q:.6f}" for q in quantities])
+        )
+        self.logger.info(
+            "Baseline statistics (MW): avg=%.6f, stdev=%.6f, min=%.6f, max=%.6f",
+            quantities.mean(),
+            quantities.std(),
+            quantities.min(),
+            quantities.max()
+        )
 
         endpoint = "%s%s" % (
             self.nodes_interface.cfg["mainEndpoint"],
