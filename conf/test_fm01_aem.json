@@ -1,7 +1,7 @@
 {
   "connectionsFile": "../conf/private/conns.json",
   "baseline": {
-    "source": "file",
+    "source": "db",
     "shiftMinutes": 30,
     "fileSettings": {
       "profileFile": "../data/baselines/example01.csv"
@@ -133,6 +133,69 @@
           }
         }
       }
+    }
+  },
+  "asset_mapping": {
+    "ECM63.1": {
+      "device_name_tag": "charge_point_ev_1",
+      "field": "power",
+      "type": "ev_charger",
+      "description": "EV Charger 1",
+      "capacity_kw": 11.0,
+      "flexibility_factor": 0.70
+    },
+    "ECM63.2": {
+      "device_name_tag": "charge_point_ev_2",
+      "field": "power",
+      "type": "ev_charger",
+      "description": "EV Charger 2",
+      "capacity_kw": 11.0,
+      "flexibility_factor": 0.70
+    },
+    "ECM96.2": {
+      "device_name_tag": "shelly_3em_pro_heat_pump_ext_unit",
+      "field": "active_power",
+      "type": "heat_pump",
+      "description": "HP Small",
+      "capacity_kw": 4.0,
+      "flexibility_factor": 0.80
+    },
+    "ECM97.1": {
+      "device_name_tag": "shelly_3em_pro_heat_pump_1",
+      "field": "active_power",
+      "type": "heat_pump",
+      "description": "HP Cinema 1",
+      "capacity_kw": 15.0,
+      "flexibility_factor": 0.85
+    },
+    "ECM97.2": {
+      "device_name_tag": "shelly_3em_pro_heat_pump_2",
+      "field": "active_power",
+      "type": "heat_pump",
+      "description": "HP Cinema 2",
+      "capacity_kw": 15.0,
+      "flexibility_factor": 0.85
+    }
+  },
+  "assets_grouping": {
+    "ECM_Cinema_HPs": {
+      "type": "heat_pump",
+      "assets": ["ECM97.1", "ECM97.2"]
+    },
+    "ECM_EV_Chargers": {
+      "type": "ev_charger",
+      "assets": ["ECM63.1", "ECM63.2"]
+    }
+  },
+  "flexibility": {
+    "peak_hours": {
+      "morning": {"start": 7, "end": 10},
+      "evening": {"start": 16, "end": 20}
+    },
+    "historical_days_back": 30,
+    "default_flexibility_factor": 0.50,
+    "ev_charger": {
+      "occupancy_threshold_w": 100
     }
   }
 }

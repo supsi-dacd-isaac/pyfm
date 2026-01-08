@@ -4,6 +4,9 @@ conf/private/*.json
 data/tmp/*
 data/plots/*
 data/csv/*
+data/ev_analysis/*
+data/hp_analysis/*
+data/market_results/*
 tkns/*
 .env
 .vscode
