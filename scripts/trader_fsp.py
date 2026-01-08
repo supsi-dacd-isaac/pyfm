@@ -16,6 +16,7 @@ from classes.fsp import FSP
 from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 from classes.flexibility_forecaster import FlexibilityForecaster
+from classes.bidding_strategy import BiddingStrategy, StrategyManager
 
 
 def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
@@ -39,188 +40,62 @@ def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
     return df
 
 
-if __name__ == "__main__":
-    # --------------------------------------------------------------------------- #
-    # Configuration file
-    # --------------------------------------------------------------------------- #
-    arg_parser = argparse.ArgumentParser(
-        description="FSP Trader - Estimate and bid flexibility on the market"
-    )
-    arg_parser.add_argument("--config_file", help="configuration file", required=True)
-    arg_parser.add_argument("--fsp", help="FSP identifier", required=True)
-    arg_parser.add_argument(
-        "--log_file", help="log file (optional, if empty log redirected on stdout)"
-    )
-    arg_parser.add_argument(
-        "--dry-run", 
-        action="store_true",
-        help="Estimate flexibility without placing orders on the market"
-    )
-    args = arg_parser.parse_args()
+def get_strategy_flexibility(
+    strategy: BiddingStrategy, 
+    slot_time: datetime, 
+    asset_breakdown: dict,
+    logger: logging.Logger
+) -> float:
+    """
+    Calculate available flexibility based on strategy and asset data.
     
-    # Dry run mode
-    dry_run = args.dry_run
-
-    # Load the main parameters
-    config_file = args.config_file
-    if os.path.isfile(config_file) is False:
-        print("\nATTENTION! Unable to open configuration file %s\n" % config_file)
-        sys.exit(1)
-
-    # Load configuration
-    cfg = json.loads(open(config_file).read())
-    cfg_conns = json.loads(open(cfg["connectionsFile"]).read())
-    cfg.update(cfg_conns)
-
-    # Logger object
-    if not args.log_file:
-        log_file = None
-    else:
-        log_file = args.log_file
-    logger = logging.getLogger()
-    logging.basicConfig(
-        format="%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s",
-        level=logging.INFO,
-        filename=log_file,
-    )
-
-    # FSP identifier
-    fsp_identifier = args.fsp
-
-    if dry_run:
-        logger.info("Starting program (DRY-RUN MODE - no orders will be placed)")
-    else:
-        logger.info("Starting program")
-
-    # Database connection
-    pgi = None
-    try:
-        pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
-    except Exception as e:
-        logger.error("Unable to connect to PostgreSQL: %s" % str(e))
-
-    # InfluxDB connection for flexibility forecasting
-    influx_client = InfluxDBClient(
-        host=cfg["influxDB"]["host"],
-        port=cfg["influxDB"]["port"],
-        password=cfg["influxDB"]["password"],
-        username=cfg["influxDB"]["user"],
-        database=cfg["influxDB"]["database"],
-        ssl=cfg["influxDB"]["ssl"],
-    )
-
-    # Actors definition
-    # DSO
-    dso = DSO(cfg["fm"]["actors"]["dso"], cfg, logger)
-    dso.set_organization(filter_dict={"name": dso.cfg["id"]})
-    slot_time = dso.get_adjusted_time(
-        cfg["fm"]["granularity"], cfg["fm"]["ordersTimeShift"]
-    )
-
-    # FSP
-    fsp = FSP(cfg["fm"]["actors"]["fsps"][fsp_identifier], cfg, logger)
-    user_info = fsp.nodes_interface.get_user_info()
-
-    fsp.set_markets(filter_dict={"name": cfg["fm"]["marketName"]})
-    fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
-
-    logger.info("market id: %s" % fsp.markets[0]["id"])
-    logger.info("market name: %s" % fsp.markets[0]["name"])
-
-    # Get quantities demanded by the DSO (DSO runs 1 minute before FSP)
-    dso_demands = dso.get_flexibility_requests(
-        slot_time, cfg["fm"]["granularity"], "Buy", "Power"
-    )
-
-    # Set current baselines for FSP
-    fsp.download_baselines(slot_time)
-
-    # Initialize FlexibilityForecaster for the 5-asset portfolio
-    flex_forecaster = FlexibilityForecaster(cfg, influx_client, logger)
+    :param strategy: BiddingStrategy instance
+    :param slot_time: Time slot for the bid
+    :param asset_breakdown: Per-asset flexibility breakdown
+    :param logger: Logger instance
+    :return: Available flexibility in MW
+    """
+    # Get strategy parameters for this time slot
+    params = strategy.get_bid_parameters(slot_time)
     
-    # FMO object
-    fmo = FMO(fsp.cfg, logger, pgi)
-
-    # Get flexibility forecast for the current slot
-    logger.info("=" * 70)
-    logger.info("FLEXIBILITY ANALYSIS FOR SLOT: %s", slot_time.strftime("%Y-%m-%d %H:%M"))
-    logger.info("=" * 70)
-    
-    # Check if this is a peak hour
-    is_peak = flex_forecaster._is_peak_hour(slot_time)
-    logger.info("Peak hour: %s", "YES" if is_peak else "NO")
-    
-    # Get per-asset flexibility breakdown for this slot
-    asset_breakdown = flex_forecaster.get_asset_flexibility_breakdown(slot_time)
-    
-    total_available_flex_kw = 0
-    logger.info("-" * 70)
-    logger.info("Asset flexibility breakdown:")
+    # Calculate actual available flexibility from allowed assets
+    actual_flex_kw = 0
     for asset_id, info in asset_breakdown.items():
-        occupancy = info.get("occupancy_probability")
-        if occupancy is not None:
-            # EV charger with occupancy
-            logger.info(
-                "  %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW (factor=%.0f%%)",
-                asset_id,
-                info["description"],
-                info["typical_load_kw"],
-                occupancy * 100,
-                info["available_flexibility_kw"],
-                info["flexibility_factor"] * 100
-            )
-        else:
-            # Heat pump or other asset
-            logger.info(
-                "  %s (%s): typical=%.2f kW, available_flex=%.2f kW (factor=%.0f%%)",
-                asset_id,
-                info["description"],
-                info["typical_load_kw"],
-                info["available_flexibility_kw"],
-                info["flexibility_factor"] * 100
-            )
-        total_available_flex_kw += info["available_flexibility_kw"]
+        if strategy.is_asset_allowed(asset_id):
+            actual_flex_kw += info["available_flexibility_kw"]
     
-    total_available_flex_mw = total_available_flex_kw / 1000
-    logger.info("-" * 70)
-    logger.info("TOTAL AVAILABLE FLEXIBILITY: %.3f kW (%.6f MW)", 
-                total_available_flex_kw, total_available_flex_mw)
+    actual_flex_mw = actual_flex_kw / 1000
     
-    # Log DSO demands
-    logger.info("-" * 70)
-    logger.info("DSO DEMANDS:")
-    total_dso_demand_up = 0
-    total_dso_demand_down = 0
-    for i, dso_demand in enumerate(dso_demands):
-        logger.info(
-            "  Demand %d: Up=%.3f MW, Down=%.3f MW, Price=%.2f CHF/MW",
-            i + 1,
-            dso_demand.get("Up", 0),
-            dso_demand.get("Down", 0),
-            dso_demand.get("unitPrice", 0)
-        )
-        total_dso_demand_up += dso_demand.get("Up", 0)
-        total_dso_demand_down += dso_demand.get("Down", 0)
+    # Get strategy's configured flexibility
+    strategy_flex_mw = params["flexibility_mw"]
+    if params["ev_flexibility_mw"] > 0:
+        strategy_flex_mw += params["ev_flexibility_mw"]
     
-    logger.info("  TOTAL DSO DEMAND: Up=%.3f MW, Down=%.3f MW", 
-                total_dso_demand_up, total_dso_demand_down)
+    # Use the minimum of strategy config and actual available
+    final_flex_mw = min(strategy_flex_mw, actual_flex_mw)
     
-    # Compare available flexibility vs DSO demand
-    logger.info("-" * 70)
-    can_meet_demand = total_available_flex_mw >= total_dso_demand_up
     logger.info(
-        "CAN MEET DSO DEMAND (Up): %s (available=%.3f MW, required=%.3f MW)",
-        "YES" if can_meet_demand else "NO",
-        total_available_flex_mw,
-        total_dso_demand_up
+        "Strategy flexibility: config=%.4f MW, actual=%.4f MW, using=%.4f MW",
+        strategy_flex_mw, actual_flex_mw, final_flex_mw
     )
-    logger.info("=" * 70)
+    
+    return final_flex_mw
 
-    # Process orders (place or simulate in dry-run mode)
+
+def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger):
+    """
+    Run the original simple bidding mode (baseline-based).
+    
+    This is the legacy approach that uses:
+    - Baseline-based quantity calculation
+    - Constant pricing from FSP config
+    """
+    logger.info("=" * 70)
+    logger.info("RUNNING IN SIMPLE MODE (baseline-based bidding)")
+    logger.info("=" * 70)
+    
     if dry_run:
-        logger.info("=" * 70)
         logger.info("DRY-RUN: Simulating order placement (no actual orders will be placed)")
-        logger.info("=" * 70)
     
     orders_summary = []
     
@@ -295,6 +170,441 @@ if __name__ == "__main__":
                             portfolio=fsp.portfolios[p_k].metadata["name"],
                             features=resp_selling[k],
                         )
+    
+    return orders_summary
+
+
+def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time, 
+                      asset_breakdown, dry_run, logger):
+    """
+    Run strategy-based bidding mode.
+    
+    Uses the configured bidding strategy to determine:
+    - Which assets to use
+    - What price to bid
+    - How much flexibility to offer
+    """
+    logger.info("=" * 70)
+    logger.info("RUNNING IN STRATEGY MODE: %s - %s", strategy_id, strategy.name)
+    logger.info("=" * 70)
+    
+    # Get strategy parameters for current time slot
+    bid_params = strategy.get_bid_parameters(slot_time)
+    logger.info("Time slot: %s", bid_params["slot_name"])
+    logger.info("Strategy bid price: %.2f CHF/MW", bid_params["bid_price"])
+    logger.info("Strategy flexibility target: %.4f MW", bid_params["flexibility_mw"])
+    
+    # Filter assets based on strategy and calculate flexibility
+    total_available_flex_kw = 0
+    strategy_flex_kw = 0
+    logger.info("-" * 70)
+    logger.info("Asset flexibility breakdown (strategy filter: %s):", strategy_id)
+    
+    for asset_id, info in asset_breakdown.items():
+        is_allowed = strategy.is_asset_allowed(asset_id)
+        status = "✓" if is_allowed else "✗"
+        
+        occupancy = info.get("occupancy_probability")
+        if occupancy is not None:
+            logger.info(
+                "  [%s] %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW",
+                status, asset_id, info["description"],
+                info["typical_load_kw"], occupancy * 100, info["available_flexibility_kw"],
+            )
+        else:
+            logger.info(
+                "  [%s] %s (%s): typical=%.2f kW, available_flex=%.2f kW",
+                status, asset_id, info["description"],
+                info["typical_load_kw"], info["available_flexibility_kw"],
+            )
+        
+        total_available_flex_kw += info["available_flexibility_kw"]
+        if is_allowed:
+            strategy_flex_kw += info["available_flexibility_kw"]
+    
+    logger.info("-" * 70)
+    logger.info("TOTAL AVAILABLE (all assets): %.3f kW (%.6f MW)", 
+                total_available_flex_kw, total_available_flex_kw / 1000)
+    logger.info("STRATEGY AVAILABLE (filtered): %.3f kW (%.6f MW)", 
+                strategy_flex_kw, strategy_flex_kw / 1000)
+    
+    # Get the flexibility to bid based on strategy
+    flexibility_to_bid_mw = get_strategy_flexibility(
+        strategy, slot_time, asset_breakdown, logger
+    )
+    
+    if dry_run:
+        logger.info("-" * 70)
+        logger.info("DRY-RUN: Simulating order placement (no actual orders will be placed)")
+    
+    orders_summary = []
+    
+    for dso_demand in dso_demands:
+        dso_price = dso_demand.get("unitPrice", 0)
+        
+        # Check if DSO price is acceptable according to strategy
+        price_acceptable = strategy.check_dso_price_acceptable(slot_time, dso_price)
+        
+        if not price_acceptable:
+            logger.info(
+                "DSO price %.2f CHF/MW is below strategy minimum %.2f CHF/MW - SKIPPING",
+                dso_price, bid_params["bid_price"]
+            )
+            continue
+        
+        for p_k in fsp.portfolios.keys():
+            baseline_value = fsp.baselines[p_k]["quantity"].loc[
+                slot_time.strftime("%Y-%m-%dT%H:%M:%SZ")
+            ] if slot_time.strftime("%Y-%m-%dT%H:%M:%SZ") in fsp.baselines[p_k]["quantity"].index else 0
+            
+            logger.info(
+                "Portfolio %s: baseline=%.6f MW, strategy_flex=%.6f MW",
+                fsp.portfolios[p_k].metadata["name"],
+                baseline_value,
+                flexibility_to_bid_mw
+            )
+            
+            if dry_run:
+                for k_regulation_type in ["Up", "Down"]:
+                    if k_regulation_type == "Up":
+                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Up", 0))
+                    else:
+                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
+                    
+                    if quantity_to_sell > 0:
+                        order_info = {
+                            "portfolio": fsp.portfolios[p_k].metadata["name"],
+                            "regulation_type": k_regulation_type,
+                            "quantity_mw": quantity_to_sell,
+                            "unit_price": dso_price,
+                            "strategy": strategy_id,
+                            "time_slot": bid_params["slot_name"],
+                            "period_from": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "period_to": (slot_time + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        }
+                        orders_summary.append(order_info)
+                        logger.info(
+                            "[DRY-RUN] WOULD PLACE ORDER: %s regulation, quantity=%.4f MW, price=%.2f CHF/MW (strategy: %s)",
+                            k_regulation_type, quantity_to_sell, dso_price, strategy_id
+                        )
+                    else:
+                        logger.info(
+                            "[DRY-RUN] NO ORDER for %s: quantity=0 (no demand or no flexibility)",
+                            k_regulation_type
+                        )
+            else:
+                for k_regulation_type in ["Up", "Down"]:
+                    if k_regulation_type == "Up":
+                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Up", 0))
+                    else:
+                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
+                    
+                    if quantity_to_sell > 0:
+                        body = {
+                            "ownerOrganizationId": fsp.organization["id"],
+                            "periodFrom": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "periodTo": (slot_time + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "validTo": (slot_time + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            "marketId": fsp.markets[0]["id"],
+                            "assetPortfolioId": p_k,
+                            "regulationType": k_regulation_type,
+                            "quantity": quantity_to_sell,
+                            "unitPrice": dso_price,
+                        }
+                        body.update(fsp.cfg["orderSection"]["mainSettings"])
+                        
+                        response = fsp.nodes_interface.post_request(
+                            "%s%s" % (fsp.nodes_interface.cfg["mainEndpoint"], "orders"), body
+                        )
+                        
+                        if response is not False:
+                            order_info = {
+                                "portfolio": fsp.portfolios[p_k].metadata["name"],
+                                "regulation_type": k_regulation_type,
+                                "quantity_mw": quantity_to_sell,
+                                "unit_price": dso_price,
+                                "strategy": strategy_id,
+                                "time_slot": bid_params["slot_name"],
+                                "period_from": body["periodFrom"],
+                                "period_to": body["periodTo"],
+                            }
+                            orders_summary.append(order_info)
+                            logger.info(
+                                "ORDER PLACED: %s regulation, quantity=%.4f MW, price=%.2f CHF/MW (strategy: %s)",
+                                k_regulation_type, quantity_to_sell, dso_price, strategy_id
+                            )
+                            fmo.add_entry_to_market_ledger(
+                                timeslot=slot_time,
+                                player=fsp,
+                                portfolio=fsp.portfolios[p_k].metadata["name"],
+                                features=body,
+                            )
+                        else:
+                            logger.error(
+                                "FAILED to place order: %s regulation, quantity=%.4f MW",
+                                k_regulation_type, quantity_to_sell
+                            )
+    
+    return orders_summary, strategy_id
+
+
+if __name__ == "__main__":
+    # --------------------------------------------------------------------------- #
+    # Configuration file
+    # --------------------------------------------------------------------------- #
+    arg_parser = argparse.ArgumentParser(
+        description="FSP Trader - Estimate and bid flexibility on the market"
+    )
+    arg_parser.add_argument("--config_file", help="configuration file", required=True)
+    arg_parser.add_argument("--fsp", help="FSP identifier", required=True)
+    arg_parser.add_argument(
+        "--strategy",
+        help="Bidding strategy to use. Options: strategy_1, strategy_2, strategy_3, strategy_4, strategy_5. "
+             "If not specified and FSP has no strategy configured, uses simple baseline-based bidding."
+    )
+    arg_parser.add_argument(
+        "--list-strategies",
+        action="store_true",
+        help="List available strategies and exit"
+    )
+    arg_parser.add_argument(
+        "--log_file", help="log file (optional, if empty log redirected on stdout)"
+    )
+    arg_parser.add_argument(
+        "--dry-run", 
+        action="store_true",
+        help="Estimate flexibility without placing orders on the market"
+    )
+    args = arg_parser.parse_args()
+    
+    # Dry run mode
+    dry_run = args.dry_run
+
+    # Load the main parameters
+    config_file = args.config_file
+    if os.path.isfile(config_file) is False:
+        print("\nATTENTION! Unable to open configuration file %s\n" % config_file)
+        sys.exit(1)
+
+    # Load configuration
+    cfg = json.loads(open(config_file).read())
+
+    # Logger object
+    if not args.log_file:
+        log_file = None
+    else:
+        log_file = args.log_file
+    logger = logging.getLogger()
+    logging.basicConfig(
+        format="%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s",
+        level=logging.INFO,
+        filename=log_file,
+    )
+
+    # Initialize strategy manager (doesn't need connections)
+    strategy_manager = StrategyManager(cfg, logger)
+    
+    # List strategies if requested (doesn't need connections)
+    if args.list_strategies:
+        strategy_manager.print_all_strategies()
+        sys.exit(0)
+    
+    # Load connections file (needed for actual trading)
+    try:
+        cfg_conns = json.loads(open(cfg["connectionsFile"]).read())
+        cfg.update(cfg_conns)
+    except FileNotFoundError:
+        print(f"\nERROR: Connections file not found: {cfg['connectionsFile']}")
+        print("This file contains database credentials and API keys.")
+        print("Please create it based on the template or contact your administrator.")
+        sys.exit(1)
+
+    # FSP identifier
+    fsp_identifier = args.fsp
+    
+    # Check FSP exists
+    if fsp_identifier not in cfg["fm"]["actors"]["fsps"]:
+        print(f"\nERROR: FSP '{fsp_identifier}' not found in configuration")
+        print(f"Available FSPs: {list(cfg['fm']['actors']['fsps'].keys())}")
+        sys.exit(1)
+    
+    fsp_config = cfg["fm"]["actors"]["fsps"][fsp_identifier]
+    
+    # Determine which mode to use:
+    # - Strategy mode: if --strategy is provided OR if FSP config has "strategy" field
+    # - Simple mode: otherwise (original baseline-based approach)
+    use_strategy_mode = False
+    strategy = None
+    strategy_id = None
+    
+    if args.strategy:
+        # Command line strategy takes priority
+        strategy_id = args.strategy
+        strategy = strategy_manager.get_strategy(strategy_id)
+        if strategy is None:
+            print(f"\nERROR: Strategy '{strategy_id}' not found")
+            print(f"Available strategies: {strategy_manager.list_strategies()}")
+            sys.exit(1)
+        use_strategy_mode = True
+    elif "strategy" in fsp_config:
+        # FSP config has strategy defined
+        strategy_id = fsp_config["strategy"]
+        strategy = strategy_manager.get_strategy(strategy_id)
+        if strategy is None:
+            print(f"\nERROR: Strategy '{strategy_id}' (from FSP config) not found")
+            print(f"Available strategies: {strategy_manager.list_strategies()}")
+            sys.exit(1)
+        use_strategy_mode = True
+    else:
+        # No strategy specified - use simple mode
+        use_strategy_mode = False
+
+    if dry_run:
+        logger.info("Starting program (DRY-RUN MODE - no orders will be placed)")
+    else:
+        logger.info("Starting program")
+    
+    logger.info("=" * 70)
+    logger.info("FSP: %s", fsp_identifier)
+    if use_strategy_mode:
+        logger.info("Mode: STRATEGY-BASED")
+        logger.info("Strategy: %s - %s", strategy_id, strategy.name)
+        logger.info("Description: %s", strategy.description)
+        logger.info("Allowed assets: %s", strategy.allowed_assets)
+    else:
+        logger.info("Mode: SIMPLE (baseline-based)")
+        logger.info("Pricing: %s", fsp_config.get("pricing", {}).get("source", "constant"))
+        logger.info("Min price: %.2f CHF/MW", fsp_config.get("pricing", {}).get("constant", 5.0))
+    logger.info("=" * 70)
+
+    # Database connection
+    pgi = None
+    try:
+        pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
+    except Exception as e:
+        logger.error("Unable to connect to PostgreSQL: %s" % str(e))
+
+    # InfluxDB connection for flexibility forecasting
+    influx_client = InfluxDBClient(
+        host=cfg["influxDB"]["host"],
+        port=cfg["influxDB"]["port"],
+        password=cfg["influxDB"]["password"],
+        username=cfg["influxDB"]["user"],
+        database=cfg["influxDB"]["database"],
+        ssl=cfg["influxDB"]["ssl"],
+    )
+
+    # Actors definition
+    # DSO
+    dso = DSO(cfg["fm"]["actors"]["dso"], cfg, logger)
+    dso.set_organization(filter_dict={"name": dso.cfg["id"]})
+    slot_time = dso.get_adjusted_time(
+        cfg["fm"]["granularity"], cfg["fm"]["ordersTimeShift"]
+    )
+
+    # FSP
+    fsp = FSP(fsp_config, cfg, logger)
+    user_info = fsp.nodes_interface.get_user_info()
+
+    fsp.set_markets(filter_dict={"name": cfg["fm"]["marketName"]})
+    fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
+
+    logger.info("market id: %s" % fsp.markets[0]["id"])
+    logger.info("market name: %s" % fsp.markets[0]["name"])
+
+    # Get quantities demanded by the DSO (DSO runs 1 minute before FSP)
+    dso_demands = dso.get_flexibility_requests(
+        slot_time, cfg["fm"]["granularity"], "Buy", "Power"
+    )
+
+    # Set current baselines for FSP
+    fsp.download_baselines(slot_time)
+
+    # Initialize FlexibilityForecaster for the 5-asset portfolio
+    flex_forecaster = FlexibilityForecaster(cfg, influx_client, logger)
+    
+    # FMO object
+    fmo = FMO(fsp.cfg, logger, pgi)
+
+    # Get flexibility forecast for the current slot
+    logger.info("=" * 70)
+    logger.info("FLEXIBILITY ANALYSIS FOR SLOT: %s", slot_time.strftime("%Y-%m-%d %H:%M"))
+    logger.info("=" * 70)
+    
+    # Check if this is a peak hour
+    is_peak = flex_forecaster._is_peak_hour(slot_time)
+    logger.info("Peak hour: %s", "YES" if is_peak else "NO")
+    
+    # Get per-asset flexibility breakdown for this slot
+    asset_breakdown = flex_forecaster.get_asset_flexibility_breakdown(slot_time)
+    
+    total_available_flex_kw = 0
+    logger.info("-" * 70)
+    logger.info("Asset flexibility breakdown:")
+    for asset_id, info in asset_breakdown.items():
+        occupancy = info.get("occupancy_probability")
+        if occupancy is not None:
+            logger.info(
+                "  %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW (factor=%.0f%%)",
+                asset_id, info["description"],
+                info["typical_load_kw"], occupancy * 100,
+                info["available_flexibility_kw"], info["flexibility_factor"] * 100
+            )
+        else:
+            logger.info(
+                "  %s (%s): typical=%.2f kW, available_flex=%.2f kW (factor=%.0f%%)",
+                asset_id, info["description"],
+                info["typical_load_kw"], info["available_flexibility_kw"],
+                info["flexibility_factor"] * 100
+            )
+        total_available_flex_kw += info["available_flexibility_kw"]
+    
+    total_available_flex_mw = total_available_flex_kw / 1000
+    logger.info("-" * 70)
+    logger.info("TOTAL AVAILABLE FLEXIBILITY: %.3f kW (%.6f MW)", 
+                total_available_flex_kw, total_available_flex_mw)
+    
+    # Log DSO demands
+    logger.info("-" * 70)
+    logger.info("DSO DEMANDS:")
+    total_dso_demand_up = 0
+    total_dso_demand_down = 0
+    for i, dso_demand in enumerate(dso_demands):
+        logger.info(
+            "  Demand %d: Up=%.3f MW, Down=%.3f MW, Price=%.2f CHF/MW",
+            i + 1,
+            dso_demand.get("Up", 0),
+            dso_demand.get("Down", 0),
+            dso_demand.get("unitPrice", 0)
+        )
+        total_dso_demand_up += dso_demand.get("Up", 0)
+        total_dso_demand_down += dso_demand.get("Down", 0)
+    
+    logger.info("  TOTAL DSO DEMAND: Up=%.3f MW, Down=%.3f MW", 
+                total_dso_demand_up, total_dso_demand_down)
+    
+    # Compare available flexibility vs DSO demand
+    logger.info("-" * 70)
+    can_meet_demand = total_available_flex_mw >= total_dso_demand_up
+    logger.info(
+        "CAN MEET DSO DEMAND (Up): %s (available=%.3f MW, required=%.3f MW)",
+        "YES" if can_meet_demand else "NO",
+        total_available_flex_mw,
+        total_dso_demand_up
+    )
+    logger.info("=" * 70)
+
+    # Run appropriate mode
+    if use_strategy_mode:
+        orders_summary, used_strategy = run_strategy_mode(
+            strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
+            asset_breakdown, dry_run, logger
+        )
+    else:
+        orders_summary = run_simple_mode(
+            fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger
+        )
+        used_strategy = None
 
     # Print summary
     logger.info("=" * 70)
@@ -304,18 +614,33 @@ if __name__ == "__main__":
         logger.info("EXECUTION SUMMARY")
     logger.info("=" * 70)
     
+    if use_strategy_mode:
+        logger.info("Mode: Strategy-based (%s - %s)", strategy_id, strategy.name)
+    else:
+        logger.info("Mode: Simple (baseline-based)")
+    
     if orders_summary:
         total_quantity = sum(o["quantity_mw"] for o in orders_summary)
+        total_value = sum(o["quantity_mw"] * o["unit_price"] for o in orders_summary)
         logger.info("Total orders: %d", len(orders_summary))
-        logger.info("Total quantity: %.3f MW", total_quantity)
+        logger.info("Total quantity: %.4f MW", total_quantity)
+        logger.info("Total potential revenue: %.2f CHF", total_value)
         for order in orders_summary:
-            logger.info(
-                "  - %s %s: %.3f MW @ %.2f CHF/MW",
-                order["portfolio"],
-                order["regulation_type"],
-                order["quantity_mw"],
-                order["unit_price"]
-            )
+            if "strategy" in order:
+                logger.info(
+                    "  - %s %s: %.4f MW @ %.2f CHF/MW = %.2f CHF (strategy: %s)",
+                    order["portfolio"], order["regulation_type"],
+                    order["quantity_mw"], order["unit_price"],
+                    order["quantity_mw"] * order["unit_price"],
+                    order["strategy"]
+                )
+            else:
+                logger.info(
+                    "  - %s %s: %.4f MW @ %.2f CHF/MW = %.2f CHF",
+                    order["portfolio"], order["regulation_type"],
+                    order["quantity_mw"], order["unit_price"],
+                    order["quantity_mw"] * order["unit_price"]
+                )
     else:
         logger.info("No orders %s", "would be placed" if dry_run else "placed")
     

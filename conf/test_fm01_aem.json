@@ -88,11 +88,13 @@
             }
           },
           "pricing": {
-            "source": "constant",
+            "source": "strategy",
             "constant": 5.0,
             "forecasting_multiplier": 1.0,
-            "activationCost": 1.0
+            "activationCost": 2.5
           },
+          "strategy": "strategy_4",
+          "assets": ["ECM96.2", "ECM97.1", "ECM97.2", "ECM63.1", "ECM63.2"],
           "forecast":{
             "source": "aem",
             "filename": "../data/forecast/example01.csv"
@@ -148,7 +150,7 @@
       "device_name_tag": "charge_point_ev_2",
       "field": "power",
       "type": "ev_charger",
-      "description": "EV Charger 2",
+      "description": "EV Charger 2",  
       "capacity_kw": 11.0,
       "flexibility_factor": 0.70
     },
@@ -196,6 +198,67 @@
     "default_flexibility_factor": 0.50,
     "ev_charger": {
       "occupancy_threshold_w": 100
+    }
+  },
+  "bidding_strategies": {
+    "strategy_1": {
+      "name": "HP Only",
+      "description": "Heat pumps only, conservative full-day coverage, no EV chargers",
+      "asset_types": ["heat_pump"],
+      "time_slots": [
+        {"name": "Morning Peak", "start": "06:30", "end": "09:00", "flexibility_mw": 0.015, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.010, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_2": {
+      "name": "Full Portfolio + Evening EV",
+      "description": "All assets, focus on evening when EVs might be charging",
+      "asset_types": ["heat_pump", "ev_charger"],
+      "time_slots": [
+        {"name": "Morning Peak", "start": "07:00", "end": "10:00", "flexibility_mw": 0.012, "bid_price": 8.0, "activation_cost": 2.5},
+        {"name": "Midday", "start": "10:00", "end": "17:00", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "17:00", "end": "20:00", "flexibility_mw": 0.010, "bid_price": 9.5, "activation_cost": 2.5, "ev_flexibility_mw": 0.0008, "ev_bid_price": 10.0, "ev_activation_cost": 4.5},
+        {"name": "Off-peak", "start": "20:00", "end": "07:00", "flexibility_mw": 0.005, "bid_price": 5.5, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_3": {
+      "name": "Morning Peak Focus",
+      "description": "Aggressive bidding during morning peak when Cinema HPs are at maximum",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM97.1", "ECM97.2"],
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.010, "bid_price": 7.5, "activation_cost": 2.5},
+        {"name": "Afternoon/Evening", "start": "12:00", "end": "20:00", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5},
+        {"name": "Night", "start": "20:00", "end": "06:30", "flexibility_mw": 0.004, "bid_price": 5.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_4": {
+      "name": "Hybrid (S3+S1)",
+      "description": "Morning peak aggressive (S3) + full day HP coverage (S1) - RECOMMENDED",
+      "asset_types": ["heat_pump"],
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.010, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_5": {
+      "name": "Hybrid2 (S3+S2)",
+      "description": "Morning peak aggressive (S3) + evening EV focus (S2)",
+      "asset_types": ["heat_pump", "ev_charger"],
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.010, "bid_price": 7.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "17:00", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "17:00", "end": "20:00", "flexibility_mw": 0.010, "bid_price": 9.5, "activation_cost": 2.5, "ev_flexibility_mw": 0.0008, "ev_bid_price": 10.0, "ev_activation_cost": 4.5},
+        {"name": "Off-peak", "start": "20:00", "end": "06:30", "flexibility_mw": 0.005, "bid_price": 5.5, "activation_cost": 2.5}
+      ]
     }
   }
 }
