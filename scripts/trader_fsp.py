@@ -271,6 +271,9 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                     else:
                         quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
                     
+                    # Round to 3 decimal places (NODES API requirement)
+                    quantity_to_sell = round(quantity_to_sell, 3)
+                    
                     if quantity_to_sell > 0:
                         order_info = {
                             "portfolio": fsp.portfolios[p_k].metadata["name"],
@@ -284,7 +287,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                         }
                         orders_summary.append(order_info)
                         logger.info(
-                            "[DRY-RUN] WOULD PLACE ORDER: %s regulation, quantity=%.4f MW, price=%.2f CHF/MW (strategy: %s)",
+                            "[DRY-RUN] WOULD PLACE ORDER: %s regulation, quantity=%.3f MW, price=%.2f CHF/MW (strategy: %s)",
                             k_regulation_type, quantity_to_sell, dso_price, strategy_id
                         )
                     else:
@@ -298,6 +301,9 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                         quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Up", 0))
                     else:
                         quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
+                    
+                    # Round to 3 decimal places (NODES API requirement)
+                    quantity_to_sell = round(quantity_to_sell, 3)
                     
                     if quantity_to_sell > 0:
                         body = {
@@ -330,7 +336,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                             }
                             orders_summary.append(order_info)
                             logger.info(
-                                "ORDER PLACED: %s regulation, quantity=%.4f MW, price=%.2f CHF/MW (strategy: %s)",
+                                "ORDER PLACED: %s regulation, quantity=%.3f MW, price=%.2f CHF/MW (strategy: %s)",
                                 k_regulation_type, quantity_to_sell, dso_price, strategy_id
                             )
                             fmo.add_entry_to_market_ledger(
@@ -341,7 +347,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                             )
                         else:
                             logger.error(
-                                "FAILED to place order: %s regulation, quantity=%.4f MW",
+                                "FAILED to place order: %s regulation, quantity=%.3f MW",
                                 k_regulation_type, quantity_to_sell
                             )
     
