@@ -17,6 +17,7 @@ from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 from classes.flexibility_forecaster import FlexibilityForecaster
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
+from classes.bid_record_repository import BidRecordRepository
 
 
 def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
@@ -82,7 +83,7 @@ def get_strategy_flexibility(
     return final_flex_mw
 
 
-def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger):
+def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, bid_record_id=None):
     """
     Run the original simple bidding mode (baseline-based).
     
@@ -169,13 +170,14 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                             player=fsp,
                             portfolio=fsp.portfolios[p_k].metadata["name"],
                             features=resp_selling[k],
+                            bid_record_id=bid_record_id,
                         )
     
     return orders_summary
 
 
 def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time, 
-                      asset_breakdown, dry_run, logger):
+                      asset_breakdown, dry_run, logger, bid_record_id=None):
     """
     Run strategy-based bidding mode.
     
@@ -344,6 +346,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                                 player=fsp,
                                 portfolio=fsp.portfolios[p_k].metadata["name"],
                                 features=body,
+                                bid_record_id=bid_record_id,
                             )
                         else:
                             logger.error(
@@ -485,8 +488,12 @@ if __name__ == "__main__":
 
     # Database connection
     pgi = None
+    bid_repo = None
     try:
         pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
+        # Initialize bid record repository for storing bid info
+        bid_repo = BidRecordRepository(pgi, logger)
+        logger.info("Bid record repository initialized")
     except Exception as e:
         logger.error("Unable to connect to PostgreSQL: %s" % str(e))
 
@@ -541,6 +548,15 @@ if __name__ == "__main__":
     is_peak = flex_forecaster._is_peak_hour(slot_time)
     logger.info("Peak hour: %s", "YES" if is_peak else "NO")
     
+    # Log temperature information if enabled
+    if flex_forecaster.temperature_enabled:
+        forecast_temp = flex_forecaster.get_forecast_temperature(slot_time)
+        if forecast_temp is not None:
+            logger.info("Temperature forecast: %.1f°C", forecast_temp)
+            logger.info("Temperature-aware HP analysis: ENABLED")
+        else:
+            logger.info("Temperature forecast: N/A (using time-based estimates)")
+    
     # Get per-asset flexibility breakdown for this slot
     asset_breakdown = flex_forecaster.get_asset_flexibility_breakdown(slot_time)
     
@@ -549,19 +565,33 @@ if __name__ == "__main__":
     logger.info("Asset flexibility breakdown:")
     for asset_id, info in asset_breakdown.items():
         occupancy = info.get("occupancy_probability")
+        estimation_method = info.get("estimation_method", "time_based")
+        temp_adjusted_load = info.get("temperature_adjusted_load_kw")
+        forecast_temp = info.get("forecast_temperature_c")
+        
         if occupancy is not None:
+            # EV charger with occupancy probability
             logger.info(
                 "  %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW (factor=%.0f%%)",
                 asset_id, info["description"],
                 info["typical_load_kw"], occupancy * 100,
                 info["available_flexibility_kw"], info["flexibility_factor"] * 100
             )
-        else:
+        elif temp_adjusted_load is not None:
+            # Heat pump with temperature-adjusted estimate
             logger.info(
-                "  %s (%s): typical=%.2f kW, available_flex=%.2f kW (factor=%.0f%%)",
+                "  %s (%s): time_based=%.2f kW, temp_adjusted=%.2f kW @ %.1f°C, available_flex=%.2f kW (method=%s)",
+                asset_id, info["description"],
+                info["typical_load_kw"], temp_adjusted_load, forecast_temp,
+                info["available_flexibility_kw"], estimation_method
+            )
+        else:
+            # Standard time-based estimate
+            logger.info(
+                "  %s (%s): typical=%.2f kW, available_flex=%.2f kW (factor=%.0f%%, method=%s)",
                 asset_id, info["description"],
                 info["typical_load_kw"], info["available_flexibility_kw"],
-                info["flexibility_factor"] * 100
+                info["flexibility_factor"] * 100, estimation_method
             )
         total_available_flex_kw += info["available_flexibility_kw"]
     
@@ -600,15 +630,57 @@ if __name__ == "__main__":
     )
     logger.info("=" * 70)
 
+    # Save bid record BEFORE placing orders (to get the ID for market_ledger linkage)
+    bid_record_id = None
+    if bid_repo:
+        try:
+            # Build assets_to_activate list
+            # Convert numpy types to native Python types to avoid SQL issues
+            assets_to_activate = []
+            if use_strategy_mode and strategy:
+                for asset_id, info in asset_breakdown.items():
+                    if strategy.is_asset_allowed(asset_id):
+                        assets_to_activate.append({
+                            "asset_id": asset_id,
+                            "description": info.get("description", asset_id),
+                            "asset_type": info.get("asset_type", "unknown"),
+                            "available_flexibility_kw": float(info.get("available_flexibility_kw", 0)),
+                            "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+                        })
+            else:
+                for asset_id, info in asset_breakdown.items():
+                    assets_to_activate.append({
+                        "asset_id": asset_id,
+                        "description": info.get("description", asset_id),
+                        "asset_type": info.get("asset_type", "unknown"),
+                        "available_flexibility_kw": float(info.get("available_flexibility_kw", 0)),
+                        "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+                    })
+            
+            bid_record_id = bid_repo.save_bid_record(
+                fsp_id=args.fsp,
+                slot_start=slot_time,
+                slot_end=slot_time + timedelta(minutes=15),
+                orders=[],  # Will be updated after orders are placed
+                strategy_id=strategy_id if use_strategy_mode else None,
+                strategy_name=strategy.name if use_strategy_mode and strategy else None,
+                strategy_description=strategy.description if use_strategy_mode and strategy else None,
+                assets_to_activate=assets_to_activate,
+            )
+            logger.info("Bid record created with ID: %s (status: pending)", bid_record_id)
+        except Exception as e:
+            logger.warning("Could not create bid record: %s", str(e))
+
     # Run appropriate mode
     if use_strategy_mode:
         orders_summary, used_strategy = run_strategy_mode(
             strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
-            asset_breakdown, dry_run, logger
+            asset_breakdown, dry_run, logger, bid_record_id=bid_record_id
         )
     else:
         orders_summary = run_simple_mode(
-            fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger
+            fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, 
+            bid_record_id=bid_record_id
         )
         used_strategy = None
 
@@ -651,6 +723,24 @@ if __name__ == "__main__":
         logger.info("No orders %s", "would be placed" if dry_run else "placed")
     
     logger.info("=" * 70)
+    
+    # Update bid record with actual orders placed
+    if bid_record_id and orders_summary and bid_repo:
+        try:
+            # Update the bid record with actual orders
+            bid_repo.save_bid_record(
+                fsp_id=args.fsp,
+                slot_start=slot_time,
+                slot_end=slot_time + timedelta(minutes=15),
+                orders=orders_summary,
+                strategy_id=strategy_id if use_strategy_mode else None,
+                strategy_name=strategy.name if use_strategy_mode and strategy else None,
+                strategy_description=strategy.description if use_strategy_mode and strategy else None,
+                assets_to_activate=None,  # Already set, won't be updated
+            )
+            logger.info("Bid record ID %s updated with %d orders", bid_record_id, len(orders_summary))
+        except Exception as e:
+            logger.error("Failed to update bid record: %s", str(e))
     
     if dry_run:
         logger.info("Ending program (DRY-RUN - no changes made to market)")

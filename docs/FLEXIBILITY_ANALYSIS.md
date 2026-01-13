@@ -26,15 +26,21 @@ This analysis uses **30 days of historical data** from InfluxDB to build consump
 │     └─> Aggregate by 15-min slots                                       │
 │     └─> Separate weekday vs weekend patterns                            │
 │                                                                          │
-│  2. CALCULATE TYPICAL LOAD                                              │
-│     └─> Average power consumption for this time slot                    │
-│     └─> Based on day type (weekday/weekend)                             │
+│  2. LOAD TEMPERATURE DATA (for Heat Pumps)                              │
+│     └─> Get historical temperatures                                     │
+│     └─> Build temperature-power correlation profiles                    │
+│     └─> Get temperature forecast for target slot                        │
 │                                                                          │
-│  3. APPLY FLEXIBILITY FACTOR                                            │
-│     └─> HP: typical_load × flexibility_factor                           │
+│  3. CALCULATE TYPICAL/EXPECTED LOAD                                     │
+│     └─> HP with temperature: power at forecast temp for this slot       │
+│     └─> HP without temperature: average for this time slot              │
+│     └─> EV: average for this time slot × occupancy probability          │
+│                                                                          │
+│  4. APPLY FLEXIBILITY FACTOR                                            │
+│     └─> HP: expected_load × flexibility_factor                          │
 │     └─> EV: typical_load × flexibility_factor × occupancy_probability   │
 │                                                                          │
-│  4. SUM AVAILABLE FLEXIBILITY                                           │
+│  5. SUM AVAILABLE FLEXIBILITY                                           │
 │     └─> Total from all assets (or filtered by strategy)                 │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -99,6 +105,8 @@ This means:
 
 ### Heat Pumps
 
+#### Basic (Time-Based) Estimation
+
 ```
 available_flexibility = typical_load × flexibility_factor
 ```
@@ -109,6 +117,36 @@ typical_load = 11.27 kW
 flexibility_factor = 0.85
 available_flexibility = 11.27 × 0.85 = 9.58 kW
 ```
+
+#### Temperature-Aware Estimation (Enhanced)
+
+When temperature analysis is enabled, the system uses **external temperature** to better predict HP consumption:
+
+```
+expected_load = f(temperature, time_slot, day_type)
+available_flexibility = expected_load × flexibility_factor
+```
+
+**How it works:**
+
+1. **Build Temperature-Power Profile**: Correlate historical HP consumption with external temperatures
+2. **Bin Temperatures**: Group temperatures into ranges (e.g., <0°C, 0-5°C, 5-10°C, etc.)
+3. **Get Forecast Temperature**: Use weather forecast for the target time slot
+4. **Lookup Expected Power**: Find average consumption for this temperature bin + time slot
+
+**Example: ECM97.2 at 17:00 with Temperature**
+```
+forecast_temperature = 2.5°C
+temperature_bin = 0-5°C
+expected_load (from profile) = 13.8 kW  # Higher than average due to cold
+flexibility_factor = 0.85
+available_flexibility = 13.8 × 0.85 = 11.73 kW
+```
+
+**Why this matters:**
+- Cold weather → Higher HP consumption → More flexibility available
+- Warm weather → Lower HP consumption → Less flexibility available
+- Standard time-based average ignores temperature variations
 
 ### EV Chargers
 
@@ -132,6 +170,8 @@ available_flexibility = 5.81 × 0.70 × 0.18 = 0.74 kW
 ---
 
 ## Example Analysis Output
+
+### Standard Output (Time-Based)
 
 ```
 ======================================================================
@@ -162,6 +202,98 @@ Asset flexibility breakdown:
 TOTAL AVAILABLE FLEXIBILITY: 15.036 kW (0.015 MW)
 ----------------------------------------------------------------------
 ```
+
+### Temperature-Aware Output (Enhanced)
+
+When temperature analysis is enabled, the output includes temperature information:
+
+```
+======================================================================
+FLEXIBILITY ANALYSIS FOR SLOT: 2026-01-08 17:00
+======================================================================
+Peak hour: YES
+Temperature forecast: 3.2°C
+Temperature-aware HP analysis: ENABLED
+
+Loading historical patterns from last 30 days (15-min aggregation)
+├─ ECM63.1: 511 data points
+├─ ECM63.2: 649 data points
+├─ ECM96.2: 2019 data points
+├─ ECM97.1: 2881 data points
+└─ ECM97.2: 2881 data points
+
+Loading temperature history from last 30 days
+└─ Loaded 2880 temperature records: avg=8.3°C, min=-2.1°C, max=18.5°C
+
+Building HP temperature profiles from last 30 days
+├─ ECM96.2: 1853 data points, correlation=-0.72, temp range=-2.1-18.5°C
+├─ ECM97.1: 2654 data points, correlation=-0.78, temp range=-2.1-18.5°C
+└─ ECM97.2: 2654 data points, correlation=-0.81, temp range=-2.1-18.5°C
+
+Loading EV occupancy patterns from last 30 days
+├─ ECM63.1: avg occupancy weekday=13.9%, weekend=5.7%
+└─ ECM63.2: avg occupancy weekday=20.1%, weekend=7.8%
+
+----------------------------------------------------------------------
+Asset flexibility breakdown:
+----------------------------------------------------------------------
+  ECM63.1 (EV Charger 1): typical=3.36 kW, occupancy=18%, available_flex=0.43 kW (factor=70%)
+  ECM63.2 (EV Charger 2): typical=5.81 kW, occupancy=18%, available_flex=0.74 kW (factor=70%)
+  ECM96.2 (HP Small):     time_based=2.07 kW, temp_adjusted=2.85 kW @ 3.2°C, available_flex=2.28 kW (method=temp_profile:0-5°C)
+  ECM97.1 (HP Cinema 1):  time_based=3.10 kW, temp_adjusted=4.25 kW @ 3.2°C, available_flex=3.61 kW (method=temp_profile:0-5°C)
+  ECM97.2 (HP Cinema 2):  time_based=11.27 kW, temp_adjusted=14.10 kW @ 3.2°C, available_flex=11.99 kW (method=temp_profile:0-5°C)
+----------------------------------------------------------------------
+TOTAL AVAILABLE FLEXIBILITY: 19.05 kW (0.019 MW)
+----------------------------------------------------------------------
+```
+
+**Key differences:**
+- **Temperature forecast** is shown at the top (3.2°C)
+- **Temperature correlation** is logged for each HP (negative = colder → more power)
+- **HP output shows both estimates**: `time_based` (simple average) and `temp_adjusted` (temperature-based)
+- **Available flexibility is higher** when it's cold (14.10 kW vs 11.27 kW for ECM97.2)
+
+---
+
+## Temperature-Power Correlation
+
+Heat pumps show a strong **negative correlation** between external temperature and power consumption:
+
+```
+Temperature ↓  →  HP Power ↑  →  Flexibility ↑
+Temperature ↑  →  HP Power ↓  →  Flexibility ↓
+```
+
+### Typical Correlation Values
+
+| Asset | Correlation | Interpretation |
+|-------|-------------|----------------|
+| ECM97.2 | -0.81 | Strong: cold = high power |
+| ECM97.1 | -0.78 | Strong: cold = high power |
+| ECM96.2 | -0.72 | Moderate-strong |
+
+**Correlation interpretation:**
+- `-1.0` = Perfect negative: every °C drop = proportional power increase
+- `-0.5` = Moderate negative: temperature matters but other factors too
+- `0` = No relationship
+
+### Why This Matters for Bidding
+
+| Scenario | Temperature | HP Power | Flexibility | Strategy |
+|----------|-------------|----------|-------------|----------|
+| Cold Winter Day | -2°C | ~15 kW | ~13 kW | Bid aggressively |
+| Mild Spring Day | 12°C | ~6 kW | ~5 kW | Bid conservatively |
+| Warm Summer Day | 22°C | ~2 kW | ~1.5 kW | Focus on EVs instead |
+
+### Temperature Profile by Time Slot
+
+The system builds profiles for each **combination of**:
+- Temperature bin (e.g., 0-5°C)
+- Time slot (e.g., 17:00-17:15)
+- Day type (weekday/weekend)
+
+This allows accurate predictions like:
+> "On a Thursday at 17:00 with 3°C forecast, ECM97.2 typically consumes 14.1 kW"
 
 ---
 
@@ -240,6 +372,19 @@ From `test_fm01_aem.json`:
   "default_flexibility_factor": 0.50,
   "ev_charger": {
     "occupancy_threshold_w": 100
+  },
+  "temperature": {
+    "enabled": true,
+    "source": {
+      "site": "ECM",
+      "device": "weather_station",
+      "field": "temperature"
+    },
+    "bins": [-5, 0, 5, 10, 15, 20, 25],
+    "forecast": {
+      "type": "historical_avg",
+      "file": "../data/forecast/temperature_forecast.json"
+    }
   }
 }
 ```
@@ -249,6 +394,37 @@ From `test_fm01_aem.json`:
 | `historical_days_back` | 30 | Days of history to analyze |
 | `default_flexibility_factor` | 0.50 | Default if not specified per asset |
 | `occupancy_threshold_w` | 100 | Power > 100W means car is connected |
+
+### Temperature Configuration
+
+| Parameter | Description |
+|-----------|-------------|
+| `temperature.enabled` | Enable/disable temperature-aware HP analysis |
+| `temperature.source.site` | InfluxDB site tag for weather data |
+| `temperature.source.device` | InfluxDB device tag for weather sensor |
+| `temperature.source.field` | Field name for temperature readings |
+| `temperature.bins` | Temperature bin boundaries in °C |
+| `temperature.forecast.type` | Forecast source: `constant`, `historical_avg`, or `file` |
+| `temperature.forecast.file` | Path to JSON file with temperature forecast |
+
+#### Forecast Types
+
+| Type | Description |
+|------|-------------|
+| `constant` | Use a fixed temperature (for testing) |
+| `historical_avg` | Use historical average for same time/day |
+| `file` | Load from JSON file with hourly forecasts |
+
+#### Temperature Bins
+
+The `bins` array defines temperature ranges for grouping historical data:
+
+```
+bins: [-5, 0, 5, 10, 15, 20, 25]
+
+Creates these ranges:
+  <-5°C, -5-0°C, 0-5°C, 5-10°C, 10-15°C, 15-20°C, 20-25°C, >25°C
+```
 
 ### Asset Configuration
 
@@ -322,11 +498,36 @@ The flexibility analysis is implemented in:
 
 **`classes/flexibility_forecaster.py`**
 
-Key methods:
-- `_load_historical_patterns()` - Load 30-day consumption patterns
-- `_load_ev_occupancy_patterns()` - Calculate EV occupancy probabilities
-- `get_asset_flexibility_breakdown()` - Per-asset flexibility calculation
-- `_is_peak_hour()` - Peak hour detection
+### Core Methods
+
+| Method | Description |
+|--------|-------------|
+| `_load_historical_patterns()` | Load 30-day consumption patterns from InfluxDB |
+| `_load_ev_occupancy_patterns()` | Calculate EV occupancy probabilities |
+| `get_asset_flexibility_breakdown()` | Per-asset flexibility calculation |
+| `_is_peak_hour()` | Peak hour detection |
+
+### Temperature-Aware Methods
+
+| Method | Description |
+|--------|-------------|
+| `_load_temperature_history()` | Load historical temperature data |
+| `_build_hp_temperature_profiles()` | Build temperature-power correlation profiles |
+| `_load_temperature_forecast()` | Load forecast from file, API, or historical average |
+| `get_forecast_temperature()` | Get temperature forecast for a specific time |
+| `get_hp_expected_power()` | Get expected HP power based on temperature |
+| `_get_temp_bin()` | Map temperature to bin label |
+| `_get_temp_bin_labels()` | Generate temperature bin labels |
+
+### Attributes
+
+| Attribute | Type | Description |
+|-----------|------|-------------|
+| `temperature_enabled` | bool | Whether temperature analysis is active |
+| `temperature_bins` | list | Temperature bin boundaries |
+| `_temperature_history` | DataFrame | Historical temperature data |
+| `_hp_temperature_profiles` | dict | Temperature-power profiles per HP |
+| `_temperature_forecast` | dict | Forecast temperatures by datetime |
 
 ---
 

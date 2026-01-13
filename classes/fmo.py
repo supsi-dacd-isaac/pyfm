@@ -53,7 +53,17 @@ class FMO:
             self.logger.warning("PostgreSQL interface not available, logging instead.")
             self.logger.info("FMO unexecuted query: %s" % sql)
 
-    def add_entry_to_market_ledger(self, timeslot, player, portfolio, features):
+    def add_entry_to_market_ledger(self, timeslot, player, portfolio, features, bid_record_id=None):
+        """
+        Add an entry to the market ledger.
+        
+        :param timeslot: Market timeslot
+        :param player: Player object (FSP or DSO)
+        :param portfolio: Portfolio identifier
+        :param features: Order features dict
+        :param bid_record_id: Optional ID of the bid record this trade originated from
+        :return: True if successful
+        """
         if portfolio is None:
             portfolio_id = "none"
             price = 0.0
@@ -61,24 +71,46 @@ class FMO:
             portfolio_id = portfolio
             price = float(features["unitPrice"])
 
-        sql = (
-            "INSERT INTO market_ledger "
-            "(timeslot_market, player_id, player_role, portfolio_id, side, regulation, flexibility_quantity, "
-            "flexibility_unit, price, currency) VALUES"
-            "('%s','%s','%s','%s','%s','%s','%s','%s','%s','%s')"
-            % (
-                timeslot,
-                player.cfg["id"],
-                player.cfg["role"],
-                portfolio_id,
-                features["side"],
-                features["regulationType"],
-                features["quantity"],
-                "MW",
-                float(price),
-                self.cfg["orderSection"]["mainSettings"]["currency"],
+        # Build SQL with optional bid_record_id
+        if bid_record_id is not None:
+            sql = (
+                "INSERT INTO market_ledger "
+                "(timeslot_market, player_id, player_role, portfolio_id, side, regulation, flexibility_quantity, "
+                "flexibility_unit, price, currency, bid_record_id) VALUES"
+                "('%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s')"
+                % (
+                    timeslot,
+                    player.cfg["id"],
+                    player.cfg["role"],
+                    portfolio_id,
+                    features["side"],
+                    features["regulationType"],
+                    features["quantity"],
+                    "MW",
+                    float(price),
+                    self.cfg["orderSection"]["mainSettings"]["currency"],
+                    bid_record_id,
+                )
             )
-        )
+        else:
+            sql = (
+                "INSERT INTO market_ledger "
+                "(timeslot_market, player_id, player_role, portfolio_id, side, regulation, flexibility_quantity, "
+                "flexibility_unit, price, currency) VALUES"
+                "('%s','%s','%s','%s','%s','%s','%s','%s','%s','%s')"
+                % (
+                    timeslot,
+                    player.cfg["id"],
+                    player.cfg["role"],
+                    portfolio_id,
+                    features["side"],
+                    features["regulationType"],
+                    features["quantity"],
+                    "MW",
+                    float(price),
+                    self.cfg["orderSection"]["mainSettings"]["currency"],
+                )
+            )
         self.__execute_sql(sql)
         return True
 
