@@ -219,9 +219,12 @@ class BidRecordRepository:
                     WHERE id = %s
                 """, (strategy_id, strategy_name, strategy_description, total_quantity_mw, bid_record_id))
                 
-                # Delete old orders and assets
+                # Delete old orders (always refresh orders on update)
                 cur.execute(f"DELETE FROM {self.SCHEMA}.{self.TABLE_ORDERS} WHERE bid_record_id = %s", (bid_record_id,))
-                cur.execute(f"DELETE FROM {self.SCHEMA}.{self.TABLE_ASSETS} WHERE bid_record_id = %s", (bid_record_id,))
+                
+                # Only delete assets if new ones are provided (None means keep existing)
+                if assets_to_activate is not None:
+                    cur.execute(f"DELETE FROM {self.SCHEMA}.{self.TABLE_ASSETS} WHERE bid_record_id = %s", (bid_record_id,))
                 
                 self.logger.info("Updated existing bid record ID %s", bid_record_id)
             else:
