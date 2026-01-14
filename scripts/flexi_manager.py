@@ -1169,7 +1169,7 @@ Examples:
     )
     
     parser.add_argument(
-        "--config", "-c",
+        "--config_file", "-c",
         default="../conf/test_fm01_aem.json",
         help="Path to configuration file (default: ../conf/test_fm01_aem.json)"
     )
@@ -1238,7 +1238,7 @@ Examples:
     dry_run = not args.live
     
     # Load configuration
-    config_path = args.config
+    config_path = args.config_file
     if not os.path.isabs(config_path):
         config_path = os.path.join(os.path.dirname(__file__), config_path)
     

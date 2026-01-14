@@ -188,17 +188,18 @@ python flexi_manager.py --fsp supsi01 --dry-run --output activation_result.json
 
 ## Command Line Arguments
 
-| Argument | Short | Description | Default |
-|----------|-------|-------------|---------|
-| `--config` | `-c` | Configuration file path | `../conf/test_fm01_aem.json` |
-| `--fsp` | `-f` | FSP identifier (required) | - |
-| `--slot` | `-s` | Target slot start (ISO format) | Next 15-min slot |
-| `--offset` | `-t` | Time offset from now (e.g., `30m`, `2h`, `1h30m`) | - |
-| `--dry-run` | `-d` | Simulate only | Yes |
-| `--live` | `-l` | Send actual commands | No |
-| `--allocation` | `-a` | Allocation strategy | `proportional` |
-| `--log-level` | - | Logging verbosity | `INFO` |
-| `--output` | `-o` | JSON output file | - |
+| Argument        | Short | Description | Default |
+|-----------------|-------|-------------|---------|
+| `--config_file` | `-c` | Configuration file path | `../conf/test_fm01_aem.json` |
+| `--fsp`         | `-f` | FSP identifier (required) | - |
+| `--slot`        | `-s` | Target slot start (ISO format) | Next 15-min slot |
+| `--offset`      | `-t` | Time offset from now (e.g., `30m`, `2h`, `1h30m`) | - |
+| `--dry-run`     | `-d` | Simulate only | Yes |
+| `--live`        | `-l` | Send actual commands | No |
+| `--allocation`  | `-a` | Allocation strategy | `proportional` |
+| `--log-level`   | - | Logging verbosity | `INFO` |
+| `--log_file`    | - | Path to log file | - |
+| `--output`      | `-o` | JSON output file | - |
 
 ### Offset Format Examples
 
@@ -426,7 +427,7 @@ The typical workflow is:
 ```bash
 # Cron example
 # trader_fsp.py runs at minute 0 to bid for slot starting at minute 30 (90-min ahead)
-0 * * * *  cd /path/to/pyfm && .venv/bin/python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json --fsp supsi01
+0 * * * *  cd /path/to/pyfm && .venv/bin/python scripts/trader_fsp.py --config conf/test_fm01_aem.json --fsp supsi01
 
 # flexi_manager.py runs at minute 14, 29, 44, 59 to activate the just-passed slot
 14,29,44,59 * * * * cd /path/to/pyfm && .venv/bin/python scripts/flexi_manager.py --fsp supsi01 --offset 15m --live
