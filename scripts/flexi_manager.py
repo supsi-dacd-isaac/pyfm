@@ -37,18 +37,31 @@ from classes.bidding_strategy import BiddingStrategy, StrategyManager
 # LOGGING SETUP
 # =============================================================================
 
-def setup_logging(log_level: str = "INFO") -> logging.Logger:
-    """Configure logging with timestamp and level."""
+def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
+    """Configure logging with timestamp and level.
+
+    :param log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
+    :param log_file: Optional path to log file. If provided, logs will be written to this file.
+    :return: Configured logger instance
+    """
     logger = logging.getLogger("flexi_manager")
     logger.setLevel(getattr(logging, log_level.upper()))
     
-    handler = logging.StreamHandler()
     formatter = logging.Formatter(
         "%(asctime)s::%(levelname)s::%(funcName)s::%(message)s"
     )
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    
+
+    # Always add console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Optionally add file handler
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
     return logger
 
 
@@ -1065,6 +1078,44 @@ class FlexibilityManager:
             )
             summary["control_results"][asset_id] = result
         
+        # Step 4: Save activation records to database
+        if self.bid_repo:
+            self.logger.info("-" * 70)
+            self.logger.info("Step 4: Saving activation records to database...")
+            
+            # Get bid record ID if available
+            bid_record = summary.get("bid_record")
+            bid_record_id = bid_record.get("id") if bid_record else None
+            
+            # Build activation records
+            activation_records = []
+            for asset_id, curtailment_kw in allocations.items():
+                asset_info = self.asset_mapping.get(asset_id, {})
+                control_result = summary["control_results"].get(asset_id, {})
+                
+                activation_records.append({
+                    "asset_id": asset_id,
+                    "power_kw": curtailment_kw,
+                    "description": asset_info.get("description", asset_id),
+                    "asset_type": asset_info.get("type"),
+                    "percentage": control_result.get("percentage"),
+                    "status": control_result.get("status", "unknown")
+                })
+            
+            try:
+                saved_count = self.bid_repo.save_asset_activations_batch(
+                    fsp_id=self.fsp_id,
+                    slot_start=slot_start,
+                    slot_end=slot_end,
+                    activations=activation_records,
+                    allocation_strategy=allocation_strategy,
+                    dry_run=dry_run,
+                    bid_record_id=bid_record_id
+                )
+                self.logger.info("Saved %d activation records", saved_count)
+            except Exception as e:
+                self.logger.warning("Could not save activation records: %s", str(e))
+        
         # Summary
         self.logger.info("=" * 70)
         self.logger.info("FLEXIBILITY ACTIVATION COMPLETE")
@@ -1170,6 +1221,10 @@ Examples:
         help="Logging level (default: INFO)"
     )
     parser.add_argument(
+        "--log-file",
+        help="Path to log file. If provided, logs will be written to this file in addition to console."
+    )
+    parser.add_argument(
         "--output", "-o",
         help="Output file for JSON summary"
     )
@@ -1177,8 +1232,8 @@ Examples:
     args = parser.parse_args()
     
     # Setup logging
-    logger = setup_logging(args.log_level)
-    
+    logger = setup_logging(args.log_level, args.log_file)
+
     # Determine dry-run mode
     dry_run = not args.live
     

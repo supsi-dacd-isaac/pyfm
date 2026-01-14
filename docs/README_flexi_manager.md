@@ -434,13 +434,30 @@ The typical workflow is:
 
 ### Database Tables
 
-Bid records are stored in PostgreSQL:
+Records are stored in PostgreSQL:
 
 ```
-pyfm.bid_records           # Main record (one per FSP per slot)
-pyfm.bid_record_orders     # Orders placed for this bid
-pyfm.bid_record_assets     # Assets to activate
+public.bid_records           # Main record (one per FSP per slot) - created by trader_fsp.py
+public.bid_record_orders     # Orders placed for this bid
+public.bid_record_assets     # Assets to activate
+public.asset_activations     # Actual activation records - created by flexi_manager.py
 ```
+
+The `asset_activations` table stores every activation command sent:
+
+| Column | Description |
+|--------|-------------|
+| `fsp_id` | FSP identifier |
+| `slot_start` / `slot_end` | Time slot |
+| `asset_id` | Asset identifier (e.g., ECM97.1) |
+| `asset_description` | Human-readable description |
+| `asset_type` | heat_pump, ev_charger |
+| `power_to_activate_kw` | Power curtailment in kW |
+| `percentage_of_capacity` | % of asset capacity |
+| `allocation_strategy` | proportional, priority, cost_optimal |
+| `dry_run` | TRUE if simulated |
+| `activation_status` | success, failed, simulated |
+| `bid_record_id` | Link to originating bid |
 
 Tables are automatically created on first run.
 

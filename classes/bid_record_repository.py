@@ -29,6 +29,7 @@ class BidRecordRepository:
     TABLE_BID_RECORDS = "bid_records"
     TABLE_ORDERS = "bid_record_orders"
     TABLE_ASSETS = "bid_record_assets"
+    TABLE_ACTIVATIONS = "asset_activations"
     
     def __init__(self, pg_interface, logger: logging.Logger):
         """
@@ -132,6 +133,36 @@ class BidRecordRepository:
             cur.execute(f"""
                 CREATE INDEX IF NOT EXISTS idx_bid_record_assets_bid_id 
                 ON {self.SCHEMA}.{self.TABLE_ASSETS}(bid_record_id)
+            """)
+            
+            # Asset activations table (records of actual activations)
+            cur.execute(f"""
+                CREATE TABLE IF NOT EXISTS {self.SCHEMA}.{self.TABLE_ACTIVATIONS} (
+                    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+                    bid_record_id UUID REFERENCES {self.SCHEMA}.{self.TABLE_BID_RECORDS}(id) ON DELETE SET NULL,
+                    fsp_id VARCHAR(100) NOT NULL,
+                    slot_start TIMESTAMP NOT NULL,
+                    slot_end TIMESTAMP NOT NULL,
+                    asset_id VARCHAR(100) NOT NULL,
+                    asset_description VARCHAR(200),
+                    asset_type VARCHAR(100),
+                    power_to_activate_kw DECIMAL(10, 3) NOT NULL,
+                    percentage_of_capacity DECIMAL(5, 2),
+                    allocation_strategy VARCHAR(50),
+                    dry_run BOOLEAN DEFAULT FALSE,
+                    activation_status VARCHAR(50) DEFAULT 'pending',
+                    created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') NOT NULL
+                )
+            """)
+            
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_asset_activations_fsp_slot 
+                ON {self.SCHEMA}.{self.TABLE_ACTIVATIONS}(fsp_id, slot_start)
+            """)
+            
+            cur.execute(f"""
+                CREATE INDEX IF NOT EXISTS idx_asset_activations_asset_id 
+                ON {self.SCHEMA}.{self.TABLE_ACTIVATIONS}(asset_id)
             """)
             
             # Add foreign key column to market_ledger if it doesn't exist
@@ -492,5 +523,168 @@ class BidRecordRepository:
             self.logger.error("Error cleaning up old records: %s", str(e))
             self.conn.rollback()
             return 0
+        finally:
+            cur.close()
+    
+    def save_asset_activation(
+        self,
+        fsp_id: str,
+        slot_start: datetime,
+        slot_end: datetime,
+        asset_id: str,
+        power_to_activate_kw: float,
+        asset_description: str = None,
+        asset_type: str = None,
+        percentage_of_capacity: float = None,
+        allocation_strategy: str = None,
+        dry_run: bool = False,
+        activation_status: str = "success",
+        bid_record_id: str = None
+    ) -> str:
+        """
+        Save an asset activation record.
+        
+        :param fsp_id: FSP identifier
+        :param slot_start: Start of time slot
+        :param slot_end: End of time slot
+        :param asset_id: Asset identifier
+        :param power_to_activate_kw: Power to curtail in kW
+        :param asset_description: Asset description (optional)
+        :param asset_type: Asset type (optional)
+        :param percentage_of_capacity: Percentage of capacity (optional)
+        :param allocation_strategy: Allocation strategy used (optional)
+        :param dry_run: Whether this was a dry run
+        :param activation_status: Status (pending, success, failed)
+        :param bid_record_id: Related bid record ID (optional)
+        :return: UUID of the inserted activation record
+        """
+        cur = self.conn.cursor()
+        
+        try:
+            cur.execute(f"""
+                INSERT INTO {self.SCHEMA}.{self.TABLE_ACTIVATIONS}
+                (fsp_id, slot_start, slot_end, asset_id, asset_description, asset_type,
+                 power_to_activate_kw, percentage_of_capacity, allocation_strategy,
+                 dry_run, activation_status, bid_record_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (
+                fsp_id, slot_start, slot_end, asset_id, asset_description, asset_type,
+                power_to_activate_kw, percentage_of_capacity, allocation_strategy,
+                dry_run, activation_status, bid_record_id
+            ))
+            
+            activation_id = cur.fetchone()[0]
+            self.conn.commit()
+            
+            self.logger.debug(
+                "Saved activation record: %s @ %s, asset=%s, power=%.2f kW",
+                fsp_id, slot_start, asset_id, power_to_activate_kw
+            )
+            
+            return str(activation_id)
+            
+        except Exception as e:
+            self.logger.error("Error saving activation record: %s", str(e))
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
+    
+    def save_asset_activations_batch(
+        self,
+        fsp_id: str,
+        slot_start: datetime,
+        slot_end: datetime,
+        activations: List[Dict],
+        allocation_strategy: str = None,
+        dry_run: bool = False,
+        bid_record_id: str = None
+    ) -> int:
+        """
+        Save multiple asset activation records in a single transaction.
+        
+        :param fsp_id: FSP identifier
+        :param slot_start: Start of time slot
+        :param slot_end: End of time slot
+        :param activations: List of activation dictionaries with keys:
+                           asset_id, power_kw, description, asset_type, percentage, status
+        :param allocation_strategy: Allocation strategy used
+        :param dry_run: Whether this was a dry run
+        :param bid_record_id: Related bid record ID (optional)
+        :return: Number of records inserted
+        """
+        if not activations:
+            return 0
+        
+        cur = self.conn.cursor()
+        
+        try:
+            count = 0
+            for act in activations:
+                cur.execute(f"""
+                    INSERT INTO {self.SCHEMA}.{self.TABLE_ACTIVATIONS}
+                    (fsp_id, slot_start, slot_end, asset_id, asset_description, asset_type,
+                     power_to_activate_kw, percentage_of_capacity, allocation_strategy,
+                     dry_run, activation_status, bid_record_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    fsp_id,
+                    slot_start,
+                    slot_end,
+                    act.get("asset_id"),
+                    act.get("description"),
+                    act.get("asset_type"),
+                    act.get("power_kw", 0),
+                    act.get("percentage"),
+                    allocation_strategy,
+                    dry_run,
+                    act.get("status", "success"),
+                    bid_record_id
+                ))
+                count += 1
+            
+            self.conn.commit()
+            
+            self.logger.info(
+                "Saved %d activation records for %s @ %s",
+                count, fsp_id, slot_start
+            )
+            
+            return count
+            
+        except Exception as e:
+            self.logger.error("Error saving activation records: %s", str(e))
+            self.conn.rollback()
+            raise
+        finally:
+            cur.close()
+    
+    def get_activations_for_slot(
+        self,
+        fsp_id: str,
+        slot_start: datetime
+    ) -> List[Dict]:
+        """
+        Get all activation records for a specific slot.
+        
+        :param fsp_id: FSP identifier
+        :param slot_start: Start of time slot
+        :return: List of activation dictionaries
+        """
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        try:
+            cur.execute(f"""
+                SELECT * FROM {self.SCHEMA}.{self.TABLE_ACTIVATIONS}
+                WHERE fsp_id = %s AND slot_start = %s
+                ORDER BY asset_id
+            """, (fsp_id, slot_start))
+            
+            return [dict(row) for row in cur.fetchall()]
+            
+        except Exception as e:
+            self.logger.error("Error getting activations: %s", str(e))
+            return []
         finally:
             cur.close()
