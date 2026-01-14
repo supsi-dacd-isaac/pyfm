@@ -1221,7 +1221,7 @@ Examples:
         help="Logging level (default: INFO)"
     )
     parser.add_argument(
-        "--log-file",
+        "--log_file",
         help="Path to log file. If provided, logs will be written to this file in addition to console."
     )
     parser.add_argument(
