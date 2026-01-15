@@ -136,12 +136,68 @@ class AssetController:
     - HTTP API: For smart devices with REST APIs
     - Modbus: For industrial equipment
     - Simulation: For testing (logs only)
+    
+    Modulation-aware control:
+    - Discrete assets (e.g., heat pumps): Sends ON/OFF state commands
+    - Continuous assets (e.g., EV chargers): Sends power setpoint commands
     """
     
     def __init__(self, asset_mapping: dict, logger: logging.Logger):
         self.asset_mapping = asset_mapping
         self.logger = logger
         self.control_results = {}
+    
+    def _get_modulation_type(self, asset_config: dict) -> str:
+        """
+        Get modulation type for an asset, with fallback to defaults by asset type.
+        
+        :param asset_config: Asset configuration dictionary
+        :return: 'continuous' or 'discrete'
+        """
+        # Explicit configuration takes precedence
+        if "modulation_type" in asset_config:
+            return asset_config["modulation_type"]
+        
+        # Fallback to default by asset type
+        asset_type = asset_config.get("type", "")
+        defaults = MODULATION_DEFAULTS.get(asset_type, {})
+        return defaults.get("modulation_type", "continuous")
+    
+    def _determine_discrete_state(
+        self, 
+        asset_config: dict, 
+        curtailment_kw: float
+    ) -> tuple:
+        """
+        Determine the target discrete state (ON/OFF) based on curtailment request.
+        
+        For ON/OFF assets, if curtailment is requested (> threshold), turn OFF.
+        Otherwise, keep ON.
+        
+        :param asset_config: Asset configuration dictionary
+        :param curtailment_kw: Requested curtailment in kW
+        :return: Tuple of (state_name, target_power_kw)
+        """
+        capacity = asset_config.get("capacity_kw", 0)
+        
+        # Get discrete states
+        discrete_states = asset_config.get("discrete_states_kw", [0.0, capacity])
+        
+        # Threshold: if curtailment >= 50% of capacity, switch OFF
+        # This can be configured per asset if needed
+        threshold_pct = asset_config.get("curtailment_threshold_pct", 50.0)
+        threshold_kw = capacity * (threshold_pct / 100.0)
+        
+        if curtailment_kw >= threshold_kw:
+            # Turn OFF (use minimum state)
+            target_power = min(discrete_states)
+            state_name = "OFF"
+        else:
+            # Keep ON (use maximum state)
+            target_power = max(discrete_states)
+            state_name = "ON"
+        
+        return state_name, target_power
     
     def curtail_asset(
         self, 
@@ -153,6 +209,9 @@ class AssetController:
         """
         Send curtailment command to an asset.
         
+        For discrete assets: Sends ON/OFF commands based on curtailment threshold.
+        For continuous assets: Sends specific power reduction values.
+        
         :param asset_id: Asset identifier (e.g., "ECM97.1")
         :param curtailment_kw: Amount of power to reduce (kW)
         :param duration_minutes: Duration of curtailment
@@ -163,15 +222,28 @@ class AssetController:
         asset_type = asset_config.get("type", "unknown")
         description = asset_config.get("description", asset_id)
         capacity_kw = asset_config.get("capacity_kw", 0)
+        modulation_type = self._get_modulation_type(asset_config)
         
         # Calculate curtailment percentage
         curtailment_pct = (curtailment_kw / capacity_kw * 100) if capacity_kw > 0 else 0
+        
+        # For discrete assets, determine the actual state to set
+        if modulation_type == "discrete":
+            state_name, target_power_kw = self._determine_discrete_state(asset_config, curtailment_kw)
+            actual_curtailment_kw = capacity_kw - target_power_kw
+        else:
+            state_name = None
+            target_power_kw = max(0, capacity_kw - curtailment_kw)
+            actual_curtailment_kw = curtailment_kw
         
         result = {
             "asset_id": asset_id,
             "description": description,
             "asset_type": asset_type,
-            "curtailment_kw": curtailment_kw,
+            "modulation_type": modulation_type,
+            "requested_curtailment_kw": curtailment_kw,
+            "actual_curtailment_kw": actual_curtailment_kw,
+            "target_power_kw": target_power_kw,
             "curtailment_pct": curtailment_pct,
             "duration_minutes": duration_minutes,
             "dry_run": dry_run,
@@ -179,15 +251,24 @@ class AssetController:
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         
+        if modulation_type == "discrete":
+            result["discrete_state"] = state_name
+        
         if dry_run:
-            self.logger.info(
-                "[DRY-RUN] Would curtail %s (%s): %.2f kW (%.1f%%) for %d minutes",
-                asset_id, description, curtailment_kw, curtailment_pct, duration_minutes
-            )
+            if modulation_type == "discrete":
+                self.logger.info(
+                    "[DRY-RUN] Would set %s (%s) to %s (target: %.2f kW) for %d minutes",
+                    asset_id, description, state_name, target_power_kw, duration_minutes
+                )
+            else:
+                self.logger.info(
+                    "[DRY-RUN] Would curtail %s (%s): %.2f kW (target: %.2f kW) for %d minutes",
+                    asset_id, description, curtailment_kw, target_power_kw, duration_minutes
+                )
             result["status"] = "simulated"
             result["message"] = "Dry-run mode - no actual command sent"
         else:
-            # Actual control logic would go here
+            # Actual control logic
             try:
                 if asset_type == "heat_pump":
                     self._control_heat_pump(asset_id, asset_config, curtailment_kw, duration_minutes)
@@ -201,10 +282,16 @@ class AssetController:
                 
                 result["status"] = "success"
                 result["message"] = "Control command sent"
-                self.logger.info(
-                    "Curtailed %s (%s): %.2f kW for %d minutes",
-                    asset_id, description, curtailment_kw, duration_minutes
-                )
+                if modulation_type == "discrete":
+                    self.logger.info(
+                        "Set %s (%s) to %s for %d minutes",
+                        asset_id, description, state_name, duration_minutes
+                    )
+                else:
+                    self.logger.info(
+                        "Curtailed %s (%s): %.2f kW for %d minutes",
+                        asset_id, description, curtailment_kw, duration_minutes
+                    )
             except Exception as e:
                 result["status"] = "error"
                 result["message"] = str(e)
@@ -223,6 +310,9 @@ class AssetController:
         """
         Send control command to a heat pump.
         
+        For discrete (ON/OFF) heat pumps: Sends state command (ON/OFF).
+        For modulating heat pumps (rare): Sends power setpoint.
+        
         Control methods (configured per asset):
         - mqtt: Publish to MQTT topic
         - http: POST to device API
@@ -230,35 +320,46 @@ class AssetController:
         """
         control_cfg = config.get("control", {})
         control_type = control_cfg.get("type", "simulation")
+        modulation_type = self._get_modulation_type(config)
+        capacity_kw = config.get("capacity_kw", 0)
         
-        if control_type == "mqtt":
-            topic = control_cfg.get("topic", f"assets/{asset_id}/control")
-            payload = {
-                "command": "curtail",
-                "power_reduction_kw": curtailment_kw,
+        # Determine command based on modulation type
+        if modulation_type == "discrete":
+            state_name, target_power_kw = self._determine_discrete_state(config, curtailment_kw)
+            command_payload = {
+                "command": "set_state",
+                "state": state_name,
+                "target_power_kw": target_power_kw,
                 "duration_minutes": duration_minutes,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
-            self.logger.info("MQTT publish to %s: %s", topic, json.dumps(payload))
+            log_msg = f"HP {asset_id}: set state to {state_name} (target: {target_power_kw:.2f} kW) for {duration_minutes} min"
+        else:
+            # Continuous modulation (rare for HPs, but supported)
+            target_power_kw = max(0, capacity_kw - curtailment_kw)
+            command_payload = {
+                "command": "set_power",
+                "target_power_kw": target_power_kw,
+                "reduction_kw": curtailment_kw,
+                "duration_minutes": duration_minutes,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            log_msg = f"HP {asset_id}: set power to {target_power_kw:.2f} kW (reduce by {curtailment_kw:.2f} kW) for {duration_minutes} min"
+        
+        if control_type == "mqtt":
+            topic = control_cfg.get("topic", f"assets/{asset_id}/control")
+            self.logger.info("MQTT publish to %s: %s", topic, json.dumps(command_payload))
             # TODO: Implement actual MQTT publish
-            # mqtt_client.publish(topic, json.dumps(payload))
+            # mqtt_client.publish(topic, json.dumps(command_payload))
             
         elif control_type == "http":
             endpoint = control_cfg.get("endpoint", "")
-            payload = {
-                "action": "reduce_power",
-                "reduction_kw": curtailment_kw,
-                "duration_s": duration_minutes * 60
-            }
-            self.logger.info("HTTP POST to %s: %s", endpoint, json.dumps(payload))
+            self.logger.info("HTTP POST to %s: %s", endpoint, json.dumps(command_payload))
             # TODO: Implement actual HTTP request
-            # requests.post(endpoint, json=payload)
+            # requests.post(endpoint, json=command_payload)
             
         elif control_type == "simulation":
-            self.logger.info(
-                "[SIMULATION] HP %s: reduce power by %.2f kW for %d min",
-                asset_id, curtailment_kw, duration_minutes
-            )
+            self.logger.info("[SIMULATION] %s", log_msg)
         else:
             raise ValueError(f"Unknown control type: {control_type}")
     
@@ -272,42 +373,55 @@ class AssetController:
         """
         Send control command to an EV charger.
         
-        EV chargers typically support:
-        - Set maximum charging power
-        - Pause/resume charging
-        - Smart charging profiles
+        EV chargers support continuous modulation (linear 0 to max power).
+        Control commands set a specific charging power limit.
+        
+        Control methods:
+        - ocpp: OCPP SetChargingProfile command
+        - http: REST API call to charger
+        - simulation: Log only (for testing)
         """
         control_cfg = config.get("control", {})
         control_type = control_cfg.get("type", "simulation")
         capacity_kw = config.get("capacity_kw", 11.0)
+        min_power_kw = config.get("min_power_kw", 0.0)
+        modulation_type = self._get_modulation_type(config)
         
-        # Calculate new charging limit
-        new_limit_kw = max(0, capacity_kw - curtailment_kw)
+        # Calculate new charging limit (continuous modulation)
+        # Respect minimum power setting (some chargers have minimum charging power)
+        target_power_kw = max(min_power_kw, capacity_kw - curtailment_kw)
+        
+        # Build command payload
+        command_payload = {
+            "command": "set_charging_limit",
+            "target_power_kw": target_power_kw,
+            "max_power_kw": capacity_kw,
+            "reduction_kw": curtailment_kw,
+            "duration_minutes": duration_minutes,
+            "modulation_type": modulation_type,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        log_msg = f"EV {asset_id}: set charging limit to {target_power_kw:.2f} kW (reduce by {curtailment_kw:.2f} kW) for {duration_minutes} min"
         
         if control_type == "ocpp":
             # OCPP (Open Charge Point Protocol) for EV chargers
             charger_id = control_cfg.get("charger_id", asset_id)
             self.logger.info(
                 "OCPP SetChargingProfile for %s: limit=%.2f kW, duration=%d min",
-                charger_id, new_limit_kw, duration_minutes
+                charger_id, target_power_kw, duration_minutes
             )
             # TODO: Implement OCPP command
+            # ocpp_client.set_charging_profile(charger_id, target_power_kw, duration_minutes)
             
         elif control_type == "http":
             endpoint = control_cfg.get("endpoint", "")
-            payload = {
-                "action": "set_charging_limit",
-                "limit_kw": new_limit_kw,
-                "duration_s": duration_minutes * 60
-            }
-            self.logger.info("HTTP POST to %s: %s", endpoint, json.dumps(payload))
+            self.logger.info("HTTP POST to %s: %s", endpoint, json.dumps(command_payload))
             # TODO: Implement HTTP request
+            # requests.post(endpoint, json=command_payload)
             
         elif control_type == "simulation":
-            self.logger.info(
-                "[SIMULATION] EV %s: set charging limit to %.2f kW for %d min",
-                asset_id, new_limit_kw, duration_minutes
-            )
+            self.logger.info("[SIMULATION] %s", log_msg)
         else:
             raise ValueError(f"Unknown control type: {control_type}")
     
@@ -459,32 +573,75 @@ class MarketResultsHandler:
 # FLEXIBILITY ALLOCATOR
 # =============================================================================
 
+# Default modulation types by asset type (used when not explicitly configured)
+MODULATION_DEFAULTS = {
+    "heat_pump": {"modulation_type": "discrete", "discrete_states_kw": [0.0, 1.0]},  # 0 or 100% of capacity
+    "ev_charger": {"modulation_type": "continuous", "min_power_kw": 0.0},
+}
+
+
 class FlexibilityAllocator:
     """
     Allocates sold flexibility across available assets.
     
     Allocation strategies:
-    - proportional: Distribute based on asset capacity
-    - priority: Fill high-flexibility assets first
-    - cost_optimal: Minimize activation costs
+    - modulation_aware: Smart allocation respecting discrete (ON/OFF) vs continuous assets (RECOMMENDED)
+    - proportional: Distribute based on asset capacity (legacy, ignores modulation constraints)
+    - priority: Fill high-flexibility assets first (legacy)
+    - cost_optimal: Minimize activation costs (legacy)
+    
+    Modulation types:
+    - continuous: Asset can modulate power linearly (e.g., EV chargers 0-11 kW)
+    - discrete: Asset can only switch between fixed states (e.g., HP ON/OFF)
     """
     
     def __init__(self, asset_mapping: dict, logger: logging.Logger):
         self.asset_mapping = asset_mapping
         self.logger = logger
     
+    def _get_modulation_type(self, asset_config: dict) -> str:
+        """
+        Get modulation type for an asset, with fallback to defaults by asset type.
+        
+        :param asset_config: Asset configuration dictionary
+        :return: 'continuous' or 'discrete'
+        """
+        # Explicit configuration takes precedence
+        if "modulation_type" in asset_config:
+            return asset_config["modulation_type"]
+        
+        # Fallback to default by asset type
+        asset_type = asset_config.get("type", "")
+        defaults = MODULATION_DEFAULTS.get(asset_type, {})
+        return defaults.get("modulation_type", "continuous")
+    
+    def _get_discrete_states(self, asset_config: dict) -> List[float]:
+        """
+        Get discrete power states for an asset.
+        
+        :param asset_config: Asset configuration dictionary
+        :return: List of valid power states in kW (e.g., [0.0, 15.0] for ON/OFF)
+        """
+        # Explicit configuration
+        if "discrete_states_kw" in asset_config:
+            return asset_config["discrete_states_kw"]
+        
+        # Generate from capacity (simple ON/OFF)
+        capacity = asset_config.get("capacity_kw", 0)
+        return [0.0, capacity]
+    
     def allocate_flexibility(
         self,
         total_flexibility_kw: float,
         allowed_assets: List[str] = None,
-        strategy: str = "proportional"
+        strategy: str = "modulation_aware"
     ) -> Dict[str, float]:
         """
         Allocate total flexibility requirement across assets.
         
         :param total_flexibility_kw: Total flexibility to deliver (kW)
         :param allowed_assets: List of asset IDs to use (None = all)
-        :param strategy: Allocation strategy
+        :param strategy: Allocation strategy (default: modulation_aware)
         :return: Dictionary mapping asset_id to curtailment_kw
         """
         self.logger.info(
@@ -502,15 +659,17 @@ class FlexibilityAllocator:
             self.logger.warning("No assets available for allocation")
             return {}
         
-        if strategy == "proportional":
+        if strategy == "modulation_aware":
+            return self._allocate_modulation_aware(total_flexibility_kw, assets)
+        elif strategy == "proportional":
             return self._allocate_proportional(total_flexibility_kw, assets)
         elif strategy == "priority":
             return self._allocate_priority(total_flexibility_kw, assets)
         elif strategy == "cost_optimal":
             return self._allocate_cost_optimal(total_flexibility_kw, assets)
         else:
-            self.logger.warning("Unknown strategy '%s', using proportional", strategy)
-            return self._allocate_proportional(total_flexibility_kw, assets)
+            self.logger.warning("Unknown strategy '%s', using modulation_aware", strategy)
+            return self._allocate_modulation_aware(total_flexibility_kw, assets)
     
     def _allocate_proportional(
         self, 
@@ -547,6 +706,173 @@ class FlexibilityAllocator:
                 remaining -= allocation
         
         self.logger.info("Proportional allocation: %s", allocations)
+        return allocations
+    
+    def _allocate_modulation_aware(
+        self, 
+        total_kw: float, 
+        assets: Dict
+    ) -> Dict[str, float]:
+        """
+        Smart allocation that respects modulation constraints.
+        
+        Strategy:
+        1. Separate assets into continuous and discrete
+        2. For discrete assets: use subset-sum to find best combination of ON/OFF states
+        3. For continuous assets: use proportional allocation for remaining flexibility
+        4. Combine both allocations
+        
+        This ensures we don't ask an ON/OFF device to "reduce by 7.5 kW" when
+        it can only do 0 or 15 kW.
+        
+        :param total_kw: Target flexibility to deliver (kW)
+        :param assets: Dictionary of asset configurations
+        :return: Dictionary mapping asset_id to curtailment_kw
+        """
+        allocations = {}
+        
+        # Separate assets by modulation type
+        continuous_assets = {}
+        discrete_assets = {}
+        
+        for asset_id, config in assets.items():
+            if not isinstance(config, dict):
+                continue
+            mod_type = self._get_modulation_type(config)
+            if mod_type == "continuous":
+                continuous_assets[asset_id] = config
+            else:
+                discrete_assets[asset_id] = config
+        
+        self.logger.info(
+            "Modulation-aware allocation: %d continuous, %d discrete assets",
+            len(continuous_assets), len(discrete_assets)
+        )
+        
+        remaining = total_kw
+        
+        # Phase 1: Allocate to discrete assets first (they have constraints)
+        # Use greedy subset-sum to find best combination
+        if discrete_assets and remaining > 0:
+            discrete_alloc = self._allocate_discrete_subset(remaining, discrete_assets)
+            allocations.update(discrete_alloc)
+            discrete_total = sum(discrete_alloc.values())
+            remaining -= discrete_total
+            self.logger.info(
+                "Discrete allocation: %.2f kW from %d assets, remaining: %.2f kW",
+                discrete_total, len(discrete_alloc), remaining
+            )
+        
+        # Phase 2: Fill remaining with continuous assets (proportional)
+        if continuous_assets and remaining > 0:
+            continuous_alloc = self._allocate_proportional(remaining, continuous_assets)
+            allocations.update(continuous_alloc)
+            continuous_total = sum(continuous_alloc.values())
+            self.logger.info(
+                "Continuous allocation: %.2f kW from %d assets",
+                continuous_total, len(continuous_alloc)
+            )
+        
+        # Log final allocation summary
+        total_allocated = sum(allocations.values())
+        deviation = total_allocated - total_kw
+        deviation_pct = (deviation / total_kw * 100) if total_kw > 0 else 0
+        
+        if abs(deviation) < 0.01:
+            deviation_msg = "(exact match)"
+        elif deviation > 0:
+            deviation_msg = f"(+{deviation:.2f} kW / +{deviation_pct:.1f}% over-delivery due to discrete assets)"
+        else:
+            deviation_msg = f"({deviation:.2f} kW / {deviation_pct:.1f}% under-delivery)"
+        
+        self.logger.info(
+            "Modulation-aware final: requested=%.2f kW, will deliver=%.2f kW %s",
+            total_kw, total_allocated, deviation_msg
+        )
+        
+        return allocations
+    
+    def _allocate_discrete_subset(
+        self, 
+        target_kw: float, 
+        discrete_assets: Dict
+    ) -> Dict[str, float]:
+        """
+        Allocate flexibility from discrete (ON/OFF) assets using greedy subset-sum.
+        
+        For ON/OFF assets, we can only deliver flexibility in discrete chunks
+        (e.g., 0 kW or 15 kW, nothing in between). This method finds the best
+        combination of assets to switch OFF that gets closest to the target
+        without significantly over-delivering.
+        
+        IMPORTANT: For discrete assets, the curtailment is the FULL capacity when 
+        switched OFF, NOT capacity × flexibility_factor. The flexibility_factor 
+        for discrete assets represents availability probability, not power reduction.
+        
+        Uses a greedy approach: sort by capacity descending, add largest that fits.
+        
+        :param target_kw: Target flexibility to deliver
+        :param discrete_assets: Dictionary of discrete asset configurations
+        :return: Dictionary mapping asset_id to curtailment_kw (full capacity when OFF)
+        """
+        allocations = {}
+        
+        # Build list of (asset_id, curtailable_power_kw)
+        # For ON/OFF assets, curtailable power = FULL capacity (when switched OFF)
+        candidates = []
+        for asset_id, config in discrete_assets.items():
+            states = self._get_discrete_states(config)
+            # Curtailable power = difference between max and min state
+            # For simple ON/OFF: [0, 15] -> curtailable = 15 (full capacity)
+            if len(states) >= 2:
+                curtailable = max(states) - min(states)
+            else:
+                curtailable = config.get("capacity_kw", 0)
+            
+            # NOTE: We do NOT apply flexibility_factor here!
+            # For discrete assets, flex_factor represents availability probability,
+            # not the amount of power that can be curtailed.
+            # When switched OFF, the asset delivers FULL capacity as curtailment.
+            
+            if curtailable > 0:
+                candidates.append((asset_id, curtailable, config))
+                self.logger.debug(
+                    "Discrete candidate: %s, curtailable=%.2f kW (full capacity when OFF)",
+                    asset_id, curtailable
+                )
+        
+        # Sort by curtailable power descending (largest first for greedy)
+        candidates.sort(key=lambda x: -x[1])
+        
+        remaining = target_kw
+        
+        for asset_id, curtailable_kw, config in candidates:
+            if remaining <= 0:
+                break
+            
+            # Only include if it fits (doesn't cause excessive over-delivery)
+            # Allow small over-delivery (within 10% or 1 kW tolerance)
+            tolerance = max(target_kw * 0.1, 1.0)
+            
+            if curtailable_kw <= remaining + tolerance:
+                # Switch this asset OFF -> delivers FULL capacity as curtailment
+                allocations[asset_id] = round(curtailable_kw, 3)
+                remaining -= curtailable_kw
+                self.logger.debug(
+                    "Discrete: %s -> switch OFF, curtail %.2f kW (remaining target: %.2f kW)",
+                    asset_id, curtailable_kw, remaining
+                )
+        
+        total_allocated = sum(allocations.values())
+        over_delivery = total_allocated - target_kw
+        
+        self.logger.info(
+            "Discrete subset allocation: target=%.2f kW, selected %d assets to switch OFF, "
+            "total curtailment=%.2f kW %s",
+            target_kw, len(allocations), total_allocated,
+            f"(+{over_delivery:.2f} kW over-delivery due to discretization)" if over_delivery > 0 else ""
+        )
+        
         return allocations
     
     def _allocate_priority(
@@ -863,7 +1189,7 @@ class FlexibilityManager:
         self,
         slot_override: str = None,
         dry_run: bool = True,
-        allocation_strategy: str = "proportional",
+        allocation_strategy: str = "modulation_aware",
         fallback_strategy: str = None
     ) -> Dict:
         """
@@ -1055,15 +1381,49 @@ class FlexibilityManager:
             summary["status"] = "allocation_failed"
             return summary
         
-        # Log allocation details
+        # Log allocation details with modulation type info
         self.logger.info("-" * 70)
         self.logger.info("Allocation plan:")
         total_allocated = 0
         for asset_id, curtailment_kw in allocations.items():
-            asset_desc = self.asset_mapping.get(asset_id, {}).get("description", asset_id)
-            self.logger.info("  %s (%s): %.2f kW", asset_id, asset_desc, curtailment_kw)
+            asset_config = self.asset_mapping.get(asset_id, {})
+            asset_desc = asset_config.get("description", asset_id)
+            
+            # Determine modulation type for display
+            mod_type = asset_config.get("modulation_type", "")
+            if not mod_type:
+                # Fallback to default by asset type
+                asset_type = asset_config.get("type", "")
+                mod_type = "discrete" if asset_type == "heat_pump" else "continuous"
+            
+            if mod_type == "discrete":
+                capacity = asset_config.get("capacity_kw", curtailment_kw)
+                # For discrete assets, curtailment = full capacity means switching OFF
+                state = "OFF" if curtailment_kw >= capacity * 0.5 else "ON"
+                self.logger.info(
+                    "  %s (%s): %.2f kW [discrete → %s]", 
+                    asset_id, asset_desc, curtailment_kw, state
+                )
+            else:
+                capacity = asset_config.get("capacity_kw", 0)
+                target_power = max(0, capacity - curtailment_kw)
+                self.logger.info(
+                    "  %s (%s): %.2f kW [continuous → limit %.2f kW]", 
+                    asset_id, asset_desc, curtailment_kw, target_power
+                )
+            
             total_allocated += curtailment_kw
-        self.logger.info("  Total allocated: %.2f kW", total_allocated)
+        
+        self.logger.info("  Total to deliver: %.2f kW", total_allocated)
+        
+        # Show deviation from requested if applicable
+        deviation = total_allocated - total_sold_kw
+        if abs(deviation) > 0.01:
+            if deviation > 0:
+                self.logger.info(
+                    "  Note: +%.2f kW over-delivery due to discrete asset constraints",
+                    deviation
+                )
         
         # Step 3: Send control commands
         self.logger.info("-" * 70)
@@ -1200,9 +1560,9 @@ Examples:
     )
     parser.add_argument(
         "--allocation", "-a",
-        choices=["proportional", "priority", "cost_optimal"],
-        default="proportional",
-        help="Allocation strategy (default: proportional)"
+        choices=["modulation_aware", "proportional", "priority", "cost_optimal"],
+        default="modulation_aware",
+        help="Allocation strategy (default: modulation_aware)"
     )
     parser.add_argument(
         "--fallback-strategy",

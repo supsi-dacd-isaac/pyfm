@@ -144,7 +144,9 @@
       "type": "ev_charger",
       "description": "EV Charger 1",
       "capacity_kw": 11.0,
-      "flexibility_factor": 0.70
+      "flexibility_factor": 0.70,
+      "modulation_type": "continuous",
+      "min_power_kw": 0.0
     },
     "ECM63.2": {
       "device_name_tag": "charge_point_ev_2",
@@ -152,7 +154,9 @@
       "type": "ev_charger",
       "description": "EV Charger 2",  
       "capacity_kw": 11.0,
-      "flexibility_factor": 0.70
+      "flexibility_factor": 0.70,
+      "modulation_type": "continuous",
+      "min_power_kw": 0.0
     },
     "ECM96.2": {
       "device_name_tag": "shelly_3em_pro_heat_pump_ext_unit",
@@ -160,7 +164,9 @@
       "type": "heat_pump",
       "description": "HP Small",
       "capacity_kw": 4.0,
-      "flexibility_factor": 0.80
+      "flexibility_factor": 0.80,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 4.0]
     },
     "ECM97.1": {
       "device_name_tag": "shelly_3em_pro_heat_pump_1",
@@ -168,7 +174,9 @@
       "type": "heat_pump",
       "description": "HP Cinema 1",
       "capacity_kw": 15.0,
-      "flexibility_factor": 0.85
+      "flexibility_factor": 0.85,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 15.0]
     },
     "ECM97.2": {
       "device_name_tag": "shelly_3em_pro_heat_pump_2",
@@ -176,7 +184,9 @@
       "type": "heat_pump",
       "description": "HP Cinema 2",
       "capacity_kw": 15.0,
-      "flexibility_factor": 0.85
+      "flexibility_factor": 0.85,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 15.0]
     }
   },
   "assets_grouping": {
@@ -198,6 +208,19 @@
     "default_flexibility_factor": 0.50,
     "ev_charger": {
       "occupancy_threshold_w": 100
+    },
+    "temperature": {
+      "enabled": false,
+      "source": {
+        "site": "ECM",
+        "device": "weather_station",
+        "field": "temperature"
+      },
+      "bins": [-5, 0, 5, 10, 15, 20, 25],
+      "forecast": {
+        "type": "historical_avg",
+        "file": "../data/forecast/temperature_forecast.json"
+      }
     }
   },
   "bidding_strategies": {

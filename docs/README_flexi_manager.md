@@ -25,16 +25,16 @@ This script manages the **activation** of flexibility for an FSP. After the FSP 
 │                          │                                               │
 │                          ▼                                               │
 │  11:59 (flexi_manager.py)                                               │
-│    │                                                                     │
-│    ▼                                                                     │
-│  ┌──────────────────────────────────────┐                               │
-│  │  ACTIVATE: Read bid record           │                               │
-│  │  → Only activate allowed assets      │                               │
-│  │  → ECM96.2: 1.67 kW                  │                               │
-│  │  → ECM97.1: 6.66 kW                  │                               │
-│  │  → ECM97.2: 6.66 kW                  │                               │
-│  │  → EV chargers: EXCLUDED             │                               │
-│  └──────────────────────────────────────┘                               │
+    │    │                                                                     │
+    │    ▼                                                                     │
+    │  ┌──────────────────────────────────────┐                               │
+    │  │  ACTIVATE: Read bid record           │                               │
+    │  │  → Only activate allowed assets      │                               │
+    │  │  → ECM97.1: 15 kW → OFF (discrete)   │                               │
+    │  │  → ECM96.2:  4 kW → OFF (discrete)   │                               │
+    │  │  → Total: 19 kW delivered            │                               │
+    │  │  → EV chargers: EXCLUDED             │                               │
+    │  └──────────────────────────────────────┘                               │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -168,7 +168,10 @@ python flexi_manager.py --fsp supsi01 --live
 ### Different Allocation Strategies
 
 ```bash
-# Proportional: distribute based on capacity
+# Modulation-aware (default): respects discrete (ON/OFF) vs continuous assets
+python flexi_manager.py --fsp supsi01 --allocation modulation_aware
+
+# Proportional: distribute based on capacity (legacy, ignores modulation constraints)
 python flexi_manager.py --fsp supsi01 --allocation proportional
 
 # Priority: fill HPs first, then EVs
@@ -196,7 +199,7 @@ python flexi_manager.py --fsp supsi01 --dry-run --output activation_result.json
 | `--offset`      | `-t` | Time offset from now (e.g., `30m`, `2h`, `1h30m`) | - |
 | `--dry-run`     | `-d` | Simulate only | Yes |
 | `--live`        | `-l` | Send actual commands | No |
-| `--allocation`  | `-a` | Allocation strategy | `proportional` |
+| `--allocation`  | `-a` | Allocation strategy | `modulation_aware` |
 | `--log-level`   | - | Logging verbosity | `INFO` |
 | `--log_file`    | - | Path to log file | - |
 | `--output`      | `-o` | JSON output file | - |
@@ -259,24 +262,62 @@ if total_sold_mw == 0:
 
 ### Step 2: Allocate Flexibility
 
-The total sold flexibility is distributed across **allowed assets only**:
+The total sold flexibility is distributed across **allowed assets only**, respecting each asset's **modulation type**:
 
 | Strategy | Description |
 |----------|-------------|
-| `proportional` | Distribute based on capacity × flexibility_factor |
+| `modulation_aware` | **Default.** Smart allocation respecting discrete (ON/OFF) vs continuous assets |
+| `proportional` | Distribute based on capacity × flexibility_factor (legacy) |
 | `priority` | Fill HPs first (more reliable), then EVs |
 | `cost_optimal` | Minimize total activation cost |
 
-**Example allocation for 15 kW:**
+#### Modulation Types
+
+Different assets have different control capabilities:
+
+| Modulation Type | Description | Curtailment | Example Assets |
+|-----------------|-------------|-------------|----------------|
+| `continuous` | Can modulate power linearly (any value from min to max) | Any value in range | EV chargers (0-11 kW) |
+| `discrete` | Can only switch between fixed states (ON/OFF) | **Full capacity** when OFF | Heat pumps |
+
+**Important for discrete assets:** When a heat pump is switched OFF, the curtailment delivered is the **full capacity** (e.g., 15 kW), not `capacity × flexibility_factor`. The `flexibility_factor` for discrete assets represents *availability probability* for bidding purposes, not the amount of power curtailed.
+
+The `modulation_aware` strategy:
+1. Allocates to **discrete assets first** using subset-sum optimization
+2. Fills remaining flexibility with **continuous assets** proportionally
+3. May result in **over-delivery** if only discrete assets are available
+
+**Example allocation for 15 kW (with modulation_aware, discrete-only):**
 ```
-ECM97.2 (HP Cinema 2):  8.5 kW (56%)  ← Largest capacity
-ECM97.1 (HP Cinema 1):  4.0 kW (27%)
-ECM96.2 (HP Small):     2.5 kW (17%)
+Target: 15 kW
+Available discrete assets:
+  - ECM97.1 (HP Cinema 1): 15 kW capacity
+  - ECM97.2 (HP Cinema 2): 15 kW capacity  
+  - ECM96.2 (HP Small):     4 kW capacity
+
+Best combination: ECM97.1 (15 kW) + ECM96.2 (4 kW) = 19 kW
+Result: +4 kW over-delivery due to discrete constraints
+```
+
+**Example allocation for 30 kW (with modulation_aware):**
+```
+Discrete assets (ON/OFF):
+  ECM97.2 (HP Cinema 2): 15.0 kW → Switch OFF
+  ECM97.1 (HP Cinema 1): 15.0 kW → Switch OFF
+  Total: 30 kW (exact match)
+
+Continuous assets (if needed for remaining):
+  ECM63.1 (EV Charger 1): 0 kW   → No change needed
 ```
 
 ### Step 3: Control Assets
 
-Send curtailment commands to each asset:
+Send curtailment commands to each asset based on modulation type:
+
+| Asset Type | Modulation | Control Command |
+|------------|------------|-----------------|
+| Heat Pump | Discrete (ON/OFF) | `set_state: OFF` or `set_state: ON` |
+| EV Charger | Continuous | `set_charging_limit: 6.5 kW` |
 
 | Asset Type | Control Methods |
 |------------|----------------|
@@ -287,39 +328,82 @@ Send curtailment commands to each asset:
 
 ## Example Output
 
+### Modulation-Aware Allocation with Over-Delivery
+
+When the target doesn't exactly match available discrete combinations, the system reports over-delivery:
+
 ```
-2026-01-09 11:59:00::INFO::run::======================================================================
-2026-01-09 11:59:00::INFO::run::FLEXIBILITY MANAGER - supsi01
-2026-01-09 11:59:00::INFO::run::======================================================================
-2026-01-09 11:59:00::INFO::run::Target slot: 2026-01-09 12:00 - 12:15
-2026-01-09 11:59:00::INFO::run::Mode: DRY-RUN
-2026-01-09 11:59:00::INFO::run::Allocation strategy: proportional
-2026-01-09 11:59:00::INFO::run::----------------------------------------------------------------------
-2026-01-09 11:59:00::INFO::run::Step 1: Querying market results...
-2026-01-09 11:59:01::INFO::get_accepted_trades_for_slot::Querying accepted trades for slot 2026-01-09 12:00 - 12:15
-2026-01-09 11:59:01::INFO::get_accepted_trades_for_slot::Found 1 accepted sell trades for this slot
-2026-01-09 11:59:01::INFO::run::----------------------------------------------------------------------
-2026-01-09 11:59:01::INFO::run::Total flexibility sold: 0.015 MW (15.00 kW)
-2026-01-09 11:59:01::INFO::run::----------------------------------------------------------------------
-2026-01-09 11:59:01::INFO::run::Step 2: Allocating flexibility across assets...
-2026-01-09 11:59:01::INFO::allocate_flexibility::Allocating 15.00 kW flexibility using 'proportional' strategy
-2026-01-09 11:59:01::INFO::_allocate_proportional::Proportional allocation: {'ECM97.2': 8.478, 'ECM97.1': 4.239, 'ECM96.2': 2.283}
+2026-01-15 07:30:00::INFO::run::======================================================================
+2026-01-15 07:30:00::INFO::run::FLEXIBILITY MANAGER - supsi01
+2026-01-15 07:30:00::INFO::run::======================================================================
+2026-01-15 07:30:00::INFO::run::Target slot: 2026-01-15 07:30 - 07:45
+2026-01-15 07:30:00::INFO::run::Mode: DRY-RUN
+2026-01-15 07:30:00::INFO::run::Allocation strategy: modulation_aware
+2026-01-15 07:30:00::INFO::run::----------------------------------------------------------------------
+2026-01-15 07:30:00::INFO::run::Step 1: Querying market results...
+2026-01-15 07:30:01::INFO::get_trades_from_ledger::Found 1 trades in market_ledger
+2026-01-15 07:30:01::INFO::run::----------------------------------------------------------------------
+2026-01-15 07:30:01::INFO::run::Total flexibility to deliver: 0.015 MW (15.00 kW)
+2026-01-15 07:30:01::INFO::run::----------------------------------------------------------------------
+2026-01-15 07:30:01::INFO::run::Step 2: Allocating flexibility across ALLOWED assets...
+2026-01-15 07:30:01::INFO::allocate_flexibility::Allocating 15.00 kW flexibility using 'modulation_aware' strategy
+2026-01-15 07:30:01::INFO::_allocate_modulation_aware::Modulation-aware allocation: 0 continuous, 3 discrete assets
+2026-01-15 07:30:01::INFO::_allocate_discrete_subset::Discrete subset allocation: target=15.00 kW, selected 2 assets to switch OFF, total curtailment=19.00 kW (+4.00 kW over-delivery due to discretization)
+2026-01-15 07:30:01::INFO::_allocate_modulation_aware::Modulation-aware final: requested=15.00 kW, will deliver=19.00 kW (+4.00 kW / +26.7% over-delivery due to discrete assets)
+2026-01-15 07:30:01::INFO::run::----------------------------------------------------------------------
+2026-01-15 07:30:01::INFO::run::Allocation plan:
+2026-01-15 07:30:01::INFO::run::  ECM97.1 (HP Cinema 1): 15.00 kW [discrete → OFF]
+2026-01-15 07:30:01::INFO::run::  ECM96.2 (HP Small): 4.00 kW [discrete → OFF]
+2026-01-15 07:30:01::INFO::run::  Total to deliver: 19.00 kW
+2026-01-15 07:30:01::INFO::run::  Note: +4.00 kW over-delivery due to discrete asset constraints
+2026-01-15 07:30:01::INFO::run::----------------------------------------------------------------------
+2026-01-15 07:30:01::INFO::run::Step 3: Sending control commands...
+2026-01-15 07:30:01::INFO::curtail_asset::[DRY-RUN] Would set ECM97.1 (HP Cinema 1) to OFF (target: 0.00 kW) for 15 minutes
+2026-01-15 07:30:01::INFO::curtail_asset::[DRY-RUN] Would set ECM96.2 (HP Small) to OFF (target: 0.00 kW) for 15 minutes
+2026-01-15 07:30:01::INFO::run::======================================================================
+2026-01-15 07:30:01::INFO::run::FLEXIBILITY ACTIVATION COMPLETE
+2026-01-15 07:30:01::INFO::run::======================================================================
+2026-01-15 07:30:01::INFO::run::Assets controlled: 2 successful, 0 failed
+2026-01-15 07:30:01::INFO::run::Total flexibility delivered: 19.00 kW (0.019 MW)
+```
+
+### Exact Match (30 kW = 15 + 15)
+
+When discrete combinations match the target exactly:
+
+```
+2026-01-09 11:59:01::INFO::allocate_flexibility::Allocating 30.00 kW flexibility using 'modulation_aware' strategy
+2026-01-09 11:59:01::INFO::_allocate_modulation_aware::Modulation-aware allocation: 0 continuous, 3 discrete assets
+2026-01-09 11:59:01::INFO::_allocate_discrete_subset::Discrete subset allocation: target=30.00 kW, selected 2 assets to switch OFF, total curtailment=30.00 kW 
+2026-01-09 11:59:01::INFO::_allocate_modulation_aware::Modulation-aware final: requested=30.00 kW, will deliver=30.00 kW (exact match)
 2026-01-09 11:59:01::INFO::run::----------------------------------------------------------------------
 2026-01-09 11:59:01::INFO::run::Allocation plan:
-2026-01-09 11:59:01::INFO::run::  ECM97.2 (HP Cinema 2): 8.48 kW
-2026-01-09 11:59:01::INFO::run::  ECM97.1 (HP Cinema 1): 4.24 kW
-2026-01-09 11:59:01::INFO::run::  ECM96.2 (HP Small): 2.28 kW
-2026-01-09 11:59:01::INFO::run::  Total allocated: 15.00 kW
+2026-01-09 11:59:01::INFO::run::  ECM97.2 (HP Cinema 2): 15.00 kW [discrete → OFF]
+2026-01-09 11:59:01::INFO::run::  ECM97.1 (HP Cinema 1): 15.00 kW [discrete → OFF]
+2026-01-09 11:59:01::INFO::run::  Total to deliver: 30.00 kW
+```
+
+### Mixed Assets (HPs + EV Chargers)
+
+When both discrete and continuous assets are available, continuous assets fill the gap precisely:
+
+```
+2026-01-09 11:59:01::INFO::_allocate_modulation_aware::Modulation-aware allocation: 2 continuous, 3 discrete assets
+2026-01-09 11:59:01::INFO::_allocate_discrete_subset::Discrete subset allocation: target=20.00 kW, selected 1 assets to switch OFF, total curtailment=15.00 kW 
+2026-01-09 11:59:01::INFO::_allocate_modulation_aware::Discrete allocation: 15.00 kW from 1 assets, remaining: 5.00 kW
+2026-01-09 11:59:01::INFO::_allocate_proportional::Proportional allocation: {'ECM63.1': 3.5, 'ECM63.2': 1.5}
+2026-01-09 11:59:01::INFO::_allocate_modulation_aware::Modulation-aware final: requested=20.00 kW, will deliver=20.00 kW (exact match)
+2026-01-09 11:59:01::INFO::run::----------------------------------------------------------------------
+2026-01-09 11:59:01::INFO::run::Allocation plan:
+2026-01-09 11:59:01::INFO::run::  ECM97.2 (HP Cinema 2): 15.00 kW [discrete → OFF]
+2026-01-09 11:59:01::INFO::run::  ECM63.1 (EV Charger 1): 3.50 kW [continuous → limit 7.50 kW]
+2026-01-09 11:59:01::INFO::run::  ECM63.2 (EV Charger 2): 1.50 kW [continuous → limit 9.50 kW]
+2026-01-09 11:59:01::INFO::run::  Total to deliver: 20.00 kW
 2026-01-09 11:59:01::INFO::run::----------------------------------------------------------------------
 2026-01-09 11:59:01::INFO::run::Step 3: Sending control commands...
-2026-01-09 11:59:01::INFO::curtail_asset::[DRY-RUN] Would curtail ECM97.2 (HP Cinema 2): 8.48 kW (56.5%) for 15 minutes
-2026-01-09 11:59:01::INFO::curtail_asset::[DRY-RUN] Would curtail ECM97.1 (HP Cinema 1): 4.24 kW (28.3%) for 15 minutes
-2026-01-09 11:59:01::INFO::curtail_asset::[DRY-RUN] Would curtail ECM96.2 (HP Small): 2.28 kW (57.1%) for 15 minutes
-2026-01-09 11:59:01::INFO::run::======================================================================
-2026-01-09 11:59:01::INFO::run::FLEXIBILITY ACTIVATION COMPLETE
-2026-01-09 11:59:01::INFO::run::======================================================================
-2026-01-09 11:59:01::INFO::run::Assets controlled: 3 successful, 0 failed
-2026-01-09 11:59:01::INFO::run::Total flexibility delivered: 15.00 kW (0.015 MW)
+2026-01-09 11:59:01::INFO::curtail_asset::[DRY-RUN] Would set ECM97.2 (HP Cinema 2) to OFF (target: 0.00 kW) for 15 minutes
+2026-01-09 11:59:01::INFO::curtail_asset::[DRY-RUN] Would curtail ECM63.1 (EV Charger 1): 3.50 kW (target: 7.50 kW) for 15 minutes
+2026-01-09 11:59:01::INFO::curtail_asset::[DRY-RUN] Would curtail ECM63.2 (EV Charger 2): 1.50 kW (target: 9.50 kW) for 15 minutes
 ```
 
 ---
@@ -328,7 +412,9 @@ Send curtailment commands to each asset:
 
 ### Asset Control Configuration
 
-To enable actual asset control, add `control` section to each asset in `asset_mapping`:
+To enable actual asset control, configure each asset in `asset_mapping` with:
+- **Modulation type**: `discrete` (ON/OFF) or `continuous` (linear)
+- **Control interface**: How to send commands to the device
 
 ```json
 {
@@ -339,6 +425,8 @@ To enable actual asset control, add `control` section to each asset in `asset_ma
       "description": "HP Cinema 1",
       "capacity_kw": 15.0,
       "flexibility_factor": 0.85,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 15.0],
       "control": {
         "type": "mqtt",
         "topic": "assets/ECM97.1/control",
@@ -351,6 +439,8 @@ To enable actual asset control, add `control` section to each asset in `asset_ma
       "description": "EV Charger 1",
       "capacity_kw": 11.0,
       "flexibility_factor": 0.70,
+      "modulation_type": "continuous",
+      "min_power_kw": 0.0,
       "control": {
         "type": "ocpp",
         "charger_id": "CP001",
@@ -359,6 +449,25 @@ To enable actual asset control, add `control` section to each asset in `asset_ma
     }
   }
 }
+```
+
+### Modulation Configuration
+
+| Field | Type | Description | Default |
+|-------|------|-------------|---------|
+| `modulation_type` | string | `"continuous"` or `"discrete"` | By asset type* |
+| `discrete_states_kw` | array | Valid power states for discrete assets | `[0, capacity_kw]` |
+| `min_power_kw` | number | Minimum power for continuous assets | `0.0` |
+
+*Default by type: `heat_pump` → `discrete`, `ev_charger` → `continuous`
+
+**Example discrete states:**
+```json
+// Simple ON/OFF heat pump
+"discrete_states_kw": [0.0, 15.0]
+
+// 2-stage compressor (OFF / LOW / HIGH)
+"discrete_states_kw": [0.0, 7.5, 15.0]
 ```
 
 ### Supported Control Types
@@ -375,7 +484,47 @@ To enable actual asset control, add `control` section to each asset in `asset_ma
 
 ## Allocation Strategies
 
-### 1. Proportional (Default)
+### 1. Modulation-Aware (Default) ⭐
+
+Smart allocation that respects physical constraints of each asset:
+
+```
+1. Separate assets into DISCRETE (ON/OFF) and CONTINUOUS (linear)
+2. Allocate to discrete assets using subset-sum optimization
+3. Fill remaining with continuous assets proportionally
+```
+
+**How it works:**
+- **Discrete assets** (heat pumps): Deliver **full capacity** when switched OFF (e.g., 15 kW HP → 15 kW curtailment)
+- **Continuous assets** (EV chargers): Can deliver any amount within their range
+
+**Example 1:** Target = 20 kW (with mixed assets)
+```
+Available:
+  - HP Cinema 2: 15 kW (discrete ON/OFF)
+  - EV Charger 1: 0-11 kW (continuous)
+
+Allocation:
+  - HP Cinema 2 → OFF (15 kW)
+  - EV Charger 1 → limit to 6 kW (5 kW reduction)
+  Total: 20 kW ✓ (exact match)
+```
+
+**Example 2:** Target = 15 kW (discrete-only, over-delivery)
+```
+Available discrete only:
+  - HP Cinema 1: 15 kW
+  - HP Cinema 2: 15 kW
+  - HP Small: 4 kW
+
+Best combination: HP Cinema 1 (15 kW) + HP Small (4 kW) = 19 kW
+Result: +4 kW over-delivery (unavoidable with ON/OFF assets)
+```
+
+**Pros:** Respects physical constraints, transparent about over/under-delivery
+**Cons:** May over-deliver when only discrete assets available (clearly reported in logs)
+
+### 2. Proportional (Legacy)
 
 Distributes flexibility based on each asset's share of total capacity:
 
@@ -385,18 +534,18 @@ allocation = share × total_required
 ```
 
 **Pros:** Fair distribution, all assets contribute
-**Cons:** May under-utilize high-capacity assets
+**Cons:** Ignores modulation constraints - may request impossible values from ON/OFF assets
 
-### 2. Priority
+### 3. Priority
 
 Fills assets in order of reliability:
 1. Heat pumps (most reliable)
 2. EV chargers (dependent on car presence)
 
 **Pros:** Maximizes delivery probability
-**Cons:** May overload some assets
+**Cons:** Ignores modulation constraints
 
-### 3. Cost-Optimal
+### 4. Cost-Optimal
 
 Fills cheapest assets first (based on `activation_cost_per_kw`):
 
@@ -407,7 +556,7 @@ Fills cheapest assets first (based on `activation_cost_per_kw`):
 ```
 
 **Pros:** Minimizes activation costs
-**Cons:** May concentrate load on few assets
+**Cons:** Ignores modulation constraints
 
 ---
 
@@ -453,9 +602,13 @@ The `asset_activations` table stores every activation command sent:
 | `asset_id` | Asset identifier (e.g., ECM97.1) |
 | `asset_description` | Human-readable description |
 | `asset_type` | heat_pump, ev_charger |
-| `power_to_activate_kw` | Power curtailment in kW |
+| `modulation_type` | discrete, continuous |
+| `discrete_state` | ON/OFF (for discrete assets) |
+| `requested_curtailment_kw` | Requested power reduction |
+| `actual_curtailment_kw` | Actual power reduction (may differ for discrete) |
+| `target_power_kw` | Target power setpoint |
 | `percentage_of_capacity` | % of asset capacity |
-| `allocation_strategy` | proportional, priority, cost_optimal |
+| `allocation_strategy` | modulation_aware, proportional, priority, cost_optimal |
 | `dry_run` | TRUE if simulated |
 | `activation_status` | success, failed, simulated |
 | `bid_record_id` | Link to originating bid |
@@ -514,6 +667,53 @@ No assets will be activated.
 
 - Add `control` section to asset in config
 - Use `simulation` type for testing
+
+### "Modulation-aware final: over-delivery due to discrete assets"
+
+This is expected when only discrete (ON/OFF) assets are available and the target doesn't match an exact combination:
+
+```
+Requested: 15 kW
+Available discrete assets: HP1 (15 kW), HP2 (15 kW), HP3 (4 kW)
+Best combination: HP1 (15 kW) + HP3 (4 kW) = 19 kW
+Over-delivery: +4 kW (26.7%)
+```
+
+**Why this happens:** Discrete assets (heat pumps) can only be ON or OFF. When switched OFF, they deliver their **full capacity** as curtailment. The system finds the smallest combination that meets or exceeds the target.
+
+**Possible combinations for the example:**
+- HP3 alone: 4 kW (under-delivers by 11 kW) ❌
+- HP1 alone: 15 kW (exact match) ✅
+- HP1 + HP3: 19 kW (over-delivers by 4 kW) - chosen if HP1 alone isn't sufficient
+
+**Solutions:**
+- Add continuous assets (EV chargers) to fill gaps precisely
+- Accept small over-delivery for discrete-only portfolios
+- Adjust bidding to offer only achievable discrete combinations
+
+### "Modulation-aware final: under-delivery"
+
+Under-delivery occurs when the target is larger than all available discrete assets combined:
+
+```
+Requested: 40 kW
+Available discrete assets: HP1 (15 kW), HP2 (15 kW), HP3 (4 kW)
+Maximum possible: 15 + 15 + 4 = 34 kW
+Under-delivery: -6 kW (15%)
+```
+
+### "Discrete state: OFF but curtailment < threshold"
+
+The system uses a threshold (default 50% of capacity) to decide ON/OFF:
+- Curtailment ≥ 50% of capacity → Switch OFF
+- Curtailment < 50% of capacity → Keep ON
+
+Configure per asset if needed:
+```json
+"ECM97.1": {
+  "curtailment_threshold_pct": 30.0  // More aggressive switching
+}
+```
 
 ---
 
