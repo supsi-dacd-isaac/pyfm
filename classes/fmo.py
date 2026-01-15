@@ -53,7 +53,8 @@ class FMO:
             self.logger.warning("PostgreSQL interface not available, logging instead.")
             self.logger.info("FMO unexecuted query: %s" % sql)
 
-    def add_entry_to_market_ledger(self, timeslot, player, portfolio, features, bid_record_id=None):
+    def add_entry_to_market_ledger(self, timeslot, player, portfolio, features, 
+                                    bid_record_id=None, demand_record_id=None):
         """
         Add an entry to the market ledger.
         
@@ -61,7 +62,8 @@ class FMO:
         :param player: Player object (FSP or DSO)
         :param portfolio: Portfolio identifier
         :param features: Order features dict
-        :param bid_record_id: Optional ID of the bid record this trade originated from
+        :param bid_record_id: Optional ID of the bid record (for sell-side/FSP)
+        :param demand_record_id: Optional ID of the demand record (for buy-side/DSO)
         :return: True if successful
         """
         if portfolio is None:
@@ -71,46 +73,40 @@ class FMO:
             portfolio_id = portfolio
             price = float(features["unitPrice"])
 
-        # Build SQL with optional bid_record_id
+        # Build column and value lists
+        columns = [
+            "timeslot_market", "player_id", "player_role", "portfolio_id", 
+            "side", "regulation", "flexibility_quantity", "flexibility_unit", 
+            "price", "currency"
+        ]
+        values = [
+            timeslot,
+            player.cfg["id"],
+            player.cfg["role"],
+            portfolio_id,
+            features["side"],
+            features["regulationType"],
+            features["quantity"],
+            "MW",
+            float(price),
+            self.cfg["orderSection"]["mainSettings"]["currency"],
+        ]
+        
+        # Add optional bid_record_id (for FSP/seller)
         if bid_record_id is not None:
-            sql = (
-                "INSERT INTO market_ledger "
-                "(timeslot_market, player_id, player_role, portfolio_id, side, regulation, flexibility_quantity, "
-                "flexibility_unit, price, currency, bid_record_id) VALUES"
-                "('%s','%s','%s','%s','%s','%s','%s','%s','%s','%s','%s')"
-                % (
-                    timeslot,
-                    player.cfg["id"],
-                    player.cfg["role"],
-                    portfolio_id,
-                    features["side"],
-                    features["regulationType"],
-                    features["quantity"],
-                    "MW",
-                    float(price),
-                    self.cfg["orderSection"]["mainSettings"]["currency"],
-                    bid_record_id,
-                )
-            )
-        else:
-            sql = (
-                "INSERT INTO market_ledger "
-                "(timeslot_market, player_id, player_role, portfolio_id, side, regulation, flexibility_quantity, "
-                "flexibility_unit, price, currency) VALUES"
-                "('%s','%s','%s','%s','%s','%s','%s','%s','%s','%s')"
-                % (
-                    timeslot,
-                    player.cfg["id"],
-                    player.cfg["role"],
-                    portfolio_id,
-                    features["side"],
-                    features["regulationType"],
-                    features["quantity"],
-                    "MW",
-                    float(price),
-                    self.cfg["orderSection"]["mainSettings"]["currency"],
-                )
-            )
+            columns.append("bid_record_id")
+            values.append(bid_record_id)
+        
+        # Add optional demand_record_id (for DSO/buyer)
+        if demand_record_id is not None:
+            columns.append("demand_record_id")
+            values.append(demand_record_id)
+        
+        # Build SQL
+        columns_str = ", ".join(columns)
+        values_str = ", ".join([f"'{v}'" for v in values])
+        
+        sql = f"INSERT INTO market_ledger ({columns_str}) VALUES ({values_str})"
         self.__execute_sql(sql)
         return True
 

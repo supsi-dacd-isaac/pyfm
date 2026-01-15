@@ -18,6 +18,7 @@ from classes.postgresql_interface import PostgreSQLInterface
 from classes.flexibility_forecaster import FlexibilityForecaster
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
 from classes.bid_record_repository import BidRecordRepository
+from classes.demand_record_repository import DemandRecordRepository
 
 
 def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
@@ -83,7 +84,8 @@ def get_strategy_flexibility(
     return final_flex_mw
 
 
-def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, bid_record_id=None):
+def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, 
+                    bid_record_id=None, demand_record_id=None):
     """
     Run the original simple bidding mode (baseline-based).
     
@@ -120,6 +122,8 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                     quantity_to_sell = fsp.calculate_quantity_to_sell_basic(
                         slot_time, dso_demand[k_regulation_type], fsp.baselines[p_k]["quantity"]
                     )
+                    # Convert to native Python float to avoid numpy issues in DB
+                    quantity_to_sell = float(quantity_to_sell) if quantity_to_sell else 0.0
                     
                     if quantity_to_sell > 0 and fsp.check_demand_price(
                         slot_time, dso_demand, quantity_to_sell
@@ -128,7 +132,7 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                             "portfolio": fsp.portfolios[p_k].metadata["name"],
                             "regulation_type": k_regulation_type,
                             "quantity_mw": quantity_to_sell,
-                            "unit_price": dso_demand["unitPrice"],
+                            "unit_price": float(dso_demand["unitPrice"]),
                             "period_from": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                             "period_to": (slot_time + timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                         }
@@ -153,8 +157,8 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                         order_info = {
                             "portfolio": fsp.portfolios[p_k].metadata["name"],
                             "regulation_type": k,
-                            "quantity_mw": resp_selling[k]["quantity"],
-                            "unit_price": resp_selling[k]["unitPrice"],
+                            "quantity_mw": float(resp_selling[k]["quantity"]),
+                            "unit_price": float(resp_selling[k]["unitPrice"]),
                             "period_from": resp_selling[k]["periodFrom"],
                             "period_to": resp_selling[k]["periodTo"],
                         }
@@ -171,13 +175,14 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                             portfolio=fsp.portfolios[p_k].metadata["name"],
                             features=resp_selling[k],
                             bid_record_id=bid_record_id,
+                            demand_record_id=demand_record_id,
                         )
     
     return orders_summary
 
 
 def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time, 
-                      asset_breakdown, dry_run, logger, bid_record_id=None):
+                      asset_breakdown, dry_run, logger, bid_record_id=None, demand_record_id=None):
     """
     Run strategy-based bidding mode.
     
@@ -273,15 +278,15 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                     else:
                         quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
                     
-                    # Round to 3 decimal places (NODES API requirement)
-                    quantity_to_sell = round(quantity_to_sell, 3)
+                    # Round to 3 decimal places (NODES API requirement) and convert to native float
+                    quantity_to_sell = float(round(quantity_to_sell, 3))
                     
                     if quantity_to_sell > 0:
                         order_info = {
                             "portfolio": fsp.portfolios[p_k].metadata["name"],
                             "regulation_type": k_regulation_type,
                             "quantity_mw": quantity_to_sell,
-                            "unit_price": dso_price,
+                            "unit_price": float(dso_price),
                             "strategy": strategy_id,
                             "time_slot": bid_params["slot_name"],
                             "period_from": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -304,8 +309,8 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                     else:
                         quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
                     
-                    # Round to 3 decimal places (NODES API requirement)
-                    quantity_to_sell = round(quantity_to_sell, 3)
+                    # Round to 3 decimal places (NODES API requirement) and convert to native float
+                    quantity_to_sell = float(round(quantity_to_sell, 3))
                     
                     if quantity_to_sell > 0:
                         body = {
@@ -317,7 +322,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                             "assetPortfolioId": p_k,
                             "regulationType": k_regulation_type,
                             "quantity": quantity_to_sell,
-                            "unitPrice": dso_price,
+                            "unitPrice": float(dso_price),
                         }
                         body.update(fsp.cfg["orderSection"]["mainSettings"])
                         
@@ -330,7 +335,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                                 "portfolio": fsp.portfolios[p_k].metadata["name"],
                                 "regulation_type": k_regulation_type,
                                 "quantity_mw": quantity_to_sell,
-                                "unit_price": dso_price,
+                                "unit_price": float(dso_price),
                                 "strategy": strategy_id,
                                 "time_slot": bid_params["slot_name"],
                                 "period_from": body["periodFrom"],
@@ -347,6 +352,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                                 portfolio=fsp.portfolios[p_k].metadata["name"],
                                 features=body,
                                 bid_record_id=bid_record_id,
+                                demand_record_id=demand_record_id,
                             )
                         else:
                             logger.error(
@@ -489,11 +495,15 @@ if __name__ == "__main__":
     # Database connection
     pgi = None
     bid_repo = None
+    demand_repo = None
     try:
         pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
         # Initialize bid record repository for storing bid info
         bid_repo = BidRecordRepository(pgi, logger)
         logger.info("Bid record repository initialized")
+        # Initialize demand record repository for storing DSO demand info
+        demand_repo = DemandRecordRepository(pgi, logger)
+        logger.info("Demand record repository initialized")
     except Exception as e:
         logger.error("Unable to connect to PostgreSQL: %s" % str(e))
 
@@ -630,6 +640,56 @@ if __name__ == "__main__":
     )
     logger.info("=" * 70)
 
+    # Save demand record (DSO request) BEFORE placing orders
+    demand_record_id = None
+    if demand_repo and (total_dso_demand_up > 0 or total_dso_demand_down > 0):
+        try:
+            slot_end = slot_time + timedelta(minutes=cfg["fm"]["granularity"])
+            
+            # Get price from first demand (they should all have same price for same slot)
+            dso_price = dso_demands[0].get("unitPrice", 0) if dso_demands else 0
+            
+            # Build orders list from dso_demands
+            demand_orders = []
+            for dso_demand in dso_demands:
+                if dso_demand.get("Up", 0) > 0:
+                    demand_orders.append({
+                        "regulation_type": "Up",
+                        "quantity_mw": float(dso_demand.get("Up", 0)),
+                        "unit_price": float(dso_demand.get("unitPrice", 0)),
+                        "period_from": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "period_to": slot_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "order_status": "observed"
+                    })
+                if dso_demand.get("Down", 0) > 0:
+                    demand_orders.append({
+                        "regulation_type": "Down",
+                        "quantity_mw": float(dso_demand.get("Down", 0)),
+                        "unit_price": float(dso_demand.get("unitPrice", 0)),
+                        "period_from": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "period_to": slot_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "order_status": "observed"
+                    })
+            
+            demand_record_id = demand_repo.save_demand_record(
+                dso_id=dso.cfg["id"],
+                slot_start=slot_time,
+                slot_end=slot_end,
+                quantity_up_mw=float(total_dso_demand_up) if total_dso_demand_up > 0 else None,
+                quantity_down_mw=float(total_dso_demand_down) if total_dso_demand_down > 0 else None,
+                quantity_unit="MW",
+                price_offered=float(dso_price) if dso_price else None,
+                currency=fsp.cfg.get("orderSection", {}).get("mainSettings", {}).get("currency", "CHF"),
+                regulation_type="Both" if total_dso_demand_up > 0 and total_dso_demand_down > 0 
+                                else ("Up" if total_dso_demand_up > 0 else "Down"),
+                request_source="trader_fsp_observation",
+                request_reason="DSO demand observed by FSP before bidding",
+                orders=demand_orders
+            )
+            logger.info("Demand record created with ID: %s (DSO: %s)", demand_record_id, dso.cfg["id"])
+        except Exception as e:
+            logger.error("Error saving demand record: %s", str(e))
+
     # Save bid record BEFORE placing orders (to get the ID for market_ledger linkage)
     bid_record_id = None
     if bid_repo:
@@ -675,12 +735,13 @@ if __name__ == "__main__":
     if use_strategy_mode:
         orders_summary, used_strategy = run_strategy_mode(
             strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
-            asset_breakdown, dry_run, logger, bid_record_id=bid_record_id
+            asset_breakdown, dry_run, logger, 
+            bid_record_id=bid_record_id, demand_record_id=demand_record_id
         )
     else:
         orders_summary = run_simple_mode(
             fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, 
-            bid_record_id=bid_record_id
+            bid_record_id=bid_record_id, demand_record_id=demand_record_id
         )
         used_strategy = None
 
