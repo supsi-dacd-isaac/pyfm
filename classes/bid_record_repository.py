@@ -78,11 +78,81 @@ class BidRecordRepository:
                     strategy_name VARCHAR(200),
                     strategy_description TEXT,
                     total_quantity_mw DECIMAL(10, 6),
+                    dso_offered_price DECIMAL(10, 4),
+                    fsp_min_price DECIMAL(10, 4),
+                    actual_price DECIMAL(10, 4),
+                    currency VARCHAR(10) DEFAULT 'CHF',
                     status VARCHAR(50) DEFAULT 'pending',
                     activated_at TIMESTAMP,
                     CONSTRAINT uq_bid_records_fsp_slot UNIQUE(fsp_id, slot_start)
                 )
             """)
+            
+            # Migration: rename old bid_price to actual_price if it exists
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'bid_records' 
+                AND column_name = 'bid_price'
+            """)
+            if cur.fetchone() is not None:
+                # Check if actual_price doesn't exist yet
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_schema = 'public' 
+                    AND table_name = 'bid_records' 
+                    AND column_name = 'actual_price'
+                """)
+                if cur.fetchone() is None:
+                    self.logger.info("Renaming bid_price to actual_price")
+                    cur.execute(f"ALTER TABLE {self.SCHEMA}.{self.TABLE_BID_RECORDS} RENAME COLUMN bid_price TO actual_price")
+            
+            # Add price columns to existing table if they don't exist (migration)
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'bid_records' 
+                AND column_name = 'dso_offered_price'
+            """)
+            if cur.fetchone() is None:
+                self.logger.info("Adding dso_offered_price column to bid_records")
+                cur.execute(f"ALTER TABLE {self.SCHEMA}.{self.TABLE_BID_RECORDS} ADD COLUMN dso_offered_price DECIMAL(10, 4)")
+            
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'bid_records' 
+                AND column_name = 'fsp_min_price'
+            """)
+            if cur.fetchone() is None:
+                self.logger.info("Adding fsp_min_price column to bid_records")
+                cur.execute(f"ALTER TABLE {self.SCHEMA}.{self.TABLE_BID_RECORDS} ADD COLUMN fsp_min_price DECIMAL(10, 4)")
+            
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'bid_records' 
+                AND column_name = 'actual_price'
+            """)
+            if cur.fetchone() is None:
+                self.logger.info("Adding actual_price column to bid_records")
+                cur.execute(f"ALTER TABLE {self.SCHEMA}.{self.TABLE_BID_RECORDS} ADD COLUMN actual_price DECIMAL(10, 4)")
+            
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = 'public' 
+                AND table_name = 'bid_records' 
+                AND column_name = 'currency'
+            """)
+            if cur.fetchone() is None:
+                self.logger.info("Adding currency column to bid_records")
+                cur.execute(f"ALTER TABLE {self.SCHEMA}.{self.TABLE_BID_RECORDS} ADD COLUMN currency VARCHAR(10) DEFAULT 'CHF'")
             
             # Orders table (what we planned to bid)
             cur.execute(f"""
@@ -209,7 +279,11 @@ class BidRecordRepository:
         strategy_name: str = None,
         strategy_description: str = None,
         assets_to_activate: List[Dict] = None,
-        total_quantity_mw: float = None
+        total_quantity_mw: float = None,
+        dso_offered_price: float = None,
+        fsp_min_price: float = None,
+        actual_price: float = None,
+        currency: str = "CHF"
     ) -> str:
         """
         Save a bid record to the database.
@@ -223,6 +297,10 @@ class BidRecordRepository:
         :param strategy_description: Strategy description (optional)
         :param assets_to_activate: List of asset dictionaries (optional)
         :param total_quantity_mw: Total quantity bid in MW (optional)
+        :param dso_offered_price: Price offered by DSO (buyer) in currency/MW (optional)
+        :param fsp_min_price: FSP's minimum acceptable price from strategy in currency/MW (optional)
+        :param actual_price: Actual transaction price agreed in currency/MW (optional)
+        :param currency: Currency for all prices (default: CHF)
         :return: UUID of the inserted/updated bid record (as string)
         """
         cur = self.conn.cursor()
@@ -231,6 +309,12 @@ class BidRecordRepository:
             # Calculate total quantity if not provided
             if total_quantity_mw is None:
                 total_quantity_mw = sum(o.get("quantity_mw", 0) for o in orders)
+            
+            # Extract actual_price from orders if not provided
+            if actual_price is None and orders:
+                prices = [o.get("unit_price") for o in orders if o.get("unit_price") is not None]
+                if prices:
+                    actual_price = max(prices)  # Use the highest offered price
             
             # Check if record already exists (update if so)
             cur.execute(f"""
@@ -246,9 +330,12 @@ class BidRecordRepository:
                 cur.execute(f"""
                     UPDATE {self.SCHEMA}.{self.TABLE_BID_RECORDS}
                     SET strategy_id = %s, strategy_name = %s, strategy_description = %s,
-                        total_quantity_mw = %s, created_at = CURRENT_TIMESTAMP, status = 'pending'
+                        total_quantity_mw = %s, dso_offered_price = %s, fsp_min_price = %s,
+                        actual_price = %s, currency = %s,
+                        created_at = CURRENT_TIMESTAMP, status = 'pending'
                     WHERE id = %s
-                """, (strategy_id, strategy_name, strategy_description, total_quantity_mw, bid_record_id))
+                """, (strategy_id, strategy_name, strategy_description, total_quantity_mw, 
+                      dso_offered_price, fsp_min_price, actual_price, currency, bid_record_id))
                 
                 # Delete old orders (always refresh orders on update)
                 cur.execute(f"DELETE FROM {self.SCHEMA}.{self.TABLE_ORDERS} WHERE bid_record_id = %s", (bid_record_id,))
@@ -262,10 +349,12 @@ class BidRecordRepository:
                 # Insert new record
                 cur.execute(f"""
                     INSERT INTO {self.SCHEMA}.{self.TABLE_BID_RECORDS}
-                    (fsp_id, slot_start, slot_end, strategy_id, strategy_name, strategy_description, total_quantity_mw)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (fsp_id, slot_start, slot_end, strategy_id, strategy_name, strategy_description, 
+                     total_quantity_mw, dso_offered_price, fsp_min_price, actual_price, currency)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
-                """, (fsp_id, slot_start, slot_end, strategy_id, strategy_name, strategy_description, total_quantity_mw))
+                """, (fsp_id, slot_start, slot_end, strategy_id, strategy_name, strategy_description, 
+                      total_quantity_mw, dso_offered_price, fsp_min_price, actual_price, currency))
                 
                 bid_record_id = cur.fetchone()[0]
                 self.logger.info("Inserted new bid record ID %s", bid_record_id)

@@ -629,6 +629,15 @@ if __name__ == "__main__":
     logger.info("  TOTAL DSO DEMAND: Up=%.3f MW, Down=%.3f MW", 
                 total_dso_demand_up, total_dso_demand_down)
     
+    # Get price information for bid record
+    dso_offered_price = dso_demands[0].get("unitPrice", 0) if dso_demands else 0
+    
+    # Get FSP's minimum acceptable price from strategy (if in strategy mode)
+    fsp_min_price = None
+    if use_strategy_mode and strategy:
+        bid_params = strategy.get_bid_parameters(slot_time)
+        fsp_min_price = bid_params.get("bid_price")
+    
     # Compare available flexibility vs DSO demand
     logger.info("-" * 70)
     can_meet_demand = total_available_flex_mw >= total_dso_demand_up
@@ -645,9 +654,6 @@ if __name__ == "__main__":
     if demand_repo and (total_dso_demand_up > 0 or total_dso_demand_down > 0):
         try:
             slot_end = slot_time + timedelta(minutes=cfg["fm"]["granularity"])
-            
-            # Get price from first demand (they should all have same price for same slot)
-            dso_price = dso_demands[0].get("unitPrice", 0) if dso_demands else 0
             
             # Build orders list from dso_demands
             demand_orders = []
@@ -678,7 +684,7 @@ if __name__ == "__main__":
                 quantity_up_mw=float(total_dso_demand_up) if total_dso_demand_up > 0 else None,
                 quantity_down_mw=float(total_dso_demand_down) if total_dso_demand_down > 0 else None,
                 quantity_unit="MW",
-                price_offered=float(dso_price) if dso_price else None,
+                price_offered=float(dso_offered_price) if dso_offered_price else None,
                 currency=fsp.cfg.get("orderSection", {}).get("mainSettings", {}).get("currency", "CHF"),
                 regulation_type="Both" if total_dso_demand_up > 0 and total_dso_demand_down > 0 
                                 else ("Up" if total_dso_demand_up > 0 else "Down"),
@@ -726,6 +732,10 @@ if __name__ == "__main__":
                 strategy_name=strategy.name if use_strategy_mode and strategy else None,
                 strategy_description=strategy.description if use_strategy_mode and strategy else None,
                 assets_to_activate=assets_to_activate,
+                dso_offered_price=float(dso_offered_price) if dso_offered_price else None,
+                fsp_min_price=float(fsp_min_price) if fsp_min_price else None,
+                actual_price=None,  # Will be set after orders are placed
+                currency=fsp.cfg.get("orderSection", {}).get("mainSettings", {}).get("currency", "CHF"),
             )
             logger.info("Bid record created with ID: %s (status: pending)", bid_record_id)
         except Exception as e:
@@ -788,6 +798,12 @@ if __name__ == "__main__":
     # Update bid record with actual orders placed
     if bid_record_id and orders_summary and bid_repo:
         try:
+            # Extract the actual transaction price from orders (use max price offered)
+            actual_transaction_price = max(
+                (o.get("unit_price", 0) for o in orders_summary), 
+                default=dso_offered_price
+            )
+            
             # Update the bid record with actual orders
             bid_repo.save_bid_record(
                 fsp_id=args.fsp,
@@ -798,8 +814,14 @@ if __name__ == "__main__":
                 strategy_name=strategy.name if use_strategy_mode and strategy else None,
                 strategy_description=strategy.description if use_strategy_mode and strategy else None,
                 assets_to_activate=None,  # Already set, won't be updated
+                dso_offered_price=float(dso_offered_price) if dso_offered_price else None,
+                fsp_min_price=float(fsp_min_price) if fsp_min_price else None,
+                actual_price=float(actual_transaction_price) if actual_transaction_price else None,
+                currency=fsp.cfg.get("orderSection", {}).get("mainSettings", {}).get("currency", "CHF"),
             )
-            logger.info("Bid record ID %s updated with %d orders", bid_record_id, len(orders_summary))
+            logger.info("Bid record ID %s updated with %d orders (DSO: %.2f, FSP min: %.2f, actual: %.2f CHF/MW)", 
+                       bid_record_id, len(orders_summary), 
+                       dso_offered_price or 0, fsp_min_price or 0, actual_transaction_price or 0)
         except Exception as e:
             logger.error("Failed to update bid record: %s", str(e))
     
