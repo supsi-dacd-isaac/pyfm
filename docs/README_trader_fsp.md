@@ -1,6 +1,6 @@
 # trader_fsp.py
 
-This script represents the **FSP trading agent** in the Opentunity-CH flexibility market. It reacts to the DSO’s flexibility requests and places corresponding **Sell** orders based on the FSP’s portfolios and baselines.
+This script represents the **FSP trading agent** in the Opentunity-CH flexibility market. It reacts to the DSO's flexibility requests and places corresponding **Sell** orders based on the FSP's portfolios, baselines, and bidding strategies.
 
 ## High-level behaviour
 
@@ -9,10 +9,72 @@ This script represents the **FSP trading agent** in the Opentunity-CH flexibilit
 3. Computes the target market timeslot (`slot_time`) from `fm.granularity` and `fm.ordersTimeShift`.
 4. Uses the DSO instance to query the market for current flexibility requests (`dso.get_flexibility_requests`).
 5. Downloads or refreshes baselines for the FSP (`fsp.download_baselines`).
-6. For each DSO request and each FSP portfolio, calls `fsp.sell_flexibility` to construct Sell orders.
-7. Posts resulting Sell orders to the market ledger through an `FMO` instance.
+6. **Calculates available flexibility** using the `FlexibilityForecaster` with **discretization-aware** logic.
+7. Applies the selected **bidding strategy** to determine price and quantity.
+8. For each DSO request and each FSP portfolio, constructs and posts Sell orders.
+9. Records bid information in the database for auditing.
 
 There is also a helper function `create_dataframe_for_portfolio_baseline` that shows how to build a baseline DataFrame from a CSV file, although it is not used in the main flow.
+
+---
+
+## Discretization-Aware Bidding
+
+The script implements **discretization-aware flexibility calculation** that correctly handles the physical constraints of different asset types:
+
+### Asset Modulation Types
+
+| Asset Type | Modulation | Control | Example |
+|------------|------------|---------|---------|
+| **Heat Pumps** | Discrete (ON/OFF) | Can only be fully ON or fully OFF | 0 kW or 15 kW |
+| **EV Chargers** | Continuous | Can be modulated to any value in range | 0-11 kW |
+
+### How It Works
+
+1. **Enumerate discrete combinations**: For N discrete assets with ON/OFF control, calculate all 2^N achievable power levels.
+   
+   Example with 3 HPs (4, 15, 15 kW):
+   - Achievable levels: {0, 4, 15, 19, 30, 34} kW
+
+2. **Calculate continuous range**: Sum of available flexibility from modulatable assets (EVs).
+   
+   Example with 2 EVs (11 kW each, 70% occupancy):
+   - Continuous range: 0 - 15.4 kW
+
+3. **Find optimal bid**: For a target flexibility:
+   - Select best discrete combination (≤ target)
+   - Fill remaining gap with continuous assets
+   - Bid the exact achievable quantity
+
+### Example Allocation
+
+For a **20 kW target**:
+
+```
+DISCRETIZATION-AWARE FLEXIBILITY ANALYSIS:
+  Target flexibility: 20.000 kW (0.020000 MW)
+  Discrete assets: ['ECM96.2', 'ECM97.1', 'ECM97.2']
+  Continuous assets: ['ECM63.1', 'ECM63.2']
+  Achievable discrete levels (kW): [0.0, 4.0, 15.0, 19.0, 30.0, 34.0]
+  Continuous range (kW): 0.00 - 15.40
+  Total achievable range (kW): 0.00 - 49.40
+----------------------------------------------------------------------
+RECOMMENDED BID: 20.000 kW (0.020000 MW) (exact match)
+  Discrete allocation (ON/OFF):
+    - ECM96.2: 4.0 kW (ON)
+    - ECM97.1: 15.0 kW (ON)
+    - ECM97.2: 0.0 kW (OFF)
+  Continuous allocation (modulated): 1.00 kW total
+    - ECM63.1: 0.50 kW (setpoint: 4.5% of 11.0 kW capacity)
+    - ECM63.2: 0.50 kW (setpoint: 4.5% of 11.0 kW capacity)
+```
+
+### Benefits
+
+- **Accurate bidding**: Bids only what can actually be delivered
+- **No delivery mismatch**: Activation exactly matches the bid
+- **Optimal portfolio use**: Combines discrete and continuous assets intelligently
+- **Consistent with flexi_manager**: Same allocation logic at bidding and activation
 
 ---
 
@@ -63,6 +125,8 @@ These prices are then forwarded unchanged to the market ledger via `FMO.add_entr
 python scripts/trader_fsp.py \
   --config_file conf/test_fm01_aem.json \
   --fsp supsi01 \
+  --strategy strategy_4 \
+  --dry-run \
   --log_file logs/trader_fsp.log
 ```
 
@@ -70,7 +134,71 @@ python scripts/trader_fsp.py \
 
 - `--config_file` (required): path to configuration JSON.
 - `--fsp` (required): FSP identifier (key under `fm.actors.fsps`, e.g. `supsi01`).
+- `--strategy` (optional): Bidding strategy to use (`strategy_1` through `strategy_5`). If not specified, uses FSP's configured strategy or falls back to simple mode.
+- `--list-strategies`: List all available strategies and exit.
+- `--dry-run` (optional): Simulate bidding without placing actual orders. Useful for testing.
 - `--log_file` (optional): path to log file. If omitted, logs go to stdout.
+
+### Dry-Run Mode
+
+Use `--dry-run` to simulate the bidding process without placing actual orders:
+
+```bash
+python scripts/trader_fsp.py \
+  --config_file conf/test_fm01_aem.json \
+  --fsp supsi01 \
+  --dry-run
+```
+
+This will:
+- Calculate available flexibility (discretization-aware)
+- Show recommended bid quantities and allocations
+- Log what orders **would** be placed
+- NOT actually submit orders to the market
+
+---
+
+## Bidding Strategies
+
+The script supports multiple bidding strategies that control which assets to use, when to bid, and at what price.
+
+### Available Strategies
+
+| Strategy | Name | Description |
+|----------|------|-------------|
+| `strategy_1` | HP Only | Heat pumps only, conservative full-day coverage |
+| `strategy_2` | Full Portfolio + Evening EV | All assets, focus on evening when EVs charge |
+| `strategy_3` | Morning Peak Focus | Aggressive bidding during morning peak (Cinema HPs) |
+| `strategy_4` | Hybrid (S3+S1) | Morning peak aggressive + full day HP coverage (**RECOMMENDED**) |
+| `strategy_5` | Hybrid2 (S3+S2) | Morning peak aggressive + evening EV focus |
+
+### Strategy Configuration
+
+Strategies are defined in `bidding_strategies` section of the config:
+
+```json
+"bidding_strategies": {
+  "strategy_4": {
+    "name": "Hybrid (S3+S1)",
+    "description": "Morning peak aggressive + full day HP coverage",
+    "asset_types": ["heat_pump"],
+    "time_slots": [
+      {"name": "Morning Peak", "start": "06:30", "end": "09:00", 
+       "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+      {"name": "Evening Peak", "start": "16:00", "end": "19:00", 
+       "flexibility_mw": 0.020, "bid_price": 9.5, "activation_cost": 2.5},
+      {"name": "Off-peak", "start": "19:00", "end": "06:30", 
+       "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+    ]
+  }
+}
+```
+
+### Strategy Selection Priority
+
+1. Command-line `--strategy` argument (highest priority)
+2. FSP config `"strategy"` field
+3. Simple mode (baseline-based, no strategy)
 
 ---
 
@@ -122,11 +250,13 @@ Example for `supsi01`:
     }
   },
   "pricing": {
-    "source": "constant",
+    "source": "strategy",
     "constant": 5.0,
     "forecasting_multiplier": 1.0,
-    "activationCost": 1.0
+    "activationCost": 2.5
   },
+  "strategy": "strategy_4",
+  "assets": ["ECM96.2", "ECM97.1", "ECM97.2", "ECM63.1", "ECM63.2"],
   "forecast": {
     "source": "aem",
     "filename": "../data/forecast/example01.csv"
@@ -141,32 +271,82 @@ Example for `supsi01`:
 
 Key elements:
 
-- **`baselines`**: controls how long the baseline horizon is and where temporary files are stored. This is used when the FSP downloads and maintains baselines.
+- **`baselines`**: controls how long the baseline horizon is and where temporary files are stored.
 - **`orderSection.quantityPercBaseline`**: percentage of the available baseline flexibility to offer to the market.
 - **`orderSection.mainSettings`**: basic order parameters for Sell offers.
-- **`pricing`**: how the Sell offer prices are set (constant or forecast-based, plus activation cost, etc.).
+- **`pricing`**: how the Sell offer prices are set. When `"source": "strategy"`, prices come from the bidding strategy.
+- **`strategy`**: default bidding strategy to use (e.g., `"strategy_4"`).
+- **`assets`**: list of asset IDs that belong to this FSP's portfolio.
 - **`forecast`**: how the FSP obtains forecasts (e.g. from AEM CSV).
 
 The `FSP` class uses these parameters in methods such as `download_baselines` and `sell_flexibility`.
+
+### Asset Mapping configuration `asset_mapping`
+
+The `asset_mapping` section defines individual assets with their modulation characteristics:
+
+```json
+"asset_mapping": {
+  "ECM63.1": {
+    "device_name_tag": "charge_point_ev_1",
+    "field": "power",
+    "type": "ev_charger",
+    "description": "EV Charger 1",
+    "capacity_kw": 11.0,
+    "flexibility_factor": 0.70,
+    "modulation_type": "continuous",
+    "min_power_kw": 0.0
+  },
+  "ECM97.1": {
+    "device_name_tag": "shelly_3em_pro_heat_pump_1",
+    "field": "active_power",
+    "type": "heat_pump",
+    "description": "HP Cinema 1",
+    "capacity_kw": 15.0,
+    "flexibility_factor": 0.85,
+    "modulation_type": "discrete",
+    "discrete_states_kw": [0.0, 15.0]
+  }
+}
+```
+
+Key fields:
+
+| Field | Description |
+|-------|-------------|
+| `type` | Asset type: `"ev_charger"` or `"heat_pump"` |
+| `capacity_kw` | Nominal power capacity |
+| `flexibility_factor` | Availability factor (0.0-1.0) |
+| `modulation_type` | `"continuous"` (any value) or `"discrete"` (ON/OFF) |
+| `min_power_kw` | Minimum power for continuous assets (default: 0) |
+| `discrete_states_kw` | Valid power states for discrete assets (e.g., `[0.0, 15.0]`) |
+
+If `modulation_type` is not specified:
+- Heat pumps default to `"discrete"` with `[0.0, capacity_kw]`
+- EV chargers default to `"continuous"`
 
 ---
 
 ## Detailed execution steps
 
 1. **Argument parsing**<br>
-   Uses `argparse` to read `--config_file`, `--fsp`, and `--log_file`.
+   Uses `argparse` to read `--config_file`, `--fsp`, `--strategy`, `--dry-run`, and `--log_file`.
 
 2. **Configuration loading**<br>
    - Reads the main JSON configuration file.
    - Reads and merges the JSON from `cfg["connectionsFile"]`.
 
-3. **Logging setup**<br>
+3. **Strategy initialization**<br>
+   - Initializes `StrategyManager` with all configured strategies.
+   - Determines which strategy to use (CLI > FSP config > simple mode).
+
+4. **Logging setup**<br>
    Configures logging via `logging.basicConfig` with the given log file or stdout.
 
-4. **Database connection (optional)**<br>
+5. **Database connection (optional)**<br>
    Tries to create a `PostgreSQLInterface(cfg["postgreSQL"], logger)`. On failure, logs an error and continues.
 
-5. **Timeslot calculation**<br>
+6. **Timeslot calculation**<br>
    - Creates a temporary `DSO` instance for time alignment:
 
      ```python
@@ -177,7 +357,7 @@ The `FSP` class uses these parameters in methods such as `download_baselines` an
 
    - `slot_time` is the reference timeslot for both demand and offers.
 
-6. **FSP setup**<br>
+7. **FSP setup**<br>
    - Initialize FSP:
 
      ```python
@@ -189,7 +369,7 @@ The `FSP` class uses these parameters in methods such as `download_baselines` an
 
    - Logs market id and market name for traceability.
 
-7. **Obtain DSO flexibility requests**<br>
+8. **Obtain DSO flexibility requests**<br>
    - The script calls:
 
      ```python
@@ -200,31 +380,121 @@ The `FSP` class uses these parameters in methods such as `download_baselines` an
 
    - This should return a list of demand objects for the given slot, side, and product type (e.g. Power).
 
-8. **Baseline download**<br>
+9. **Baseline download**<br>
    - Calls `fsp.download_baselines(slot_time)` to ensure current baselines are available for all portfolios and assets.
 
-9. **FMO initialization**<br>
-   - `fmo = FMO(fsp.cfg, logger, pgi)`.
+10. **Flexibility forecasting (discretization-aware)**<br>
+    - Initializes `FlexibilityForecaster` for the asset portfolio.
+    - Calls `get_asset_flexibility_breakdown(slot_time)` to get per-asset details.
+    - Uses `get_achievable_flexibility()` to calculate:
+      - Discrete asset combinations (ON/OFF states)
+      - Continuous asset ranges (modulation)
+      - Recommended bid quantity
 
-10. **Offer construction and posting**<br>
-    For every DSO demand and for every FSP portfolio:
+11. **Strategy-based bid calculation**<br>
+    If using strategy mode:
 
     ```python
-    for dso_demand in dso_demands:
-        for p_k in fsp.portfolios.keys():
-            resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
-            for k in resp_selling.keys():
-                if resp_selling[k] is not False:
-                    fmo.add_entry_to_market_ledger(
-                        timeslot=slot_time,
-                        player=fsp,
-                        portfolio=fsp.portfolios[p_k].metadata["name"],
-                        features=resp_selling[k],
-                    )
+    flexibility_to_bid_mw, achievable_details = get_strategy_flexibility_discrete(
+        strategy, slot_time, flex_forecaster, logger
+    )
     ```
 
-    - `sell_flexibility` returns a dictionary of order descriptions (possibly one per product, type or time slice).
-    - Only non-`False` entries are posted to the market ledger.
+    This returns the **achievable** flexibility (not just a fractional sum) and the allocation plan.
+
+12. **FMO initialization**<br>
+    - `fmo = FMO(fsp.cfg, logger, pgi)`.
+
+13. **Bid record creation**<br>
+    - Creates a bid record in the database before placing orders.
+    - Includes assets to activate, prices, and strategy info.
+
+14. **Offer construction and posting**<br>
+    For strategy mode:
+
+    ```python
+    orders_summary, used_strategy = run_strategy_mode(
+        strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
+        asset_breakdown, flex_forecaster, dry_run, logger
+    )
+    ```
+
+    For simple mode:
+
+    ```python
+    orders_summary = run_simple_mode(
+        fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger
+    )
+    ```
+
+    - In dry-run mode, logs what would be placed without actual submission.
+    - In live mode, posts orders to the market ledger.
+
+15. **Bid record update**<br>
+    - Updates the bid record with actual orders placed and final prices.
+
+---
+
+## Example Log Output
+
+When running in strategy mode with discretization-aware bidding:
+
+```
+======================================================================
+FSP: supsi01
+Mode: STRATEGY-BASED
+Strategy: strategy_4 - Hybrid (S3+S1)
+Description: Morning peak aggressive + full day HP coverage
+Allowed assets: ['ECM96.2', 'ECM97.1', 'ECM97.2']
+======================================================================
+FLEXIBILITY ANALYSIS FOR SLOT: 2026-01-15 08:30
+======================================================================
+Peak hour: YES
+----------------------------------------------------------------------
+Asset flexibility breakdown (strategy filter: strategy_4):
+  [✓] [D] ECM96.2 (HP Small): typical=3.50 kW, available_flex=2.80 kW
+  [✓] [D] ECM97.1 (HP Cinema 1): typical=14.20 kW, available_flex=12.07 kW
+  [✓] [D] ECM97.2 (HP Cinema 2): typical=13.80 kW, available_flex=11.73 kW
+  [✗] [C] ECM63.1 (EV Charger 1): typical=5.50 kW, occupancy=45%, available_flex=1.73 kW
+  [✗] [C] ECM63.2 (EV Charger 2): typical=4.20 kW, occupancy=38%, available_flex=1.12 kW
+----------------------------------------------------------------------
+TOTAL AVAILABLE (all assets, continuous sum): 29.45 kW (0.029450 MW)
+STRATEGY AVAILABLE (filtered, continuous sum): 26.60 kW (0.026600 MW)
+----------------------------------------------------------------------
+DISCRETIZATION-AWARE FLEXIBILITY ANALYSIS:
+  Target flexibility: 20.000 kW (0.020000 MW)
+  Discrete assets: ['ECM96.2', 'ECM97.1', 'ECM97.2']
+  Continuous assets: []
+  Achievable discrete levels (kW): [0.0, 4.0, 15.0, 19.0, 30.0, 34.0]
+  Continuous range (kW): 0.00 - 0.00
+  Total achievable range (kW): 0.00 - 34.00
+----------------------------------------------------------------------
+RECOMMENDED BID: 19.000 kW (0.019000 MW) (-1.00 kW / -5.0% under target)
+  Discrete allocation (ON/OFF):
+    - ECM96.2: 4.0 kW (ON)
+    - ECM97.1: 15.0 kW (ON)
+    - ECM97.2: 0.0 kW (OFF)
+----------------------------------------------------------------------
+RUNNING IN STRATEGY MODE: strategy_4 - Hybrid (S3+S1)
+======================================================================
+Time slot: Morning Peak (Aggressive)
+Strategy bid price: 9.00 CHF/MW
+Strategy flexibility target: 0.0200 MW
+----------------------------------------------------------------------
+[DRY-RUN] WOULD PLACE ORDER: Up regulation, quantity=0.019 MW, price=9.00 CHF/MW
+======================================================================
+DRY-RUN SUMMARY
+======================================================================
+Mode: Strategy-based (strategy_4 - Hybrid (S3+S1))
+Total orders: 1
+Total quantity: 0.0190 MW
+Total potential revenue: 0.17 CHF
+```
+
+**Legend for asset markers:**
+- `[✓]` / `[✗]`: Asset allowed/not allowed by strategy
+- `[D]`: Discrete asset (ON/OFF control)
+- `[C]`: Continuous asset (modulated control)
 
 ---
 
@@ -289,8 +559,44 @@ By changing the FSP-specific configuration, you can control how aggressively the
 ## Dependencies and environment
 
 - Requires `classes.dso.DSO`, `classes.fsp.FSP`, `classes.fmo.FMO`, `classes.postgresql_interface.PostgreSQLInterface`.
-- Requires `pandas` for the helper function.
+- Requires `classes.flexibility_forecaster.FlexibilityForecaster` for discretization-aware flexibility calculation.
+- Requires `classes.bidding_strategy.BiddingStrategy`, `classes.bidding_strategy.StrategyManager` for strategy-based bidding.
+- Requires `classes.bid_record_repository.BidRecordRepository` for storing bid records.
+- Requires `classes.demand_record_repository.DemandRecordRepository` for storing DSO demand records.
+- Requires `pandas` for the helper function and data manipulation.
+- Requires `influxdb.InfluxDBClient` for historical data queries.
 - Needs configuration and connections as defined in `conf/test_fm01_aem.json` and the referenced `connectionsFile`.
+
+---
+
+## Troubleshooting
+
+### Under-delivery due to discrete constraints
+
+If the log shows significant under-delivery:
+```
+RECOMMENDED BID: 15.000 kW (-5.00 kW / -25.0% under target)
+```
+
+This means the discrete asset combinations cannot reach the target. Consider:
+1. Adding more discrete assets to the portfolio
+2. Including continuous assets (EVs) in the strategy
+3. Reducing the flexibility target
+
+### Over-delivery due to discrete constraints
+
+If the log shows over-delivery:
+```
+RECOMMENDED BID: 19.000 kW (+4.00 kW / +26.7% over target)
+```
+
+This is expected when the best discrete combination exceeds the target. The system prefers slight under-delivery by default. To change this behavior, adjust the `_calculate_best_bid()` logic in `FlexibilityForecaster`.
+
+### No continuous assets for fine-tuning
+
+If your strategy only allows heat pumps (discrete assets), you lose the ability to fine-tune bids:
+- Consider using strategies that include EV chargers (continuous)
+- Or accept that bids will be at discrete power levels only
 # baseline_updater.py
 
 This script updates the baselines for a given Flexibility Service Provider (FSP) in the Opentunity-CH flexibility market setup.

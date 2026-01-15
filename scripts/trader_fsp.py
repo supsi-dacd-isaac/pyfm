@@ -6,6 +6,7 @@ import sys
 import json
 import datetime
 from datetime import datetime, timedelta
+from typing import Tuple
 import pandas as pd
 from influxdb import InfluxDBClient
 
@@ -51,6 +52,9 @@ def get_strategy_flexibility(
     """
     Calculate available flexibility based on strategy and asset data.
     
+    NOTE: This is the legacy continuous-sum method. Use get_strategy_flexibility_discrete()
+    for discretization-aware bidding.
+    
     :param strategy: BiddingStrategy instance
     :param slot_time: Time slot for the bid
     :param asset_breakdown: Per-asset flexibility breakdown
@@ -82,6 +86,101 @@ def get_strategy_flexibility(
     )
     
     return final_flex_mw
+
+
+def get_strategy_flexibility_discrete(
+    strategy: BiddingStrategy,
+    slot_time: datetime,
+    flex_forecaster: FlexibilityForecaster,
+    logger: logging.Logger
+) -> Tuple[float, dict]:
+    """
+    Calculate achievable flexibility considering discrete asset constraints.
+    
+    This is the discretization-aware version that calculates what can actually
+    be delivered, not just fractional sums.
+    
+    :param strategy: BiddingStrategy instance
+    :param slot_time: Time slot for the bid
+    :param flex_forecaster: FlexibilityForecaster instance
+    :param logger: Logger instance
+    :return: Tuple of (achievable flexibility in MW, allocation details)
+    """
+    # Get strategy parameters
+    params = strategy.get_bid_parameters(slot_time)
+    
+    # Get strategy's target flexibility (as target for discrete calculation)
+    target_flex_kw = params["flexibility_mw"] * 1000  # Convert to kW
+    if params.get("ev_flexibility_mw", 0) > 0:
+        target_flex_kw += params["ev_flexibility_mw"] * 1000
+    
+    # Get allowed assets from strategy
+    allowed_assets = strategy.allowed_assets if hasattr(strategy, 'allowed_assets') else None
+    
+    # Get discretization-aware flexibility calculation
+    achievable = flex_forecaster.get_achievable_flexibility(
+        period_from=slot_time,
+        target_kw=target_flex_kw,
+        allowed_assets=allowed_assets,
+        use_temperature=True
+    )
+    
+    # Log detailed breakdown
+    logger.info("-" * 70)
+    logger.info("DISCRETIZATION-AWARE FLEXIBILITY ANALYSIS:")
+    logger.info("  Target flexibility: %.3f kW (%.6f MW)", target_flex_kw, target_flex_kw / 1000)
+    logger.info("  Discrete assets: %s", achievable["discrete_assets"])
+    logger.info("  Continuous assets: %s", achievable["continuous_assets"])
+    logger.info("  Achievable discrete levels (kW): %s", achievable["discrete_levels_kw"])
+    logger.info("  Continuous range (kW): %.2f - %.2f", 
+                achievable["continuous_range_kw"][0], 
+                achievable["continuous_range_kw"][1])
+    logger.info("  Total achievable range (kW): %.2f - %.2f",
+                achievable["total_achievable_range_kw"][0],
+                achievable["total_achievable_range_kw"][1])
+    
+    # Get recommended bid
+    recommended_kw = achievable.get("recommended_bid_kw", 0)
+    recommended_mw = recommended_kw / 1000
+    
+    deviation_kw = achievable.get("bid_deviation_kw", 0)
+    deviation_pct = achievable.get("bid_deviation_pct", 0)
+    
+    if abs(deviation_kw) < 0.01:
+        deviation_msg = "(exact match)"
+    elif deviation_kw > 0:
+        deviation_msg = f"(+{deviation_kw:.2f} kW / +{deviation_pct:.1f}% over target)"
+    else:
+        deviation_msg = f"({deviation_kw:.2f} kW / {deviation_pct:.1f}% under target)"
+    
+    logger.info("-" * 70)
+    logger.info("RECOMMENDED BID: %.3f kW (%.6f MW) %s", 
+                recommended_kw, recommended_mw, deviation_msg)
+    
+    allocation = achievable.get("recommended_allocation", {})
+    if allocation:
+        discrete_alloc = allocation.get("discrete", {})
+        continuous_alloc = allocation.get("continuous", {})
+        continuous_total = allocation.get("continuous_total_kw", 0)
+        
+        if discrete_alloc:
+            logger.info("  Discrete allocation (ON/OFF):")
+            for asset_id, power in discrete_alloc.items():
+                state = "ON" if power > 0 else "OFF"
+                logger.info("    - %s: %.1f kW (%s)", asset_id, power, state)
+        
+        if continuous_alloc:
+            logger.info("  Continuous allocation (modulated): %.2f kW total", continuous_total)
+            for asset_id, details in continuous_alloc.items():
+                power = details.get("power_kw", 0)
+                max_power = details.get("max_power_kw", 0)
+                setpoint_pct = details.get("setpoint_pct", 0)
+                logger.info("    - %s: %.2f kW (setpoint: %.1f%% of %.1f kW capacity)", 
+                           asset_id, power, setpoint_pct, max_power)
+    
+    logger.info("-" * 70)
+    
+    return recommended_mw, achievable
 
 
 def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, 
@@ -182,14 +281,15 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
 
 
 def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time, 
-                      asset_breakdown, dry_run, logger, bid_record_id=None, demand_record_id=None):
+                      asset_breakdown, flex_forecaster, dry_run, logger, 
+                      bid_record_id=None, demand_record_id=None):
     """
-    Run strategy-based bidding mode.
+    Run strategy-based bidding mode with discretization-aware flexibility calculation.
     
     Uses the configured bidding strategy to determine:
     - Which assets to use
     - What price to bid
-    - How much flexibility to offer
+    - How much flexibility to offer (considering discrete asset constraints)
     """
     logger.info("=" * 70)
     logger.info("RUNNING IN STRATEGY MODE: %s - %s", strategy_id, strategy.name)
@@ -211,17 +311,21 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
         is_allowed = strategy.is_asset_allowed(asset_id)
         status = "✓" if is_allowed else "✗"
         
+        # Get modulation type for display
+        mod_type = flex_forecaster._get_modulation_type(asset_id)
+        mod_label = "[D]" if mod_type == "discrete" else "[C]"
+        
         occupancy = info.get("occupancy_probability")
         if occupancy is not None:
             logger.info(
-                "  [%s] %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW",
-                status, asset_id, info["description"],
+                "  [%s] %s %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW",
+                status, mod_label, asset_id, info["description"],
                 info["typical_load_kw"], occupancy * 100, info["available_flexibility_kw"],
             )
         else:
             logger.info(
-                "  [%s] %s (%s): typical=%.2f kW, available_flex=%.2f kW",
-                status, asset_id, info["description"],
+                "  [%s] %s %s (%s): typical=%.2f kW, available_flex=%.2f kW",
+                status, mod_label, asset_id, info["description"],
                 info["typical_load_kw"], info["available_flexibility_kw"],
             )
         
@@ -230,14 +334,14 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             strategy_flex_kw += info["available_flexibility_kw"]
     
     logger.info("-" * 70)
-    logger.info("TOTAL AVAILABLE (all assets): %.3f kW (%.6f MW)", 
+    logger.info("TOTAL AVAILABLE (all assets, continuous sum): %.3f kW (%.6f MW)", 
                 total_available_flex_kw, total_available_flex_kw / 1000)
-    logger.info("STRATEGY AVAILABLE (filtered): %.3f kW (%.6f MW)", 
+    logger.info("STRATEGY AVAILABLE (filtered, continuous sum): %.3f kW (%.6f MW)", 
                 strategy_flex_kw, strategy_flex_kw / 1000)
     
-    # Get the flexibility to bid based on strategy
-    flexibility_to_bid_mw = get_strategy_flexibility(
-        strategy, slot_time, asset_breakdown, logger
+    # Get the flexibility to bid using discretization-aware calculation
+    flexibility_to_bid_mw, achievable_details = get_strategy_flexibility_discrete(
+        strategy, slot_time, flex_forecaster, logger
     )
     
     if dry_run:
@@ -745,7 +849,7 @@ if __name__ == "__main__":
     if use_strategy_mode:
         orders_summary, used_strategy = run_strategy_mode(
             strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
-            asset_breakdown, dry_run, logger, 
+            asset_breakdown, flex_forecaster, dry_run, logger, 
             bid_record_id=bid_record_id, demand_record_id=demand_record_id
         )
     else:

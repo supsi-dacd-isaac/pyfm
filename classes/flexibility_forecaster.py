@@ -1055,3 +1055,418 @@ class FlexibilityForecaster:
         if self.temperature_enabled:
             print(f"Temperature-aware analysis: ENABLED (bins: {self.temperature_bins})")
         print()
+    
+    # =========================================================================
+    # DISCRETIZATION-AWARE FLEXIBILITY CALCULATION
+    # =========================================================================
+    
+    def _get_modulation_type(self, asset_id: str) -> str:
+        """
+        Get the modulation type for an asset.
+        
+        :param asset_id: Asset identifier
+        :return: 'continuous' or 'discrete'
+        """
+        mapping = self.asset_mapping.get(asset_id, {})
+        if not isinstance(mapping, dict):
+            return "continuous"
+        
+        # Explicit modulation_type in config takes priority
+        if "modulation_type" in mapping:
+            return mapping["modulation_type"]
+        
+        # Default based on asset type
+        asset_type = mapping.get("type", "")
+        if asset_type == "heat_pump":
+            return "discrete"
+        return "continuous"
+    
+    def _get_discrete_states(self, asset_id: str) -> List[float]:
+        """
+        Get the discrete power states for an asset.
+        
+        :param asset_id: Asset identifier
+        :return: List of achievable power states in kW (e.g., [0.0, 15.0] for ON/OFF)
+        """
+        mapping = self.asset_mapping.get(asset_id, {})
+        if not isinstance(mapping, dict):
+            return [0.0]
+        
+        # Explicit discrete_states_kw in config
+        if "discrete_states_kw" in mapping:
+            return mapping["discrete_states_kw"]
+        
+        # Default: ON/OFF at full capacity
+        capacity = mapping.get("capacity_kw", 0.0)
+        return [0.0, capacity]
+    
+    def _enumerate_discrete_combinations(
+        self, 
+        discrete_assets: Dict[str, Dict]
+    ) -> List[Tuple[float, Dict[str, float]]]:
+        """
+        Enumerate all possible power combinations from discrete assets.
+        
+        Uses subset-sum enumeration. For N assets with binary states, 
+        this produces 2^N combinations.
+        
+        :param discrete_assets: Dict of {asset_id: {'capacity_kw': X, 'available': True/False, ...}}
+        :return: List of (total_power_kw, {asset_id: power_kw}) tuples, sorted by total power
+        """
+        if not discrete_assets:
+            return [(0.0, {})]
+        
+        # Start with empty combination
+        combinations = [(0.0, {})]
+        
+        for asset_id, info in discrete_assets.items():
+            # Get the discrete states for this asset
+            states = self._get_discrete_states(asset_id)
+            available = info.get("available", True)
+            
+            if not available:
+                # Asset not available - can only be in OFF state
+                states = [0.0]
+            
+            new_combinations = []
+            for total, allocation in combinations:
+                for state in states:
+                    new_total = total + state
+                    new_allocation = allocation.copy()
+                    new_allocation[asset_id] = state
+                    new_combinations.append((new_total, new_allocation))
+            
+            combinations = new_combinations
+        
+        # Sort by total power
+        combinations.sort(key=lambda x: x[0])
+        
+        # Remove duplicates (same total power)
+        unique_combinations = []
+        seen_totals = set()
+        for total, allocation in combinations:
+            # Round to avoid floating point issues
+            rounded_total = round(total, 2)
+            if rounded_total not in seen_totals:
+                seen_totals.add(rounded_total)
+                unique_combinations.append((total, allocation))
+        
+        return unique_combinations
+    
+    def get_achievable_flexibility(
+        self,
+        period_from: datetime,
+        target_kw: float = None,
+        allowed_assets: List[str] = None,
+        use_temperature: bool = True
+    ) -> Dict:
+        """
+        Calculate achievable flexibility considering discrete asset constraints.
+        
+        This is the discretization-aware version of get_asset_flexibility_breakdown().
+        It calculates what power levels can actually be delivered, not just
+        fractional sums.
+        
+        :param period_from: Start of time slot
+        :param target_kw: Optional target flexibility (if None, returns max achievable)
+        :param allowed_assets: Optional list of asset IDs to consider
+        :param use_temperature: Whether to use temperature-based HP estimation
+        :return: Dictionary with:
+            - 'discrete_combinations': All achievable discrete power levels
+            - 'continuous_range': (min, max) from continuous assets
+            - 'total_achievable_range': (min, max) total flexibility
+            - 'recommended_bid_kw': Best bid quantity for target (if provided)
+            - 'asset_breakdown': Per-asset details
+            - 'discrete_assets': List of discrete asset IDs
+            - 'continuous_assets': List of continuous asset IDs
+        """
+        # Get base asset breakdown
+        breakdown = self.get_asset_flexibility_breakdown(period_from, use_temperature)
+        
+        # Filter by allowed assets if specified
+        if allowed_assets:
+            breakdown = {k: v for k, v in breakdown.items() if k in allowed_assets}
+        
+        # Separate into discrete and continuous assets
+        discrete_assets = {}
+        continuous_assets = {}
+        
+        for asset_id, info in breakdown.items():
+            mod_type = self._get_modulation_type(asset_id)
+            
+            # Check if asset is available (has flexibility)
+            available_flex = info.get("available_flexibility_kw", 0)
+            flex_factor = info.get("flexibility_factor", 0.5)
+            nominal_kw = info.get("nominal_capacity_kw", 0)
+            
+            # For discrete assets, availability is probabilistic
+            # We consider it "available" if flex_factor > threshold
+            is_available = flex_factor >= 0.5  # 50% threshold
+            
+            if mod_type == "discrete":
+                discrete_assets[asset_id] = {
+                    "capacity_kw": nominal_kw,
+                    "available": is_available,
+                    "availability_prob": flex_factor,
+                    "info": info
+                }
+            else:
+                # Continuous assets can be modulated to any value within their range
+                # Get min_power_kw from config (some EVs have minimum charging power)
+                mapping = self.asset_mapping.get(asset_id, {})
+                min_power_kw = mapping.get("min_power_kw", 0.0) if isinstance(mapping, dict) else 0.0
+                
+                # Controllable range: from min_power to capacity (or 0 if turned off)
+                # available_flex_kw is the expected value considering occupancy
+                continuous_assets[asset_id] = {
+                    "capacity_kw": nominal_kw,
+                    "min_power_kw": min_power_kw,
+                    "available_flex_kw": available_flex,  # Expected availability
+                    "controllable_range_kw": (0.0, nominal_kw),  # Full modulation range
+                    "typical_load_kw": info.get("typical_load_kw", 0),
+                    "occupancy_prob": info.get("occupancy_probability", 1.0),
+                    "info": info
+                }
+        
+        # Enumerate discrete combinations
+        discrete_combos = self._enumerate_discrete_combinations(discrete_assets)
+        discrete_levels = [combo[0] for combo in discrete_combos]
+        
+        # Calculate continuous range
+        # For bidding: use available_flex_kw (expected value based on occupancy)
+        # For control: full range from 0 to sum of capacities
+        continuous_min = 0.0
+        continuous_available = sum(
+            a["available_flex_kw"] for a in continuous_assets.values()
+        )
+        continuous_max_capacity = sum(
+            a["capacity_kw"] for a in continuous_assets.values()
+        )
+        
+        # Calculate total achievable range
+        # Min: smallest discrete + no continuous
+        # Max: largest discrete + all continuous (use available for bidding)
+        total_min = min(discrete_levels) if discrete_levels else 0.0
+        total_max_available = max(discrete_levels) + continuous_available if discrete_levels else continuous_available
+        total_max_capacity = max(discrete_levels) + continuous_max_capacity if discrete_levels else continuous_max_capacity
+        
+        result = {
+            "period_from": period_from.isoformat(),
+            "discrete_combinations": discrete_combos,
+            "discrete_levels_kw": discrete_levels,
+            "continuous_range_kw": (continuous_min, continuous_available),  # For bidding
+            "continuous_max_capacity_kw": continuous_max_capacity,  # Full control range
+            "total_achievable_range_kw": (total_min, total_max_available),  # For bidding
+            "total_max_capacity_kw": total_max_capacity,  # If all assets available
+            "asset_breakdown": breakdown,
+            "discrete_assets": list(discrete_assets.keys()),
+            "continuous_assets": list(continuous_assets.keys()),
+            "discrete_asset_details": discrete_assets,
+            "continuous_asset_details": continuous_assets,
+        }
+        
+        # If target is provided, calculate the best bid
+        if target_kw is not None:
+            best_bid = self._calculate_best_bid(
+                target_kw, discrete_combos, continuous_available, continuous_assets
+            )
+            result["target_kw"] = target_kw
+            result["recommended_bid_kw"] = best_bid["bid_kw"]
+            result["recommended_allocation"] = best_bid["allocation"]
+            result["bid_deviation_kw"] = best_bid["bid_kw"] - target_kw
+            result["bid_deviation_pct"] = (
+                (best_bid["bid_kw"] - target_kw) / target_kw * 100 
+                if target_kw > 0 else 0
+            )
+        
+        return result
+    
+    def _calculate_best_bid(
+        self,
+        target_kw: float,
+        discrete_combos: List[Tuple[float, Dict[str, float]]],
+        continuous_max_kw: float,
+        continuous_assets: Dict[str, Dict] = None
+    ) -> Dict:
+        """
+        Calculate the best achievable bid for a target flexibility.
+        
+        Strategy:
+        1. Find the largest discrete combination <= target
+        2. Fill remaining with continuous assets (proportionally distributed)
+        3. If still under target, consider next discrete level
+        
+        For continuous assets (e.g., EV chargers):
+        - Can be modulated to any value within [min_power_kw, capacity_kw]
+        - Distribution is proportional to available flexibility
+        
+        :param target_kw: Target flexibility in kW
+        :param discrete_combos: List of (total, allocation) from discrete assets
+        :param continuous_max_kw: Maximum available from continuous assets
+        :param continuous_assets: Dict of continuous asset details for per-asset allocation
+        :return: Dict with 'bid_kw' and detailed allocation
+        """
+        continuous_assets = continuous_assets or {}
+        
+        if not discrete_combos:
+            # No discrete assets - just use continuous
+            bid = min(target_kw, continuous_max_kw)
+            continuous_alloc = self._allocate_continuous(bid, continuous_assets)
+            return {
+                "bid_kw": round(bid, 3),
+                "allocation": {
+                    "discrete": {},
+                    "continuous": continuous_alloc,
+                    "continuous_total_kw": round(bid, 3)
+                },
+                "discrete_kw": 0,
+                "continuous_kw": round(bid, 3),
+                "strategy": "continuous_only"
+            }
+        
+        best_bid = None
+        best_deviation = float('inf')
+        
+        for discrete_total, discrete_alloc in discrete_combos:
+            # Can we reach target with this discrete combination + continuous?
+            remaining = target_kw - discrete_total
+            
+            if remaining <= 0:
+                # Discrete alone exceeds target
+                # This is an over-delivery scenario
+                continuous_contrib = 0
+                total_bid = discrete_total
+            elif remaining <= continuous_max_kw:
+                # We can exactly match or fill with continuous
+                continuous_contrib = remaining
+                total_bid = discrete_total + continuous_contrib
+            else:
+                # Even with max continuous, we're under target
+                continuous_contrib = continuous_max_kw
+                total_bid = discrete_total + continuous_contrib
+            
+            deviation = abs(total_bid - target_kw)
+            
+            # Prefer slight under-delivery over over-delivery (conservative)
+            # Add small penalty for over-delivery
+            if total_bid > target_kw:
+                deviation += 0.01  # Small penalty for over-delivery
+            
+            if deviation < best_deviation:
+                best_deviation = deviation
+                # Calculate per-asset allocation for continuous assets
+                continuous_alloc = self._allocate_continuous(continuous_contrib, continuous_assets)
+                
+                best_bid = {
+                    "bid_kw": round(total_bid, 3),
+                    "allocation": {
+                        "discrete": discrete_alloc,
+                        "continuous": continuous_alloc,
+                        "continuous_total_kw": round(continuous_contrib, 3)
+                    },
+                    "discrete_kw": round(discrete_total, 3),
+                    "continuous_kw": round(continuous_contrib, 3),
+                    "strategy": "discrete_first" if discrete_total > 0 else "continuous_only"
+                }
+        
+        return best_bid
+    
+    def _allocate_continuous(
+        self, 
+        target_kw: float, 
+        continuous_assets: Dict[str, Dict]
+    ) -> Dict[str, Dict]:
+        """
+        Allocate power to continuous assets proportionally.
+        
+        Continuous assets (like EV chargers) can be modulated to any value
+        within their controllable range [min_power_kw, capacity_kw].
+        
+        :param target_kw: Total power to allocate to continuous assets
+        :param continuous_assets: Dict of {asset_id: {capacity_kw, min_power_kw, available_flex_kw, ...}}
+        :return: Dict of {asset_id: {power_kw, min_kw, max_kw, setpoint_pct}}
+        """
+        if not continuous_assets or target_kw <= 0:
+            return {}
+        
+        # Calculate total available flexibility for proportional distribution
+        total_available = sum(a.get("available_flex_kw", 0) for a in continuous_assets.values())
+        
+        if total_available <= 0:
+            return {}
+        
+        allocation = {}
+        remaining = target_kw
+        
+        for asset_id, info in continuous_assets.items():
+            available = info.get("available_flex_kw", 0)
+            capacity = info.get("capacity_kw", 0)
+            min_power = info.get("min_power_kw", 0)
+            
+            if available <= 0 or capacity <= 0:
+                continue
+            
+            # Proportional allocation based on available flexibility
+            proportion = available / total_available
+            asset_share = target_kw * proportion
+            
+            # Clamp to asset's controllable range
+            # For curtailment: we're reducing from typical load, so max reduction = available
+            power_kw = min(asset_share, available, remaining)
+            power_kw = max(power_kw, 0)  # Can't allocate negative
+            
+            # Calculate setpoint as percentage of capacity
+            setpoint_pct = (power_kw / capacity * 100) if capacity > 0 else 0
+            
+            allocation[asset_id] = {
+                "power_kw": round(power_kw, 3),
+                "min_power_kw": min_power,
+                "max_power_kw": capacity,
+                "available_flex_kw": round(available, 3),
+                "setpoint_pct": round(setpoint_pct, 1),
+                "modulation": "continuous"
+            }
+            
+            remaining -= power_kw
+        
+        return allocation
+    
+    def get_biddable_quantities(
+        self,
+        period_from: datetime,
+        allowed_assets: List[str] = None,
+        use_temperature: bool = True
+    ) -> List[float]:
+        """
+        Get all exactly-achievable bid quantities for a time slot.
+        
+        This returns the discrete "steps" at which the FSP can bid,
+        useful for quantum-style bidding or for understanding constraints.
+        
+        :param period_from: Start of time slot
+        :param allowed_assets: Optional list of asset IDs to consider
+        :param use_temperature: Whether to use temperature-based HP estimation
+        :return: List of achievable power levels in kW, sorted ascending
+        """
+        result = self.get_achievable_flexibility(
+            period_from, 
+            target_kw=None,
+            allowed_assets=allowed_assets,
+            use_temperature=use_temperature
+        )
+        
+        discrete_levels = result["discrete_levels_kw"]
+        continuous_max = result["continuous_range_kw"][1]
+        
+        # Each discrete level can be augmented with continuous up to continuous_max
+        # For simplicity, return discrete levels + their max extensions
+        biddable = []
+        for level in discrete_levels:
+            biddable.append(level)
+            if continuous_max > 0:
+                biddable.append(level + continuous_max)
+        
+        # Remove duplicates and sort
+        biddable = sorted(set(round(b, 3) for b in biddable))
+        
+        return biddable
