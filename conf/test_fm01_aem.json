@@ -164,7 +164,7 @@
       "type": "heat_pump",
       "description": "HP Small",
       "capacity_kw": 4.0,
-      "flexibility_factor": 0.80,
+      "flexibility_factor": 1.0,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 4.0]
     },
@@ -174,7 +174,7 @@
       "type": "heat_pump",
       "description": "HP Cinema 1",
       "capacity_kw": 15.0,
-      "flexibility_factor": 0.85,
+      "flexibility_factor": 1.0,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 15.0]
     },
@@ -184,7 +184,7 @@
       "type": "heat_pump",
       "description": "HP Cinema 2",
       "capacity_kw": 15.0,
-      "flexibility_factor": 0.85,
+      "flexibility_factor": 1.0,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 15.0]
     }
@@ -264,10 +264,10 @@
       "description": "Morning peak aggressive (S3) + full day HP coverage (S1) - RECOMMENDED",
       "asset_types": ["heat_pump"],
       "time_slots": [
-        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
         {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
         {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
-        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.020, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
         {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
       ]
     },
