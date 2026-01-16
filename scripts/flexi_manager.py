@@ -1921,16 +1921,23 @@ class FlexibilityManager:
         self.logger.info("FLEXIBILITY ACTIVATION COMPLETE")
         self.logger.info("=" * 70)
         
+        # Count successful statuses: "success", "simulated", or "queued" (RabbitMQ)
         successful = sum(1 for r in summary["control_results"].values() 
-                        if r.get("status") in ["success", "simulated"])
+                        if r.get("status") in ["success", "simulated", "queued"])
         failed = len(summary["control_results"]) - successful
         
-        self.logger.info("Assets controlled: %d successful, %d failed", successful, failed)
+        # Adjust message based on whether RabbitMQ is used
+        if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+            self.logger.info("Commands queued: %d (actuation delegated to forwarder)", successful)
+        else:
+            self.logger.info("Assets controlled: %d successful, %d failed", successful, failed)
         self.logger.info("Total flexibility delivered: %.2f kW (%.3f MW)", 
                         total_allocated, total_allocated / 1000)
         
         if failed > 0:
             summary["status"] = "partial_success"
+        elif self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+            summary["status"] = "queued"  # All commands queued for forwarder
         
         return summary
 
@@ -2235,9 +2242,7 @@ Examples:
         rabbitmq_publisher.disconnect()
     
     # Exit code based on status
-    if summary["status"] == "success":
-        sys.exit(0)
-    elif summary["status"] == "no_flexibility":
+    if summary["status"] in ["success", "queued", "no_flexibility", "no_trades", "no_bid_record"]:
         sys.exit(0)
     elif summary["status"] == "partial_success":
         sys.exit(1)
