@@ -1,0 +1,4 @@
+# Minimal requirements for forwarder service
+# Only includes dependencies actually needed by forwarder.py
+
+pika==1.3.2

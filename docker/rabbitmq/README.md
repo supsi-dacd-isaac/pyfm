@@ -1,37 +1,72 @@
 # RabbitMQ for PyFM
 
-Simple RabbitMQ setup for the flexibility command forwarding system.
+Message broker for the flexibility command forwarding system.
 
 ## Quick Start
 
 ```bash
 cd docker/rabbitmq
 
-# Start
+# Start RabbitMQ
 docker-compose up -d
 
-# Check it's running
+# Check status
 docker-compose ps
 
 # Stop
 docker-compose down
 ```
 
-## Connection
+## Connection Details
 
-- **URL**: http://localhost:15672
-- **AMQP Port**: 5672
-- **Username**: `guest`
-- **Password**: `guest`
+| Setting | Value |
+|---------|-------|
+| **Management UI** | http://localhost:15672 |
+| **AMQP Port** | 5672 |
+| **Username** | `guest` |
+| **Password** | `guest` |
 
-## Usage
+## Usage with Forwarder
+
+After starting RabbitMQ, start the forwarder service:
 
 ```bash
-# Start forwarder (Terminal 1)
-python scripts/forwarder.py --dry-run
-
-# Run flexi_manager with RabbitMQ (Terminal 2)
-python scripts/flexi_manager.py --fsp supsi01 --dry-run --rabbitmq
+cd ../forwarder
+docker-compose up -d
 ```
 
-The exchanges and queues are created automatically by the scripts.
+Or run forwarder manually for development:
+
+```bash
+cd ../../scripts
+python forwarder.py --dry-run
+```
+
+## Usage with flexi_manager
+
+Send commands from flexi_manager:
+
+```bash
+cd ../../scripts
+python flexi_manager.py --fsp supsi01 --rabbitmq --dry-run
+```
+
+## Monitoring
+
+```bash
+# View logs
+docker-compose logs -f
+
+# List queues
+docker exec pyfm_rabbitmq rabbitmqctl list_queues name messages consumers
+
+# List connections
+docker exec pyfm_rabbitmq rabbitmqctl list_connections
+
+# Purge a queue
+docker exec pyfm_rabbitmq rabbitmqctl purge_queue asset_commands
+```
+
+## Network
+
+RabbitMQ creates a `pyfm_network` bridge network. Other services can join this network to communicate with RabbitMQ using hostname `rabbitmq` or `pyfm_rabbitmq`.

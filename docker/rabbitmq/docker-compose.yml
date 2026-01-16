@@ -1,10 +1,40 @@
 version: '3.8'
 
+# =============================================================================
+# RabbitMQ Message Broker for PyFM
+# =============================================================================
+#
+# Usage:
+#   docker-compose up -d      # Start RabbitMQ
+#   docker-compose ps         # Check status
+#   docker-compose down       # Stop RabbitMQ
+#
+# Management UI: http://localhost:15672 (guest/guest)
+#
+# =============================================================================
+
 services:
   rabbitmq:
     image: rabbitmq:3-management
     container_name: pyfm_rabbitmq
+    hostname: rabbitmq
     ports:
-      - "5672:5672"
-      - "15672:15672"
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
+    networks:
+      - pyfm_network
+
+networks:
+  pyfm_network:
+    driver: bridge
+    name: pyfm_network

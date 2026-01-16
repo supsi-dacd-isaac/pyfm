@@ -107,7 +107,11 @@ The forwarder is responsible for:
 
 **Key Classes:**
 - `RabbitMQConsumer`: Handles connection and message consumption
-- `DryRunHandler`: Logs commands without actuation (current implementation)
+- `CommandHandler`: Processes commands (dry-run or live mode)
+
+**Deployment Options:**
+- **Docker service**: Runs as container alongside RabbitMQ
+- **Manual execution**: Run directly for development/debugging
 
 ---
 
@@ -134,27 +138,46 @@ pip install -r requirements.txt
 ### Step 2: Start RabbitMQ
 
 ```bash
-# Navigate to RabbitMQ docker folder
 cd docker/rabbitmq
-
-# Start RabbitMQ container
 docker-compose up -d
-
-# Verify it's running
-docker-compose ps
-
-# Check logs
-docker-compose logs -f rabbitmq
 ```
 
-### Step 3: Verify RabbitMQ is Ready
+### Step 3: Start Forwarder
 
-Open the management UI in your browser:
+You have two options:
+
+#### Option A: Docker Service (Production)
+
+```bash
+cd docker/forwarder
+docker-compose up -d
+
+# View logs
+docker-compose logs -f
+```
+
+#### Option B: Manual Execution (Development)
+
+```bash
+cd scripts
+python forwarder.py --dry-run --log-level DEBUG
+```
+
+### Step 4: Verify Services
+
+**RabbitMQ Management UI:**
 - **URL**: http://localhost:15672
-- **Username**: `pyfm` (or `guest`)
-- **Password**: `pyfm_secret` (or `guest`)
+- **Username**: `guest`
+- **Password**: `guest`
 
-You should see the pre-configured exchanges and queues.
+**Check Forwarder logs:**
+```bash
+# If running as Docker service
+cd docker/forwarder
+docker-compose logs -f
+```
+
+The exchanges and queues are created automatically by the scripts.
 
 ---
 
@@ -459,8 +482,94 @@ docker exec pyfm_rabbitmq rabbitmqctl purge_queue asset_commands
 ### Log Files
 
 - **flexi_manager**: Use `--log_file` argument
-- **forwarder**: Use `--log-file` argument  
-- **RabbitMQ**: `docker-compose logs -f rabbitmq`
+- **forwarder (manual)**: Use `--log-file` argument
+- **forwarder (Docker)**: Log file at `docker/forwarder/logs/forwarder.log`
+- **RabbitMQ**: `docker-compose logs -f`
+
+```bash
+# View forwarder console logs (Docker)
+cd docker/forwarder
+docker-compose logs -f
+
+# View forwarder log file
+tail -f logs/forwarder.log
+```
+
+---
+
+## Docker Deployment
+
+The system is deployed as **two separate services** for flexibility and independent scaling.
+
+### 1. Start RabbitMQ
+
+```bash
+cd docker/rabbitmq
+docker-compose up -d
+```
+
+### 2. Start Forwarder
+
+```bash
+cd docker/forwarder
+docker-compose up -d
+```
+
+### Environment Variables
+
+Configure the forwarder via environment variables or `.env` file:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `FORWARDER_MODE` | `dry-run` | `dry-run` or `live` |
+| `FORWARDER_LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
+| `FORWARDER_LOG_FILE` | `/app/logs/forwarder.log` | Log file path (Docker mount: `./logs`) |
+| `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
+| `FORWARDER_QUEUES` | `commands` | Queues: `commands,measurements` |
+| `RABBITMQ_HOST` | `localhost` | RabbitMQ hostname |
+| `RABBITMQ_PORT` | `5672` | RabbitMQ port |
+| `RABBITMQ_USER` | `guest` | RabbitMQ username |
+| `RABBITMQ_PASS` | `guest` | RabbitMQ password |
+| `RABBITMQ_CONNECT_RETRIES` | `10` | Connection retry attempts |
+| `RABBITMQ_CONNECT_RETRY_DELAY` | `5` | Seconds between retries |
+
+### Building the Image
+
+```bash
+# From project root
+docker build -f docker/Dockerfile.forwarder -t pyfm-forwarder .
+
+# Or via docker-compose
+cd docker/forwarder
+docker-compose build
+```
+
+### Viewing Logs
+
+```bash
+# RabbitMQ logs
+cd docker/rabbitmq
+docker-compose logs -f
+
+# Forwarder console logs
+cd docker/forwarder
+docker-compose logs -f
+
+# Forwarder log file
+tail -f docker/forwarder/logs/forwarder.log
+```
+
+### Stopping Services
+
+```bash
+# Stop forwarder
+cd docker/forwarder
+docker-compose down
+
+# Stop RabbitMQ
+cd docker/rabbitmq
+docker-compose down
+```
 
 ---
 
@@ -496,3 +605,4 @@ The current implementation includes dry-run mode only for the forwarder. Future 
 - [README_flexi_manager.md](README_flexi_manager.md) - Detailed flexi_manager documentation
 - [README_trader_fsp.md](README_trader_fsp.md) - FSP trading agent documentation
 - [docker/rabbitmq/README.md](../docker/rabbitmq/README.md) - RabbitMQ Docker setup
+- [docker/forwarder/README.md](../docker/forwarder/README.md) - Forwarder Docker setup

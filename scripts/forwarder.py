@@ -22,6 +22,18 @@ Usage:
     # Custom RabbitMQ configuration
     python forwarder.py --dry-run --rabbitmq-host rabbitmq.local --rabbitmq-port 5672
 
+Environment variables (for Docker/containerized deployment):
+    FORWARDER_MODE          - "dry-run" or "live" (default: dry-run)
+    FORWARDER_LOG_LEVEL     - DEBUG, INFO, WARNING, ERROR (default: INFO)
+    FORWARDER_ASSET_TYPES   - Comma-separated list of asset types to filter
+    FORWARDER_QUEUES        - Comma-separated list: commands,measurements
+    RABBITMQ_HOST           - RabbitMQ hostname (default: localhost)
+    RABBITMQ_PORT           - RabbitMQ port (default: 5672)
+    RABBITMQ_USER           - RabbitMQ username (default: guest)
+    RABBITMQ_PASS           - RabbitMQ password (default: guest)
+    RABBITMQ_VHOST          - RabbitMQ virtual host (default: /)
+    RABBITMQ_EXCHANGE       - RabbitMQ exchange (default: flexi_commands)
+
 Example flow:
     1. flexi_manager.py publishes commands to RabbitMQ exchange 'flexi_commands'
     2. forwarder.py consumes from queue 'asset_commands'
@@ -37,6 +49,11 @@ import signal
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Callable
+
+
+def get_env(name: str, default: str = None) -> str:
+    """Get environment variable with optional default."""
+    return os.environ.get(name, default)
 
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -542,67 +559,70 @@ Examples:
     parser.add_argument(
         "--dry-run", "-d",
         action="store_true",
-        default=True,
-        help="Dry-run mode - log commands without actuating (default)"
+        default=(get_env("FORWARDER_MODE", "dry-run").lower() == "dry-run"),
+        help="Dry-run mode - log commands without actuating (default, env: FORWARDER_MODE)"
     )
     parser.add_argument(
         "--live", "-l",
         action="store_true",
-        help="Live mode - actually forward commands (NOT IMPLEMENTED YET)"
+        default=(get_env("FORWARDER_MODE", "dry-run").lower() == "live"),
+        help="Live mode - actually forward commands (env: FORWARDER_MODE=live)"
     )
     parser.add_argument(
         "--asset-types",
-        help="Comma-separated list of asset types to process (e.g., heat_pump,ev_charger)"
+        default=get_env("FORWARDER_ASSET_TYPES"),
+        help="Comma-separated list of asset types to process (env: FORWARDER_ASSET_TYPES)"
     )
     parser.add_argument(
         "--queues",
-        default="commands",
-        help="Comma-separated list of queues to consume: commands,measurements (default: commands)"
+        default=get_env("FORWARDER_QUEUES", "commands"),
+        help="Comma-separated list of queues to consume (env: FORWARDER_QUEUES)"
     )
     
-    # RabbitMQ arguments
+    # RabbitMQ arguments (with environment variable defaults for Docker)
     parser.add_argument(
         "--rabbitmq-host",
-        default="localhost",
-        help="RabbitMQ server hostname (default: localhost)"
+        default=get_env("RABBITMQ_HOST", "localhost"),
+        help="RabbitMQ server hostname (env: RABBITMQ_HOST)"
     )
     parser.add_argument(
         "--rabbitmq-port",
         type=int,
-        default=5672,
-        help="RabbitMQ server port (default: 5672)"
+        default=int(get_env("RABBITMQ_PORT", "5672")),
+        help="RabbitMQ server port (env: RABBITMQ_PORT)"
     )
     parser.add_argument(
         "--rabbitmq-user",
-        default="guest",
-        help="RabbitMQ username (default: guest)"
+        default=get_env("RABBITMQ_USER", "guest"),
+        help="RabbitMQ username (env: RABBITMQ_USER)"
     )
     parser.add_argument(
         "--rabbitmq-pass",
-        default="guest",
-        help="RabbitMQ password (default: guest)"
+        default=get_env("RABBITMQ_PASS", "guest"),
+        help="RabbitMQ password (env: RABBITMQ_PASS)"
     )
     parser.add_argument(
         "--rabbitmq-vhost",
-        default="/",
-        help="RabbitMQ virtual host (default: /)"
+        default=get_env("RABBITMQ_VHOST", "/"),
+        help="RabbitMQ virtual host (env: RABBITMQ_VHOST)"
     )
     parser.add_argument(
         "--rabbitmq-exchange",
-        default="flexi_commands",
-        help="RabbitMQ exchange name (default: flexi_commands)"
+        default=get_env("RABBITMQ_EXCHANGE", "flexi_commands"),
+        help="RabbitMQ exchange name (env: RABBITMQ_EXCHANGE)"
     )
     
     # Logging arguments
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        default="INFO",
-        help="Logging level (default: INFO)"
+        default=get_env("FORWARDER_LOG_LEVEL", "INFO"),
+        help="Logging level (env: FORWARDER_LOG_LEVEL)"
     )
     parser.add_argument(
         "--log-file",
-        help="Path to log file"
+        default=get_env("FORWARDER_LOG_FILE"),
+        help="Path to log file (env: FORWARDER_LOG_FILE)"
     )
     
     args = parser.parse_args()
@@ -695,9 +715,24 @@ Examples:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    # Connect and start consuming
-    if not consumer.connect():
-        logger.error("Failed to connect to RabbitMQ")
+    # Connect with retry (useful for Docker where RabbitMQ might not be ready yet)
+    max_retries = int(get_env("RABBITMQ_CONNECT_RETRIES", "10"))
+    retry_delay = int(get_env("RABBITMQ_CONNECT_RETRY_DELAY", "5"))
+    
+    connected = False
+    for attempt in range(1, max_retries + 1):
+        logger.info("Connecting to RabbitMQ (attempt %d/%d)...", attempt, max_retries)
+        if consumer.connect():
+            connected = True
+            break
+        else:
+            if attempt < max_retries:
+                logger.warning("Connection failed, retrying in %d seconds...", retry_delay)
+                time.sleep(retry_delay)
+            else:
+                logger.error("Failed to connect to RabbitMQ after %d attempts", max_retries)
+    
+    if not connected:
         sys.exit(1)
     
     try:
