@@ -1,0 +1,45 @@
+FROM python:3.11-slim-bookworm
+
+LABEL maintainer="PyFM Team"
+LABEL description="Forwarder service for flexibility command forwarding"
+
+WORKDIR /app
+
+# No system dependencies needed - pika is pure Python
+
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip
+COPY docker/forwarder/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY scripts/forwarder.py /app/scripts/
+COPY classes/ /app/classes/
+
+# Create logs directory
+RUN mkdir -p /app/logs
+
+# Set Python path
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+
+# Default environment variables
+ENV FORWARDER_MODE=dry-run
+ENV FORWARDER_LOG_LEVEL=INFO
+ENV RABBITMQ_HOST=rabbitmq
+ENV RABBITMQ_PORT=5672
+ENV RABBITMQ_USER=guest
+ENV RABBITMQ_PASS=guest
+ENV RABBITMQ_VHOST=/
+ENV RABBITMQ_EXCHANGE=flexi_commands
+ENV RABBITMQ_CONNECT_RETRIES=10
+ENV RABBITMQ_CONNECT_RETRY_DELAY=5
+
+WORKDIR /app/scripts
+
+# Health check - verify the process is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD pgrep -f "python.*forwarder.py" || exit 1
+
+# Run forwarder
+CMD ["python", "forwarder.py"]
