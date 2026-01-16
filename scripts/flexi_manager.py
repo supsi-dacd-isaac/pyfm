@@ -582,7 +582,7 @@ class AssetController:
             command_payload["discrete_state"] = state_name
         
         # Queue command for RabbitMQ (always, regardless of dry_run)
-        # Note: slot_start/slot_end will be added by publish_pending_commands
+        # Note: slot_start/slot_end and dry_run will be added by publish_pending_commands
         if self.rabbitmq_publisher:
             self._pending_commands.append({
                 "asset_id": asset_id,
@@ -592,20 +592,34 @@ class AssetController:
                 "priority": 7  # High priority for curtailment commands
             })
             result["rabbitmq_queued"] = True
-        
-        if dry_run:
+            
+            # When RabbitMQ is enabled, actuation is delegated to forwarder
             if modulation_type == "discrete":
                 self.logger.info(
-                    "[DRY-RUN] Would set %s (%s) to %s (target: %.2f kW) for %d minutes",
+                    "Queued command: set %s (%s) to %s (target: %.2f kW) for %d minutes",
                     asset_id, description, state_name, target_power_kw, duration_minutes
                 )
             else:
                 self.logger.info(
-                    "[DRY-RUN] Would curtail %s (%s): %.2f kW (target: %.2f kW) for %d minutes",
+                    "Queued command: curtail %s (%s): %.2f kW (target: %.2f kW) for %d minutes",
+                    asset_id, description, curtailment_kw, target_power_kw, duration_minutes
+                )
+            result["status"] = "queued"
+            result["message"] = "Command queued for RabbitMQ - actuation delegated to forwarder"
+        elif dry_run:
+            # Local dry-run (no RabbitMQ)
+            if modulation_type == "discrete":
+                self.logger.info(
+                    "[LOCAL DRY-RUN] Would set %s (%s) to %s (target: %.2f kW) for %d minutes",
+                    asset_id, description, state_name, target_power_kw, duration_minutes
+                )
+            else:
+                self.logger.info(
+                    "[LOCAL DRY-RUN] Would curtail %s (%s): %.2f kW (target: %.2f kW) for %d minutes",
                     asset_id, description, curtailment_kw, target_power_kw, duration_minutes
                 )
             result["status"] = "simulated"
-            result["message"] = "Dry-run mode - no actual command sent"
+            result["message"] = "Local dry-run mode - no actual command sent"
         else:
             # Actual control logic
             try:
@@ -801,7 +815,7 @@ class AssetController:
             # TODO: Implement actual restore logic
             return {"asset_id": asset_id, "status": "success", "action": "restore"}
     
-    def publish_pending_commands(self, slot_info: dict = None) -> int:
+    def publish_pending_commands(self, slot_info: dict = None, dry_run: bool = True) -> int:
         """
         Publish all pending commands to RabbitMQ.
         
@@ -809,6 +823,7 @@ class AssetController:
         batch-publish commands to the message broker.
         
         :param slot_info: Optional slot information for batch header
+        :param dry_run: Whether forwarder should operate in dry-run mode
         :return: Number of successfully published commands
         """
         if not self.rabbitmq_publisher:
@@ -819,11 +834,13 @@ class AssetController:
             self.logger.debug("No pending commands to publish")
             return 0
         
-        self.logger.info("Publishing %d commands to RabbitMQ...", len(self._pending_commands))
+        self.logger.info("Publishing %d commands to RabbitMQ (dry_run=%s)...", 
+                        len(self._pending_commands), dry_run)
         
-        # Add slot_start and slot_end to each command's payload
-        if slot_info:
-            for cmd in self._pending_commands:
+        # Add slot_start, slot_end, and dry_run to each command's payload
+        for cmd in self._pending_commands:
+            cmd["payload"]["dry_run"] = dry_run
+            if slot_info:
                 cmd["payload"]["slot_start"] = slot_info.get("slot_start")
                 cmd["payload"]["slot_end"] = slot_info.get("slot_end")
         
@@ -1845,6 +1862,7 @@ class FlexibilityManager:
         if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
             self.logger.info("-" * 70)
             self.logger.info("Step 4: Publishing commands to RabbitMQ...")
+            self.logger.info("  Forwarder mode: %s", "DRY-RUN" if dry_run else "LIVE ACTUATION")
             
             slot_info = {
                 "fsp_id": self.fsp_id,
@@ -1855,8 +1873,9 @@ class FlexibilityManager:
                 "dry_run": dry_run
             }
             
-            published = self.controller.publish_pending_commands(slot_info)
+            published = self.controller.publish_pending_commands(slot_info, dry_run=dry_run)
             summary["rabbitmq_published"] = published
+            summary["forwarder_dry_run"] = dry_run
             self.logger.info("Published %d commands to RabbitMQ", published)
         
         # Step 5: Save activation records to database

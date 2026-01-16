@@ -87,23 +87,39 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> lo
 # COMMAND HANDLERS (DRY-RUN MODE)
 # =============================================================================
 
-class DryRunHandler:
+class CommandHandler:
     """
-    Handles commands in dry-run mode by logging what would be done.
+    Handles commands received from RabbitMQ.
     
-    In production, this would be replaced with actual protocol handlers
-    (MQTT, HTTP, Modbus, OCPP, etc.).
+    Supports two modes:
+    - dry_run=True: Logs what would be done without actual actuation
+    - dry_run=False: Would send commands to actual devices (NOT IMPLEMENTED YET)
+    
+    The dry_run mode can be:
+    - Set globally via --dry-run flag (overrides message flag)
+    - Read from each message's payload (if no global override)
     """
     
-    def __init__(self, logger: logging.Logger):
+    def __init__(self, logger: logging.Logger, force_dry_run: bool = True):
+        """
+        Initialize command handler.
+        
+        :param logger: Logger instance
+        :param force_dry_run: If True, always use dry-run mode regardless of message flag
+        """
         self.logger = logger
+        self.force_dry_run = force_dry_run
         self.commands_received = 0
         self.commands_by_type = {}
         self.commands_by_asset = {}
     
     def handle_command(self, message: dict) -> bool:
         """
-        Handle a command message in dry-run mode.
+        Handle a command message.
+        
+        Decides whether to actuate based on:
+        1. force_dry_run (global override from --dry-run flag)
+        2. dry_run flag in the message payload
         
         :param message: Command message dictionary
         :return: True if handled successfully
@@ -116,6 +132,13 @@ class DryRunHandler:
         payload = message.get("payload", {})
         timestamp = message.get("timestamp", "")
         
+        # Determine if this should be dry-run
+        # Global force_dry_run takes precedence, otherwise use message flag
+        message_dry_run = payload.get("dry_run", True)
+        is_dry_run = self.force_dry_run or message_dry_run
+        
+        mode_label = "[DRY-RUN]" if is_dry_run else "[LIVE]"
+        
         # Update statistics
         self.commands_by_type[command_type] = self.commands_by_type.get(command_type, 0) + 1
         self.commands_by_asset[asset_id] = self.commands_by_asset.get(asset_id, 0) + 1
@@ -126,7 +149,7 @@ class DryRunHandler:
         
         # Log the command details
         self.logger.info("=" * 60)
-        self.logger.info("[DRY-RUN] COMMAND RECEIVED #%d", self.commands_received)
+        self.logger.info("%s COMMAND RECEIVED #%d", mode_label, self.commands_received)
         self.logger.info("=" * 60)
         self.logger.info("  Asset ID:     %s", asset_id)
         self.logger.info("  Asset Type:   %s", asset_type)
@@ -154,25 +177,40 @@ class DryRunHandler:
             self.logger.info("  Target Power: %.2f kW", target_power)
             self.logger.info("  Duration:     %d minutes", duration)
             
-            # Log what would be done
+            # Execute or simulate
             self.logger.info("-" * 60)
-            if modulation_type == "discrete":
-                self.logger.info(
-                    "[DRY-RUN] Would send %s command to %s (%s) for slot %s",
-                    state, asset_id, payload.get("description", ""), slot_start
-                )
+            if is_dry_run:
+                if modulation_type == "discrete":
+                    self.logger.info(
+                        "%s Would send %s command to %s (%s) for slot %s",
+                        mode_label, state, asset_id, payload.get("description", ""), slot_start
+                    )
+                else:
+                    self.logger.info(
+                        "%s Would set power limit to %.2f kW on %s (%s) for slot %s",
+                        mode_label, target_power, asset_id, payload.get("description", ""), slot_start
+                    )
             else:
-                self.logger.info(
-                    "[DRY-RUN] Would set power limit to %.2f kW on %s (%s) for slot %s",
-                    target_power, asset_id, payload.get("description", ""), slot_start
+                # LIVE MODE - actual actuation would happen here
+                # TODO: Implement actual protocol handlers (MQTT, HTTP, Modbus, OCPP)
+                self.logger.warning(
+                    "%s LIVE ACTUATION NOT IMPLEMENTED - would actuate %s (%s)",
+                    mode_label, asset_id, payload.get("description", "")
                 )
         
         elif command_type == "restore":
             self.logger.info("-" * 60)
-            self.logger.info(
-                "[DRY-RUN] Would restore %s (%s) to normal operation at %s",
-                asset_id, payload.get("description", ""), slot_end
-            )
+            if is_dry_run:
+                self.logger.info(
+                    "%s Would restore %s (%s) to normal operation at %s",
+                    mode_label, asset_id, payload.get("description", ""), slot_end
+                )
+            else:
+                # LIVE MODE
+                self.logger.warning(
+                    "%s LIVE RESTORE NOT IMPLEMENTED - would restore %s (%s)",
+                    mode_label, asset_id, payload.get("description", "")
+                )
         
         else:
             self.logger.info("  Payload:      %s", json.dumps(payload, indent=4))
@@ -573,15 +611,18 @@ Examples:
     logger = setup_logging(args.log_level, args.log_file)
     
     # Determine mode
-    live_mode = args.live
-    if live_mode:
-        logger.error("Live mode is not yet implemented. Use --dry-run.")
-        sys.exit(1)
+    # --dry-run (default) forces all commands to dry-run regardless of message flag
+    # --live allows respecting the dry_run flag from each message
+    force_dry_run = not args.live
     
     logger.info("=" * 60)
     logger.info("FORWARDER - Command/Measurement Forwarding Service")
     logger.info("=" * 60)
-    logger.info("Mode: %s", "LIVE" if live_mode else "DRY-RUN")
+    if force_dry_run:
+        logger.info("Mode: DRY-RUN (forced - all commands will be simulated)")
+    else:
+        logger.info("Mode: LIVE (actuation mode determined by each message)")
+        logger.warning("WARNING: Live actuation is NOT YET IMPLEMENTED!")
     logger.info("RabbitMQ: %s:%d", args.rabbitmq_host, args.rabbitmq_port)
     logger.info("Exchange: %s", args.rabbitmq_exchange)
     logger.info("-" * 60)
@@ -612,7 +653,7 @@ Examples:
     logger.info("Queues: %s", queues_to_consume)
     
     # Create handler
-    handler = DryRunHandler(logger)
+    handler = CommandHandler(logger, force_dry_run=force_dry_run)
     
     # Create consumer
     consumer = RabbitMQConsumer(
