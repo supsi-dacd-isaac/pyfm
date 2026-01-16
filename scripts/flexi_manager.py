@@ -27,10 +27,312 @@ from typing import Dict, List, Optional, Tuple
 # Add parent directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# RabbitMQ support (optional)
+try:
+    import pika
+    RABBITMQ_AVAILABLE = True
+except ImportError:
+    RABBITMQ_AVAILABLE = False
+
 from classes.nodes_interface import NODESInterface as NodesInterface
 from classes.postgresql_interface import PostgreSQLInterface
 from classes.bid_record_repository import BidRecordRepository
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
+
+
+# =============================================================================
+# RABBITMQ PUBLISHER
+# =============================================================================
+
+class RabbitMQPublisher:
+    """
+    Publishes control commands and measurements to RabbitMQ for forwarding.
+    
+    This enables decoupling of command generation (flexi_manager) from
+    command actuation (forwarder), allowing for better scalability and
+    reliable message delivery.
+    
+    Exchange: flexi_commands (topic exchange)
+    Routing keys:
+        - commands.{asset_type}.{asset_id}   - Control commands
+        - measurements.{asset_type}.{asset_id} - Measurement data
+    """
+    
+    DEFAULT_EXCHANGE = "flexi_commands"
+    DEFAULT_QUEUE_COMMANDS = "asset_commands"
+    DEFAULT_QUEUE_MEASUREMENTS = "asset_measurements"
+    
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5672,
+        username: str = "guest",
+        password: str = "guest",
+        virtual_host: str = "/",
+        exchange: str = None,
+        logger: logging.Logger = None
+    ):
+        """
+        Initialize RabbitMQ publisher.
+        
+        :param host: RabbitMQ server hostname
+        :param port: RabbitMQ server port
+        :param username: RabbitMQ username
+        :param password: RabbitMQ password
+        :param virtual_host: RabbitMQ virtual host
+        :param exchange: Exchange name (default: flexi_commands)
+        :param logger: Logger instance
+        """
+        if not RABBITMQ_AVAILABLE:
+            raise RuntimeError("pika library not installed. Run: pip install pika")
+        
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.virtual_host = virtual_host
+        self.exchange = exchange or self.DEFAULT_EXCHANGE
+        self.logger = logger or logging.getLogger(__name__)
+        
+        self.connection = None
+        self.channel = None
+        self._connected = False
+    
+    def connect(self) -> bool:
+        """
+        Establish connection to RabbitMQ server.
+        
+        :return: True if connected successfully
+        """
+        try:
+            credentials = pika.PlainCredentials(self.username, self.password)
+            parameters = pika.ConnectionParameters(
+                host=self.host,
+                port=self.port,
+                virtual_host=self.virtual_host,
+                credentials=credentials,
+                heartbeat=600,
+                blocked_connection_timeout=300
+            )
+            
+            self.connection = pika.BlockingConnection(parameters)
+            self.channel = self.connection.channel()
+            
+            # Declare exchange (topic type for flexible routing)
+            self.channel.exchange_declare(
+                exchange=self.exchange,
+                exchange_type='topic',
+                durable=True
+            )
+            
+            # Declare queues
+            self.channel.queue_declare(
+                queue=self.DEFAULT_QUEUE_COMMANDS,
+                durable=True
+            )
+            self.channel.queue_declare(
+                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
+                durable=True
+            )
+            
+            # Bind queues to exchange with routing patterns
+            self.channel.queue_bind(
+                exchange=self.exchange,
+                queue=self.DEFAULT_QUEUE_COMMANDS,
+                routing_key="commands.#"
+            )
+            self.channel.queue_bind(
+                exchange=self.exchange,
+                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
+                routing_key="measurements.#"
+            )
+            
+            self._connected = True
+            self.logger.info(
+                "Connected to RabbitMQ at %s:%d (exchange: %s)",
+                self.host, self.port, self.exchange
+            )
+            return True
+            
+        except Exception as e:
+            self.logger.error("Failed to connect to RabbitMQ: %s", str(e))
+            self._connected = False
+            return False
+    
+    def disconnect(self):
+        """Close RabbitMQ connection."""
+        if self.connection and self.connection.is_open:
+            try:
+                self.connection.close()
+                self.logger.info("Disconnected from RabbitMQ")
+            except Exception as e:
+                self.logger.warning("Error closing RabbitMQ connection: %s", str(e))
+        self._connected = False
+    
+    def is_connected(self) -> bool:
+        """Check if connected to RabbitMQ."""
+        return self._connected and self.connection and self.connection.is_open
+    
+    def publish_command(
+        self,
+        asset_id: str,
+        asset_type: str,
+        command_type: str,
+        payload: dict,
+        priority: int = 5
+    ) -> bool:
+        """
+        Publish a control command to RabbitMQ.
+        
+        :param asset_id: Asset identifier
+        :param asset_type: Asset type (heat_pump, ev_charger, etc.)
+        :param command_type: Command type (curtail, restore, set_power, etc.)
+        :param payload: Command payload dictionary
+        :param priority: Message priority (0-9, higher = more urgent)
+        :return: True if published successfully
+        """
+        if not self.is_connected():
+            self.logger.warning("Not connected to RabbitMQ - cannot publish command")
+            return False
+        
+        routing_key = f"commands.{asset_type}.{asset_id}"
+        
+        message = {
+            "message_type": "command",
+            "asset_id": asset_id,
+            "asset_type": asset_type,
+            "command_type": command_type,
+            "payload": payload,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "priority": priority
+        }
+        
+        try:
+            self.channel.basic_publish(
+                exchange=self.exchange,
+                routing_key=routing_key,
+                body=json.dumps(message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,  # Persistent message
+                    content_type='application/json',
+                    priority=priority
+                )
+            )
+            self.logger.debug(
+                "Published command to %s: %s -> %s",
+                routing_key, command_type, asset_id
+            )
+            return True
+            
+        except Exception as e:
+            self.logger.error("Failed to publish command: %s", str(e))
+            return False
+    
+    def publish_measurement(
+        self,
+        asset_id: str,
+        asset_type: str,
+        measurement_type: str,
+        payload: dict
+    ) -> bool:
+        """
+        Publish a measurement to RabbitMQ.
+        
+        :param asset_id: Asset identifier
+        :param asset_type: Asset type
+        :param measurement_type: Measurement type (power, energy, status, etc.)
+        :param payload: Measurement payload dictionary
+        :return: True if published successfully
+        """
+        if not self.is_connected():
+            self.logger.warning("Not connected to RabbitMQ - cannot publish measurement")
+            return False
+        
+        routing_key = f"measurements.{asset_type}.{asset_id}"
+        
+        message = {
+            "message_type": "measurement",
+            "asset_id": asset_id,
+            "asset_type": asset_type,
+            "measurement_type": measurement_type,
+            "payload": payload,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        try:
+            self.channel.basic_publish(
+                exchange=self.exchange,
+                routing_key=routing_key,
+                body=json.dumps(message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,
+                    content_type='application/json'
+                )
+            )
+            self.logger.debug(
+                "Published measurement to %s: %s -> %s",
+                routing_key, measurement_type, asset_id
+            )
+            return True
+            
+        except Exception as e:
+            self.logger.error("Failed to publish measurement: %s", str(e))
+            return False
+    
+    def publish_batch_commands(
+        self,
+        commands: List[dict],
+        slot_info: dict = None
+    ) -> int:
+        """
+        Publish multiple commands as a batch.
+        
+        :param commands: List of command dictionaries
+        :param slot_info: Optional slot information to include
+        :return: Number of successfully published commands
+        """
+        if not self.is_connected():
+            self.logger.warning("Not connected to RabbitMQ - cannot publish batch")
+            return 0
+        
+        success_count = 0
+        
+        # Optionally publish a batch header
+        if slot_info:
+            batch_header = {
+                "message_type": "batch_start",
+                "slot_info": slot_info,
+                "command_count": len(commands),
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            try:
+                self.channel.basic_publish(
+                    exchange=self.exchange,
+                    routing_key="commands.batch.header",
+                    body=json.dumps(batch_header),
+                    properties=pika.BasicProperties(
+                        delivery_mode=2,
+                        content_type='application/json'
+                    )
+                )
+            except Exception as e:
+                self.logger.warning("Failed to publish batch header: %s", str(e))
+        
+        for cmd in commands:
+            if self.publish_command(
+                asset_id=cmd.get("asset_id"),
+                asset_type=cmd.get("asset_type"),
+                command_type=cmd.get("command_type"),
+                payload=cmd.get("payload", {}),
+                priority=cmd.get("priority", 5)
+            ):
+                success_count += 1
+        
+        self.logger.info(
+            "Published %d/%d commands to RabbitMQ",
+            success_count, len(commands)
+        )
+        return success_count
 
 
 # =============================================================================
@@ -135,6 +437,7 @@ class AssetController:
     - MQTT: For IoT devices
     - HTTP API: For smart devices with REST APIs
     - Modbus: For industrial equipment
+    - RabbitMQ: For decoupled command forwarding via message broker
     - Simulation: For testing (logs only)
     
     Modulation-aware control:
@@ -142,10 +445,17 @@ class AssetController:
     - Continuous assets (e.g., EV chargers): Sends power setpoint commands
     """
     
-    def __init__(self, asset_mapping: dict, logger: logging.Logger):
+    def __init__(
+        self, 
+        asset_mapping: dict, 
+        logger: logging.Logger,
+        rabbitmq_publisher: 'RabbitMQPublisher' = None
+    ):
         self.asset_mapping = asset_mapping
         self.logger = logger
         self.control_results = {}
+        self.rabbitmq_publisher = rabbitmq_publisher
+        self._pending_commands = []  # Buffer for batch publishing
     
     def _get_modulation_type(self, asset_config: dict) -> str:
         """
@@ -253,6 +563,35 @@ class AssetController:
         
         if modulation_type == "discrete":
             result["discrete_state"] = state_name
+        
+        # Build command payload for RabbitMQ
+        command_payload = {
+            "asset_id": asset_id,
+            "description": description,
+            "asset_type": asset_type,
+            "modulation_type": modulation_type,
+            "requested_curtailment_kw": curtailment_kw,
+            "actual_curtailment_kw": actual_curtailment_kw,
+            "target_power_kw": target_power_kw,
+            "capacity_kw": capacity_kw,
+            "duration_minutes": duration_minutes,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+        if modulation_type == "discrete":
+            command_payload["discrete_state"] = state_name
+        
+        # Queue command for RabbitMQ (always, regardless of dry_run)
+        # Note: slot_start/slot_end will be added by publish_pending_commands
+        if self.rabbitmq_publisher:
+            self._pending_commands.append({
+                "asset_id": asset_id,
+                "asset_type": asset_type,
+                "command_type": "curtail",
+                "payload": command_payload,
+                "priority": 7  # High priority for curtailment commands
+            })
+            result["rabbitmq_queued"] = True
         
         if dry_run:
             if modulation_type == "discrete":
@@ -435,6 +774,24 @@ class AssetController:
         """
         asset_config = self.asset_mapping.get(asset_id, {})
         description = asset_config.get("description", asset_id)
+        asset_type = asset_config.get("type", "unknown")
+        
+        # Queue restore command for RabbitMQ
+        if self.rabbitmq_publisher:
+            restore_payload = {
+                "asset_id": asset_id,
+                "description": description,
+                "asset_type": asset_type,
+                "action": "restore",
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            self._pending_commands.append({
+                "asset_id": asset_id,
+                "asset_type": asset_type,
+                "command_type": "restore",
+                "payload": restore_payload,
+                "priority": 5
+            })
         
         if dry_run:
             self.logger.info("[DRY-RUN] Would restore %s (%s) to normal operation", asset_id, description)
@@ -443,6 +800,50 @@ class AssetController:
             self.logger.info("Restoring %s (%s) to normal operation", asset_id, description)
             # TODO: Implement actual restore logic
             return {"asset_id": asset_id, "status": "success", "action": "restore"}
+    
+    def publish_pending_commands(self, slot_info: dict = None) -> int:
+        """
+        Publish all pending commands to RabbitMQ.
+        
+        This method should be called after all curtail_asset calls to
+        batch-publish commands to the message broker.
+        
+        :param slot_info: Optional slot information for batch header
+        :return: Number of successfully published commands
+        """
+        if not self.rabbitmq_publisher:
+            self.logger.debug("No RabbitMQ publisher configured - skipping publish")
+            return 0
+        
+        if not self._pending_commands:
+            self.logger.debug("No pending commands to publish")
+            return 0
+        
+        self.logger.info("Publishing %d commands to RabbitMQ...", len(self._pending_commands))
+        
+        # Add slot_start and slot_end to each command's payload
+        if slot_info:
+            for cmd in self._pending_commands:
+                cmd["payload"]["slot_start"] = slot_info.get("slot_start")
+                cmd["payload"]["slot_end"] = slot_info.get("slot_end")
+        
+        published = self.rabbitmq_publisher.publish_batch_commands(
+            self._pending_commands,
+            slot_info=slot_info
+        )
+        
+        # Clear pending commands after publishing
+        self._pending_commands = []
+        
+        return published
+    
+    def get_pending_commands(self) -> List[dict]:
+        """Get list of pending commands (for inspection/logging)."""
+        return self._pending_commands.copy()
+    
+    def clear_pending_commands(self):
+        """Clear pending commands without publishing."""
+        self._pending_commands = []
 
 
 # =============================================================================
@@ -1108,7 +1509,8 @@ class FlexibilityManager:
         nodes_interface: NodesInterface,
         bid_repo: BidRecordRepository,
         logger: logging.Logger,
-        nodes_authenticated: bool = False
+        nodes_authenticated: bool = False,
+        rabbitmq_publisher: 'RabbitMQPublisher' = None
     ):
         self.config = config
         self.fsp_id = fsp_id
@@ -1117,6 +1519,7 @@ class FlexibilityManager:
         self.logger = logger
         self.bid_repo = bid_repo
         self.nodes_authenticated = nodes_authenticated
+        self.rabbitmq_publisher = rabbitmq_publisher
         
         # Get FSP's allowed assets (default from config)
         self.fsp_assets = self.fsp_config.get("assets", list(self.asset_mapping.keys()))
@@ -1127,7 +1530,7 @@ class FlexibilityManager:
         # Initialize components
         self.market_handler = MarketResultsHandler(nodes_interface, logger)
         self.allocator = FlexibilityAllocator(self.asset_mapping, logger)
-        self.controller = AssetController(self.asset_mapping, logger)
+        self.controller = AssetController(self.asset_mapping, logger, rabbitmq_publisher)
         self.bid_handler = BidRecordHandler(bid_repo, logger)
         
         # Get organization ID from NODES only if authenticated
@@ -1438,10 +1841,28 @@ class FlexibilityManager:
             )
             summary["control_results"][asset_id] = result
         
-        # Step 4: Save activation records to database
+        # Step 4: Publish commands to RabbitMQ (if configured)
+        if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+            self.logger.info("-" * 70)
+            self.logger.info("Step 4: Publishing commands to RabbitMQ...")
+            
+            slot_info = {
+                "fsp_id": self.fsp_id,
+                "slot_start": slot_start.isoformat(),
+                "slot_end": slot_end.isoformat(),
+                "total_flexibility_kw": total_sold_kw,
+                "allocation_strategy": allocation_strategy,
+                "dry_run": dry_run
+            }
+            
+            published = self.controller.publish_pending_commands(slot_info)
+            summary["rabbitmq_published"] = published
+            self.logger.info("Published %d commands to RabbitMQ", published)
+        
+        # Step 5: Save activation records to database
         if self.bid_repo:
             self.logger.info("-" * 70)
-            self.logger.info("Step 4: Saving activation records to database...")
+            self.logger.info("Step 5: Saving activation records to database...")
             
             # Get bid record ID if available
             bid_record = summary.get("bid_record")
@@ -1589,6 +2010,44 @@ Examples:
         help="Output file for JSON summary"
     )
     
+    # RabbitMQ arguments
+    parser.add_argument(
+        "--rabbitmq",
+        action="store_true",
+        help="Enable RabbitMQ message publishing for command forwarding"
+    )
+    parser.add_argument(
+        "--rabbitmq-host",
+        default="localhost",
+        help="RabbitMQ server hostname (default: localhost)"
+    )
+    parser.add_argument(
+        "--rabbitmq-port",
+        type=int,
+        default=5672,
+        help="RabbitMQ server port (default: 5672)"
+    )
+    parser.add_argument(
+        "--rabbitmq-user",
+        default="guest",
+        help="RabbitMQ username (default: guest)"
+    )
+    parser.add_argument(
+        "--rabbitmq-pass",
+        default="guest",
+        help="RabbitMQ password (default: guest)"
+    )
+    parser.add_argument(
+        "--rabbitmq-vhost",
+        default="/",
+        help="RabbitMQ virtual host (default: /)"
+    )
+    parser.add_argument(
+        "--rabbitmq-exchange",
+        default="flexi_commands",
+        help="RabbitMQ exchange name (default: flexi_commands)"
+    )
+    
     args = parser.parse_args()
     
     # Setup logging
@@ -1674,11 +2133,38 @@ Examples:
     except Exception as e:
         logger.warning("Error loading connections: %s - running in offline mode", str(e))
     
+    # Initialize RabbitMQ publisher if requested
+    rabbitmq_publisher = None
+    if args.rabbitmq:
+        if not RABBITMQ_AVAILABLE:
+            logger.error("RabbitMQ requested but pika library not installed. Run: pip install pika")
+            sys.exit(1)
+        
+        try:
+            rabbitmq_publisher = RabbitMQPublisher(
+                host=args.rabbitmq_host,
+                port=args.rabbitmq_port,
+                username=args.rabbitmq_user,
+                password=args.rabbitmq_pass,
+                virtual_host=args.rabbitmq_vhost,
+                exchange=args.rabbitmq_exchange,
+                logger=logger
+            )
+            if rabbitmq_publisher.connect():
+                logger.info("RabbitMQ publisher initialized successfully")
+            else:
+                logger.warning("Could not connect to RabbitMQ - continuing without message publishing")
+                rabbitmq_publisher = None
+        except Exception as e:
+            logger.warning("Failed to initialize RabbitMQ publisher: %s", str(e))
+            rabbitmq_publisher = None
+    
     # Create and run flexibility manager
     if nodes_interface or bid_repo:
         manager = FlexibilityManager(
             config, args.fsp, nodes_interface, bid_repo, logger,
-            nodes_authenticated=nodes_authenticated
+            nodes_authenticated=nodes_authenticated,
+            rabbitmq_publisher=rabbitmq_publisher
         )
     else:
         # Create a mock manager for testing
@@ -1692,7 +2178,8 @@ Examples:
         
         manager = FlexibilityManager(
             config, args.fsp, MockNodesInterface(), None, logger,
-            nodes_authenticated=False
+            nodes_authenticated=False,
+            rabbitmq_publisher=rabbitmq_publisher
         )
     
     # Determine slot override from --slot or --offset
@@ -1723,6 +2210,10 @@ Examples:
         with open(args.output, "w") as f:
             json.dump(summary, f, indent=2)
         logger.info("Summary written to %s", args.output)
+    
+    # Cleanup RabbitMQ connection
+    if rabbitmq_publisher:
+        rabbitmq_publisher.disconnect()
     
     # Exit code based on status
     if summary["status"] == "success":
