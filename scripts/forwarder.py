@@ -47,7 +47,7 @@ import argparse
 import logging
 import signal
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Any
 from urllib.parse import urlparse, urlunparse
 
@@ -150,8 +150,8 @@ def _to_on_off(value: Any) -> Optional[bool]:
     return None
 
 
-def _format_datetime_utc(value: Any) -> Optional[str]:
-    """Parse an ISO-like datetime and return a UTC naive ISO string."""
+def _coerce_datetime_utc_naive(value: Any) -> Optional[datetime]:
+    """Parse an ISO-like datetime and return a naive UTC datetime."""
     if not value:
         return None
     if isinstance(value, datetime):
@@ -166,8 +166,34 @@ def _format_datetime_utc(value: Any) -> Optional[str]:
 
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _format_datetime_utc(value: Any) -> Optional[str]:
+    """Parse an ISO-like datetime and return a UTC naive ISO string."""
+    dt = _coerce_datetime_utc_naive(value)
+    if dt is None:
+        return None
     return dt.isoformat()
+
+
+def _utc_now_naive() -> datetime:
+    """Return current UTC time as a naive datetime."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _format_datetime_utc_future_minute(value: Any, now: Optional[datetime] = None) -> Optional[str]:
+    """Return the later of the mapped time and the upcoming UTC minute."""
+    dt = _coerce_datetime_utc_naive(value)
+    if dt is None:
+        return None
+
+    reference_now = now if now is not None else _utc_now_naive()
+    if reference_now.tzinfo is not None:
+        reference_now = reference_now.astimezone(timezone.utc).replace(tzinfo=None)
+
+    next_minute = reference_now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return max(dt, next_minute).isoformat(timespec="seconds")
 
 
 def _render_template(template: str, context: dict) -> str:
@@ -203,6 +229,9 @@ def _apply_template(template: Any, context: dict) -> Any:
                 return converted if converted is not None else value
             if value_type == "datetime_utc":
                 converted = _format_datetime_utc(value)
+                return converted if converted is not None else value
+            if value_type == "datetime_utc_future_minute":
+                converted = _format_datetime_utc_future_minute(value)
                 return converted if converted is not None else value
             return value
         return {k: _apply_template(v, context) for k, v in template.items()}

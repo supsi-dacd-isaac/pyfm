@@ -12,7 +12,7 @@
       "endpoint_template": "{api.controlUrl}/{payload.community}/{payload.site_id}/{payload.asset_id}",
       "body_template": {
         "power": {"$map": ["payload.discrete_state", "payload.target_state", "target_state"], "type": "on_off"},
-        "time": {"$map": "payload.slot_start", "type": "datetime_utc"}
+        "time": {"$map": "payload.slot_start", "type": "datetime_utc_future_minute"}
       },
       "endpoint_overrides": {
         "ECM96.2": "/ECM/ECM96/hp"
