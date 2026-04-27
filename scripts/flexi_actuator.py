@@ -40,6 +40,8 @@ MODULATION_DEFAULTS = {
     "ev_charger": {"modulation_type": "continuous"},
 }
 
+DEFAULT_EV_INTERVAL_MINUTES = 15
+
 
 class RabbitMQPublisher:
     """
@@ -440,12 +442,14 @@ def _build_restore_command(
     asset_config: dict,
     community: Optional[str],
     original_command: str,
+    duration_minutes: int,
     logger: logging.Logger,
 ) -> tuple:
     """Build a manager-compatible restore command envelope."""
     asset_type = asset_config.get("type", "unknown")
     description = asset_config.get("description", asset_id)
     site_id = asset_config.get("pod", "")
+    capacity_kw = float(asset_config.get("capacity_kw", 0) or 0)
 
     payload = {
         "community": community,
@@ -454,11 +458,34 @@ def _build_restore_command(
         "description": description,
         "asset_type": asset_type,
         "action": "restore",
+        "duration_minutes": duration_minutes,
+        "capacity_kw": capacity_kw,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "requested_command": original_command,
     }
 
-    logger.info("Queued restore command for %s (%s)", asset_id, description)
+    if asset_type == "ev_charger":
+        if asset_config.get("restore_power_kw") is not None:
+            restore_power_kw = float(asset_config.get("restore_power_kw"))
+            restore_source = "restore_power_kw"
+        elif asset_config.get("default_power_kw") is not None:
+            restore_power_kw = float(asset_config.get("default_power_kw"))
+            restore_source = "default_power_kw"
+        else:
+            restore_power_kw = capacity_kw
+            restore_source = "capacity_kw"
+
+        payload["target_power_kw"] = restore_power_kw
+        payload["power_kw"] = restore_power_kw
+        logger.info(
+            "Queued EV restore command for %s (%s) using %s=%.2f kW",
+            asset_id,
+            description,
+            restore_source,
+            restore_power_kw,
+        )
+    else:
+        logger.info("Queued restore command for %s (%s)", asset_id, description)
 
     command = {
         "asset_id": asset_id,
@@ -510,6 +537,7 @@ def _build_rabbitmq_command(
             asset_config=asset_config,
             community=community,
             original_command=original_command,
+            duration_minutes=duration_minutes,
             logger=logger,
         )
 
@@ -532,6 +560,7 @@ def _build_slot_info(
         "fsp_id": fsp,
         "slot_start": slot_start.isoformat(),
         "slot_end": slot_end.isoformat(),
+        "duration_minutes": duration_minutes,
         "total_flexibility_kw": total_flexibility_kw,
         "allocation_strategy": "manual_actuation",
         "strategy_id": "",
@@ -541,6 +570,142 @@ def _build_slot_info(
     }
 
 
+def _ceil_to_next_interval(dt: datetime, interval_minutes: int = DEFAULT_EV_INTERVAL_MINUTES) -> datetime:
+    """Round to the next UTC interval boundary, never the current instant."""
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be a positive integer")
+
+    if dt.tzinfo is None:
+        dt_utc = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt_utc = dt.astimezone(timezone.utc)
+
+    base = dt_utc.replace(second=0, microsecond=0)
+    minutes_to_add = interval_minutes - (base.minute % interval_minutes)
+    if minutes_to_add == 0:
+        minutes_to_add = interval_minutes
+    return base + timedelta(minutes=minutes_to_add)
+
+
+def _format_aem_utc(dt: datetime) -> str:
+    """Format a datetime as a UTC naive ISO string with second precision."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def _build_ev_schedule(
+    slot_start: datetime,
+    slot_end: datetime,
+    power_kw: float,
+    interval_minutes: int = DEFAULT_EV_INTERVAL_MINUTES,
+) -> dict:
+    """Build an EV power schedule using clean UTC timestamps."""
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be a positive integer")
+
+    power_value = float(power_kw)
+    schedule = {}
+    current = slot_start
+
+    while current < slot_end:
+        schedule[_format_aem_utc(current)] = power_value
+        current += timedelta(minutes=interval_minutes)
+
+    if not schedule:
+        raise ValueError(
+            f"EV schedule is empty for start={_format_aem_utc(slot_start)} end={_format_aem_utc(slot_end)}"
+        )
+
+    return schedule
+
+
+def _get_command_duration_minutes(payload: dict, slot_info: dict) -> int:
+    """Resolve the command duration from payload or batch metadata."""
+    duration_value = payload.get("duration_minutes")
+    if duration_value is None:
+        duration_value = slot_info.get("duration_minutes")
+
+    duration_minutes = int(duration_value or 0)
+    if duration_minutes <= 0:
+        raise ValueError(f"Invalid duration_minutes for command: {duration_value!r}")
+
+    return duration_minutes
+
+
+def _add_ev_schedule_to_payload(
+    command: dict,
+    slot_start: datetime,
+    slot_end: datetime,
+    interval_minutes: int,
+    logger: logging.Logger,
+) -> None:
+    """Inject a clean future EV schedule into the command payload."""
+    payload = command.get("payload", {})
+    asset_id = command.get("asset_id", "unknown")
+
+    power_kw = payload.get("power_kw")
+    if power_kw is None:
+        power_kw = payload.get("target_power_kw")
+    if power_kw is None:
+        raise ValueError(f"EV command for {asset_id} is missing power_kw/target_power_kw")
+
+    power_value = float(power_kw)
+    payload["target_power_kw"] = power_value
+    payload["power_kw"] = power_value
+    payload["slot_start"] = _format_aem_utc(slot_start)
+    payload["slot_end"] = _format_aem_utc(slot_end)
+    payload["schedule"] = _build_ev_schedule(
+        slot_start=slot_start,
+        slot_end=slot_end,
+        power_kw=power_value,
+        interval_minutes=interval_minutes,
+    )
+
+    logger.info(
+        "EV schedule for %s: power=%.2f kW, start=%s, end=%s, points=%d",
+        asset_id,
+        power_value,
+        payload["slot_start"],
+        payload["slot_end"],
+        len(payload["schedule"]),
+    )
+
+
+def _prepare_commands_for_publish(
+    commands: List[dict],
+    slot_info: dict,
+    dry_run: bool,
+    ev_interval_minutes: int,
+    logger: logging.Logger,
+) -> None:
+    """Apply runtime payload fields to all commands before publish or dry-run output."""
+    ev_slot_start = None
+
+    for command in commands:
+        payload = command.setdefault("payload", {})
+        payload["dry_run"] = dry_run
+
+        if command.get("asset_type") == "ev_charger":
+            if ev_slot_start is None:
+                ev_slot_start = _ceil_to_next_interval(
+                    datetime.now(timezone.utc),
+                    interval_minutes=ev_interval_minutes,
+                )
+            duration_minutes = _get_command_duration_minutes(payload, slot_info)
+            ev_slot_end = ev_slot_start + timedelta(minutes=duration_minutes)
+            _add_ev_schedule_to_payload(
+                command=command,
+                slot_start=ev_slot_start,
+                slot_end=ev_slot_end,
+                interval_minutes=ev_interval_minutes,
+                logger=logger,
+            )
+        else:
+            payload["slot_start"] = slot_info.get("slot_start")
+            payload["slot_end"] = slot_info.get("slot_end")
+
+
 def _publish_commands(
     publisher: RabbitMQPublisher,
     commands: List[dict],
@@ -548,14 +713,8 @@ def _publish_commands(
     dry_run: bool,
     logger: logging.Logger,
 ) -> int:
-    """Add runtime payload fields and publish the queued commands."""
+    """Publish already-prepared commands to RabbitMQ."""
     logger.info("Publishing %d commands to RabbitMQ (dry_run=%s)...", len(commands), dry_run)
-
-    for command in commands:
-        command["payload"]["dry_run"] = dry_run
-        command["payload"]["slot_start"] = slot_info.get("slot_start")
-        command["payload"]["slot_end"] = slot_info.get("slot_end")
-
     return publisher.publish_batch_commands(commands, slot_info=slot_info)
 
 
@@ -568,6 +727,9 @@ Examples:
   python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibilities ECM96.2 ECM97.1 --command force_off
   python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --flexibility ECM97.1 --command force_off
   python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibilities ECM96.2 --command force_on --dry-run
+  python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM63.1 --command force_off --dry-run
+  python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM63.1 --command force_on --duration-minutes 30 --dry-run
+  python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM63.1 --command restore --dry-run
         """
     )
 
@@ -600,6 +762,12 @@ Examples:
         "--duration-minutes",
         type=int,
         help="Command duration in minutes (default: config fm.granularity or 15)",
+    )
+    parser.add_argument(
+        "--ev-interval-minutes",
+        type=int,
+        default=DEFAULT_EV_INTERVAL_MINUTES,
+        help=f"EV schedule interval in minutes (default: {DEFAULT_EV_INTERVAL_MINUTES})",
     )
     parser.add_argument(
         "--dry-run",
@@ -677,16 +845,11 @@ Examples:
     if duration_minutes <= 0:
         logger.error("Duration must be a positive integer")
         sys.exit(1)
+    if args.ev_interval_minutes <= 0:
+        logger.error("EV interval must be a positive integer")
+        sys.exit(1)
 
     logger.info("Requested actuator payload: %s", json.dumps(command_map, indent=2))
-
-    if args.dry_run:
-        logger.info("[DRY-RUN] Skipping RabbitMQ publish")
-        sys.exit(0)
-
-    if not RABBITMQ_AVAILABLE:
-        logger.error("pika library not installed. Run: pip install pika")
-        sys.exit(1)
 
     community = config.get("fm", {}).get("community")
     asset_mapping = config.get("asset_mapping", {})
@@ -714,10 +877,28 @@ Examples:
         fsp=args.fsp,
         command_map=command_map,
         duration_minutes=duration_minutes,
-        dry_run=False,
+        dry_run=args.dry_run,
         normalized_command=normalized_command,
         total_flexibility_kw=total_flexibility_kw,
     )
+
+    _prepare_commands_for_publish(
+        commands=commands,
+        slot_info=slot_info,
+        dry_run=args.dry_run,
+        ev_interval_minutes=args.ev_interval_minutes,
+        logger=logger,
+    )
+
+    if args.dry_run:
+        logger.info("[DRY-RUN] Final slot_info:\n%s", json.dumps(slot_info, indent=2))
+        logger.info("[DRY-RUN] Final command envelopes:\n%s", json.dumps(commands, indent=2))
+        logger.info("[DRY-RUN] Skipping RabbitMQ publish")
+        sys.exit(0)
+
+    if not RABBITMQ_AVAILABLE:
+        logger.error("pika library not installed. Run: pip install pika")
+        sys.exit(1)
 
     publisher = RabbitMQPublisher(
         host=args.rabbitmq_host,
