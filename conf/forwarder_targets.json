@@ -1,0 +1,22 @@
+{
+  "targets": [
+    {
+      "name": "aem-api",
+      "reference_api": "aemAPITest",
+      "timeout": 5.0,
+      "verify_ssl": false,
+      "enabled": true,
+      "asset_types": null,
+      "asset_ids": null,
+      "description": "AEM API (test instance)",
+      "endpoint_template": "{api.controlUrl}/{payload.community}/{payload.site_id}/{payload.asset_id}",
+      "body_template": {
+        "power": {"$map": ["payload.discrete_state", "payload.target_state", "target_state"], "type": "on_off"},
+        "time": {"$map": "payload.slot_start", "type": "datetime_utc"}
+      }
+    }
+  ],
+  "default_timeout": 5.0,
+  "retry_on_failure": false,
+  "max_retries": 3
+}
