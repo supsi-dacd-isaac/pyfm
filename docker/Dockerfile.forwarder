@@ -41,7 +41,7 @@ WORKDIR /app/scripts
 
 # Health check - verify the process is running
 HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
-    CMD pgrep -f "python.*forwarder.py" || exit 1
+    CMD python -c "import sys; cmd=open('/proc/1/cmdline','rb').read().decode('latin1'); sys.exit(0 if 'forwarder.py' in cmd else 1)"
 
 # Run forwarder
 CMD ["python", "forwarder.py"]
