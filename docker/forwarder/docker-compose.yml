@@ -1,66 +1,72 @@
 # =============================================================================
-# Forwarder Service for PyFM
-# =============================================================================
-#
-# Command forwarding service that receives commands from RabbitMQ and 
-# forwards them to actual devices.
-#
-# Prerequisites:
-#   - RabbitMQ must be running (docker/rabbitmq)
-#
-# Usage:
-#   docker-compose up -d         # Start forwarder
-#   docker-compose logs -f       # View logs (console + file)
-#   docker-compose down          # Stop forwarder
-#   docker-compose up --build    # Rebuild and start
-#
-# Logs are written to: ./logs/forwarder.log
-#
-# =============================================================================
+  # Forwarder Service for PyFM
+  # =============================================================================
+  #
+  # Command forwarding service that receives commands from RabbitMQ and
+  # forwards them to actual devices.
+  #
+  # Prerequisites:
+  #   - RabbitMQ must be running (docker/rabbitmq)
+  #   - aem-server-simulator must be running (docker/aem-server-simulator)
+  #
+  # Usage:
+  #   docker-compose up -d         # Start forwarder
+  #   docker-compose logs -f       # View logs (console + file)
+  #   docker-compose down          # Stop forwarder
+  #   docker-compose up --build    # Rebuild and start
+  #
+  # Logs are written to: ./logs/forwarder.log
+  #
+  # Note: aem-server-simulator is managed separately in docker/aem-server-simulator/
+  #       Both services share the 'pyfm_network' for inter-container communication.
+  #
+  # =============================================================================
 
-services:
-  forwarder:
-    build:
-      context: ../..
-      dockerfile: docker/Dockerfile.forwarder
-    image: pyfm-forwarder:latest
-    container_name: pyfm_forwarder
-    environment:
-      # Forwarder configuration
-      FORWARDER_MODE: ${FORWARDER_MODE:-dry-run}          # dry-run or live
-      FORWARDER_LOG_LEVEL: ${FORWARDER_LOG_LEVEL:-INFO}   # DEBUG, INFO, WARNING, ERROR
-      FORWARDER_LOG_FILE: /app/logs/forwarder.log         # Log file inside container
-      # FORWARDER_ASSET_TYPES: heat_pump,ev_charger       # Filter by asset types
-      # FORWARDER_QUEUES: commands,measurements           # Queues to consume
-      
-      # RabbitMQ connection (connect to host network or external RabbitMQ)
-      RABBITMQ_HOST: ${RABBITMQ_HOST:-localhost}
-      RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
-      RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-      RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
-      RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
-      RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-flexi_commands}
-      
-      # Connection retry settings
-      RABBITMQ_CONNECT_RETRIES: ${RABBITMQ_CONNECT_RETRIES:-10}
-      RABBITMQ_CONNECT_RETRY_DELAY: ${RABBITMQ_CONNECT_RETRY_DELAY:-5}
-    
-    # Mount logs directory
-    volumes:
-      - ./logs:/app/logs
-    
-    # Use host network to connect to RabbitMQ on localhost
-    # Or use external network if RabbitMQ is in another compose
-    network_mode: ${FORWARDER_NETWORK_MODE:-host}
-    
-    # Alternative: connect to the pyfm_network (uncomment if RabbitMQ uses it)
-    # networks:
-    #   - pyfm_network
-    
-    restart: unless-stopped
+  services:
+    forwarder:
+      build:
+        context: ../..
+        dockerfile: docker/Dockerfile.forwarder
+      image: pyfm-forwarder:latest
+      container_name: pyfm_forwarder
+      environment:
+        # Forwarder configuration
+        FORWARDER_MODE: ${FORWARDER_MODE:-live}             # dry-run or live
+        FORWARDER_LOG_LEVEL: ${FORWARDER_LOG_LEVEL:-INFO}   # DEBUG, INFO, WARNING, ERROR
+        FORWARDER_LOG_FILE: /app/logs/forwarder.log         # Log file inside container
+        FORWARDER_CONFIG: /app/conf/forwarder_targets.json  # Config file path
+        FORWARDER_CONNS: /app/conf/private/conns.json       # conns.json path
+        # FORWARDER_ASSET_TYPES: heat_pump,ev_charger       # Filter by asset types
+        # FORWARDER_QUEUES: commands,measurements           # Queues to consume
 
-# Uncomment if using bridge network mode instead of host
-# networks:
-#   pyfm_network:
-#     external: true
-#     name: pyfm_network
+        # RabbitMQ connection
+        RABBITMQ_HOST: ${RABBITMQ_HOST:-host.docker.internal}
+        RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
+        RABBITMQ_USER: ${RABBITMQ_USER:-guest}
+        RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
+        RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+        RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-flexi_commands}
+
+        # Connection retry settings
+        RABBITMQ_CONNECT_RETRIES: ${RABBITMQ_CONNECT_RETRIES:-10}
+        RABBITMQ_CONNECT_RETRY_DELAY: ${RABBITMQ_CONNECT_RETRY_DELAY:-5}
+
+      # Mount logs and config directories
+      volumes:
+        - ./logs:/app/logs
+        - ../../conf/forwarder_targets.json:/app/conf/forwarder_targets.json:ro
+        - ../../conf/private/conns.json:/app/conf/private/conns.json:ro
+
+      # Add extra hosts for host.docker.internal on Linux
+      extra_hosts:
+        - "host.docker.internal:host-gateway"
+
+      networks:
+        - pyfm_network
+
+      restart: unless-stopped
+
+  networks:
+    pyfm_network:
+      external: true
+      name: pyfm_network

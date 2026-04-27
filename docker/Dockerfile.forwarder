@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY scripts/forwarder.py /app/scripts/
 COPY classes/ /app/classes/
+COPY conf/forwarder_targets.json /app/conf/
 
 # Create logs directory
 RUN mkdir -p /app/logs
@@ -26,6 +27,7 @@ ENV PYTHONUNBUFFERED=1
 # Default environment variables
 ENV FORWARDER_MODE=dry-run
 ENV FORWARDER_LOG_LEVEL=INFO
+ENV FORWARDER_CONFIG=/app/conf/forwarder_targets.json
 ENV RABBITMQ_HOST=rabbitmq
 ENV RABBITMQ_PORT=5672
 ENV RABBITMQ_USER=guest

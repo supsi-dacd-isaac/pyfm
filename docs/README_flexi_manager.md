@@ -187,6 +187,35 @@ python flexi_manager.py --fsp supsi01 --allocation cost_optimal
 python flexi_manager.py --fsp supsi01 --dry-run --output activation_result.json
 ```
 
+### Autonomous Mode (Dry-Run Only)
+
+```
+python flexi_manager.py --fsp supsi01 --dry-run --autonomous
+python flexi_manager.py --fsp supsi01 --dry-run --autonomous --autonomous-lookahead 6 --autonomous-history 14
+python flexi_manager.py --fsp supsi01 --dry-run --autonomous --no-autonomous  # Disable config-driven autonomous  mode
+```
+
+When no bid record exists for the slot, autonomous mode lets the manager **analyze historical DSO demand** from `demand_records` and predict the next few hours (default 3h) of willingness to pay. It prints:
+1. The current DSO request (price/quantity) if any
+2. A table of avg/min/max/std per 15-minute slot for the lookahead window
+3. Overall statistics (avg/min/max/std) and data coverage
+4. A recommendation whether to pre-activate assets (e.g., pre-heat HPs) based on a configurable price increase threshold
+5. A list of suitable heat pump assets that can be turned ON ahead of a peak
+
+Configuration defaults live in `conf/test_fm01_aem.json` under the new `autonomous` section:
+
+```json
+"autonomous": {
+  "enabled": true,
+  "lookahead_hours": 3,
+  "historical_days": 7,
+  "price_increase_threshold_pct": 20,
+  "dso_id": "AEM"
+}
+```
+
+Even though autonomous mode does not trigger actual control commands, it lets you **see how the price is expected to evolve** so you can warm up assets in advance and be ready for a future activation.
+
 ---
 
 ## Command Line Arguments

@@ -37,7 +37,11 @@ except ImportError:
 from classes.nodes_interface import NODESInterface as NodesInterface
 from classes.postgresql_interface import PostgreSQLInterface
 from classes.bid_record_repository import BidRecordRepository
+from classes.demand_record_repository import DemandRecordRepository
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
+
+# For statistics
+import statistics
 
 
 # =============================================================================
@@ -206,7 +210,9 @@ class RabbitMQPublisher:
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "priority": priority
         }
-        
+
+        # self.logger.info("RabbitMQ command JSON: %s", json.dumps(message))
+
         try:
             self.channel.basic_publish(
                 exchange=self.exchange,
@@ -258,7 +264,9 @@ class RabbitMQPublisher:
             "payload": payload,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
-        
+
+        self.logger.info("RabbitMQ measurement JSON: %s", json.dumps(message))
+
         try:
             self.channel.basic_publish(
                 exchange=self.exchange,
@@ -306,6 +314,7 @@ class RabbitMQPublisher:
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
             try:
+                # self.logger.info("RabbitMQ batch header JSON: %s", json.dumps(batch_header))
                 self.channel.basic_publish(
                     exchange=self.exchange,
                     routing_key="commands.batch.header",
@@ -449,12 +458,14 @@ class AssetController:
         self, 
         asset_mapping: dict, 
         logger: logging.Logger,
-        rabbitmq_publisher: 'RabbitMQPublisher' = None
+        rabbitmq_publisher: 'RabbitMQPublisher' = None,
+        community: str = None
     ):
         self.asset_mapping = asset_mapping
         self.logger = logger
         self.control_results = {}
         self.rabbitmq_publisher = rabbitmq_publisher
+        self.community = community
         self._pending_commands = []  # Buffer for batch publishing
     
     def _get_modulation_type(self, asset_config: dict) -> str:
@@ -565,7 +576,12 @@ class AssetController:
             result["discrete_state"] = state_name
         
         # Build command payload for RabbitMQ
+        # Get site_id (pod) from asset config
+        site_id = asset_config.get("pod", "")
+
         command_payload = {
+            "community": self.community,
+            "site_id": site_id,
             "asset_id": asset_id,
             "description": description,
             "asset_type": asset_type,
@@ -789,10 +805,13 @@ class AssetController:
         asset_config = self.asset_mapping.get(asset_id, {})
         description = asset_config.get("description", asset_id)
         asset_type = asset_config.get("type", "unknown")
-        
+        site_id = asset_config.get("pod", "")
+
         # Queue restore command for RabbitMQ
         if self.rabbitmq_publisher:
             restore_payload = {
+                "community": self.community,
+                "site_id": site_id,
                 "asset_id": asset_id,
                 "description": description,
                 "asset_type": asset_type,
@@ -1508,6 +1527,417 @@ class BidRecordHandler:
 
 
 # =============================================================================
+# PRICE PREDICTOR (Autonomous Decision Support)
+# =============================================================================
+
+class PricePredictor:
+    """
+    Analyzes historical demand records to predict future DSO willingness to pay.
+    
+    Uses the demand_records table to understand when DSO is likely to pay more
+    for flexibility. Separates analysis by day type (weekday vs weekend) to
+    capture different behavior patterns.
+    
+    This enables autonomous pre-activation decisions:
+    - If current price is low but higher prices expected soon, pre-heat/pre-cool
+    - If current price is high, hold flexibility for activation
+    """
+    
+    def __init__(
+        self,
+        demand_repo: DemandRecordRepository,
+        dso_id: str,
+        logger: logging.Logger,
+        historical_days: int = 7
+    ):
+        """
+        Initialize the price predictor.
+        
+        :param demand_repo: DemandRecordRepository instance
+        :param dso_id: DSO identifier to analyze
+        :param logger: Logger instance
+        :param historical_days: Number of days to analyze (default: 7)
+        """
+        self.demand_repo = demand_repo
+        self.dso_id = dso_id
+        self.logger = logger
+        self.historical_days = historical_days
+        
+        # Cache for price patterns (populated on first query)
+        self._weekday_patterns = None
+        self._weekend_patterns = None
+    
+    def _is_weekend(self, dt: datetime) -> bool:
+        """Check if a datetime is on a weekend (Saturday=5, Sunday=6)."""
+        return dt.weekday() >= 5
+    
+    def _get_slot_key(self, dt: datetime) -> str:
+        """
+        Generate a slot key (HH:MM) for grouping 15-minute slots.
+        
+        :param dt: Datetime to convert
+        :return: String key like "09:15"
+        """
+        return dt.strftime("%H:%M")
+    
+    def _load_historical_patterns(self) -> None:
+        """
+        Load and analyze historical demand records.
+        
+        Groups data by:
+        - Day type (weekday/weekend)
+        - Time slot (15-minute intervals)
+        
+        Calculates statistics for price_offered per slot.
+        """
+        if self.demand_repo is None:
+            self.logger.warning("No demand repository - cannot load patterns")
+            self._weekday_patterns = {}
+            self._weekend_patterns = {}
+            return
+        
+        end_date = datetime.now(timezone.utc).replace(tzinfo=None)
+        start_date = end_date - timedelta(days=self.historical_days)
+        
+        self.logger.info(
+            "Loading demand history for %s from %s to %s",
+            self.dso_id,
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+        
+        try:
+            records = self.demand_repo.get_history(self.dso_id, start_date, end_date)
+            
+            # Group by day type and slot
+            weekday_data = {}  # slot_key -> list of prices
+            weekend_data = {}
+            
+            for record in records:
+                slot_start = record.get("slot_start")
+                price = record.get("price_offered")
+                
+                if slot_start is None or price is None:
+                    continue
+                
+                # Handle timezone-aware datetimes
+                if hasattr(slot_start, 'tzinfo') and slot_start.tzinfo is not None:
+                    slot_start = slot_start.replace(tzinfo=None)
+                
+                slot_key = self._get_slot_key(slot_start)
+                price_float = float(price)
+                
+                if self._is_weekend(slot_start):
+                    if slot_key not in weekend_data:
+                        weekend_data[slot_key] = []
+                    weekend_data[slot_key].append(price_float)
+                else:
+                    if slot_key not in weekday_data:
+                        weekday_data[slot_key] = []
+                    weekday_data[slot_key].append(price_float)
+            
+            # Calculate statistics for each slot
+            self._weekday_patterns = self._calculate_slot_stats(weekday_data)
+            self._weekend_patterns = self._calculate_slot_stats(weekend_data)
+            
+            self.logger.info(
+                "Loaded patterns: %d weekday slots, %d weekend slots from %d records",
+                len(self._weekday_patterns),
+                len(self._weekend_patterns),
+                len(records)
+            )
+            
+        except Exception as e:
+            self.logger.error("Error loading demand patterns: %s", str(e))
+            self._weekday_patterns = {}
+            self._weekend_patterns = {}
+    
+    def _calculate_slot_stats(self, slot_data: Dict[str, List[float]]) -> Dict[str, Dict]:
+        """
+        Calculate statistics for each time slot.
+        
+        :param slot_data: Dictionary of slot_key -> list of prices
+        :return: Dictionary of slot_key -> stats dict
+        """
+        result = {}
+        
+        for slot_key, prices in slot_data.items():
+            if not prices:
+                continue
+            
+            result[slot_key] = {
+                "count": len(prices),
+                "avg": statistics.mean(prices),
+                "min": min(prices),
+                "max": max(prices),
+                "std": statistics.stdev(prices) if len(prices) > 1 else 0.0,
+                "values": prices  # Keep raw values for detailed analysis
+            }
+        
+        return result
+    
+    def get_current_slot_price(self, slot_time: datetime = None) -> Optional[Dict]:
+        """
+        Get the current or specified slot's demand record price.
+        
+        :param slot_time: Optional slot time (defaults to current slot)
+        :return: Dictionary with current demand info or None
+        """
+        if self.demand_repo is None:
+            return None
+        
+        if slot_time is None:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            minutes = (now.minute // 15) * 15
+            slot_time = now.replace(minute=minutes, second=0, microsecond=0)
+        
+        try:
+            record = self.demand_repo.get_demand_record(self.dso_id, slot_time)
+            if record:
+                return {
+                    "slot_start": record.get("slot_start"),
+                    "price_offered": float(record.get("price_offered") or 0),
+                    "quantity_up_mw": float(record.get("quantity_up_mw") or 0),
+                    "quantity_down_mw": float(record.get("quantity_down_mw") or 0),
+                    "status": record.get("status")
+                }
+            return None
+        except Exception as e:
+            self.logger.error("Error getting current slot price: %s", str(e))
+            return None
+    
+    def predict_price_evolution(
+        self,
+        start_time: datetime = None,
+        lookahead_hours: float = 3.0
+    ) -> Dict:
+        """
+        Predict price evolution for the next N hours.
+        
+        Uses historical patterns to estimate expected prices for each 15-minute
+        slot in the lookahead period.
+        
+        :param start_time: Starting time (defaults to now)
+        :param lookahead_hours: Hours to look ahead (default: 3)
+        :return: Dictionary with predictions and statistics
+        """
+        # Load patterns if not cached
+        if self._weekday_patterns is None:
+            self._load_historical_patterns()
+        
+        if start_time is None:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            # Align to current 15-minute slot
+            minutes = (now.minute // 15) * 15
+            start_time = now.replace(minute=minutes, second=0, microsecond=0)
+        
+        # Handle timezone-aware datetimes
+        if hasattr(start_time, 'tzinfo') and start_time.tzinfo is not None:
+            start_time = start_time.replace(tzinfo=None)
+        
+        # Calculate number of slots to predict
+        slots_count = int(lookahead_hours * 4)  # 4 slots per hour
+        
+        # Determine which pattern set to use based on start day
+        is_weekend = self._is_weekend(start_time)
+        patterns = self._weekend_patterns if is_weekend else self._weekday_patterns
+        day_type = "weekend" if is_weekend else "weekday"
+        
+        # Generate predictions for each slot
+        predictions = []
+        all_predicted_prices = []
+        
+        current_time = start_time
+        for i in range(slots_count):
+            slot_key = self._get_slot_key(current_time)
+            slot_stats = patterns.get(slot_key, {})
+            
+            prediction = {
+                "slot": current_time.isoformat(),
+                "slot_key": slot_key,
+                "offset_minutes": i * 15,
+                "has_data": bool(slot_stats),
+                "avg": slot_stats.get("avg"),
+                "min": slot_stats.get("min"),
+                "max": slot_stats.get("max"),
+                "std": slot_stats.get("std"),
+                "sample_count": slot_stats.get("count", 0)
+            }
+            
+            predictions.append(prediction)
+            
+            if slot_stats.get("avg") is not None:
+                all_predicted_prices.append(slot_stats["avg"])
+            
+            current_time = current_time + timedelta(minutes=15)
+        
+        # Calculate overall statistics
+        overall_stats = {}
+        if all_predicted_prices:
+            overall_stats = {
+                "avg": statistics.mean(all_predicted_prices),
+                "min": min(all_predicted_prices),
+                "max": max(all_predicted_prices),
+                "std": statistics.stdev(all_predicted_prices) if len(all_predicted_prices) > 1 else 0.0,
+                "slot_count_with_data": len(all_predicted_prices),
+                "slot_count_total": slots_count
+            }
+        
+        return {
+            "start_time": start_time.isoformat(),
+            "lookahead_hours": lookahead_hours,
+            "day_type": day_type,
+            "slots_analyzed": slots_count,
+            "predictions": predictions,
+            "overall_stats": overall_stats,
+            "pattern_source": f"last {self.historical_days} days"
+        }
+    
+    def should_preactivate(
+        self,
+        current_price: float,
+        lookahead_hours: float = 3.0,
+        threshold_pct: float = 20.0,
+        start_time: datetime = None
+    ) -> Dict:
+        """
+        Determine if pre-activation (e.g., pre-heating) makes sense.
+        
+        Pre-activation is recommended when:
+        - Future prices are expected to be significantly higher than current
+        - Asset is currently OFF and could be turned ON for pre-heating
+        
+        :param current_price: Current DSO price offer (or 0 if no current request)
+        :param lookahead_hours: Hours to look ahead
+        :param threshold_pct: Percentage increase to trigger recommendation
+        :param start_time: Starting time for prediction (defaults to now)
+        :return: Dictionary with recommendation and analysis
+        """
+        prediction = self.predict_price_evolution(
+            lookahead_hours=lookahead_hours,
+            start_time=start_time
+        )
+        
+        overall = prediction.get("overall_stats", {})
+        max_predicted = overall.get("max", 0)
+        avg_predicted = overall.get("avg", 0)
+        
+        # Find peak slot
+        peak_slot = None
+        peak_price = 0
+        for pred in prediction.get("predictions", []):
+            if pred.get("avg") and pred["avg"] > peak_price:
+                peak_price = pred["avg"]
+                peak_slot = pred
+        
+        # Calculate potential gain
+        price_increase = max_predicted - current_price if current_price > 0 else max_predicted
+        price_increase_pct = (price_increase / current_price * 100) if current_price > 0 else 100
+        
+        # Recommendation logic
+        recommend = False
+        reason = ""
+        
+        if current_price == 0:
+            # No current request
+            if max_predicted > 0:
+                recommend = True
+                reason = f"No current DSO request, but peak of {max_predicted:.2f} CHF/MW expected"
+            else:
+                reason = "No current request and no historical price data"
+        elif price_increase_pct >= threshold_pct:
+            recommend = True
+            reason = f"Price expected to increase by {price_increase_pct:.1f}% (from {current_price:.2f} to {max_predicted:.2f} CHF/MW)"
+        else:
+            reason = f"Price increase ({price_increase_pct:.1f}%) below threshold ({threshold_pct:.1f}%)"
+        
+        return {
+            "recommend_preactivation": recommend,
+            "reason": reason,
+            "current_price": current_price,
+            "max_predicted_price": max_predicted,
+            "avg_predicted_price": avg_predicted,
+            "price_increase": price_increase,
+            "price_increase_pct": price_increase_pct,
+            "peak_slot": peak_slot,
+            "prediction_summary": prediction
+        }
+    
+    def print_price_forecast(
+        self,
+        current_price: float = None,
+        lookahead_hours: float = 3.0,
+        start_time: datetime = None
+    ) -> None:
+        """
+        Print a formatted price forecast to the logger.
+        
+        :param current_price: Current DSO price (optional)
+        :param lookahead_hours: Hours to look ahead
+        :param start_time: Starting time for prediction (defaults to now)
+        """
+        prediction = self.predict_price_evolution(
+            lookahead_hours=lookahead_hours,
+            start_time=start_time
+        )
+        overall = prediction.get("overall_stats", {})
+        
+        self.logger.info("=" * 70)
+        self.logger.info("AUTONOMOUS MODE - PRICE FORECAST")
+        self.logger.info("=" * 70)
+        
+        if current_price is not None and current_price > 0:
+            self.logger.info("Current DSO price: %.2f CHF/MW", current_price)
+        else:
+            self.logger.info("Current DSO price: No current request")
+        
+        self.logger.info("-" * 70)
+        self.logger.info(
+            "Forecast for next %.1f hours (%d slots) based on %s (%s):",
+            lookahead_hours,
+            prediction.get("slots_analyzed", 0),
+            prediction.get("pattern_source", "?"),
+            prediction.get("day_type", "?")
+        )
+        self.logger.info("-" * 70)
+        
+        # Print slot-by-slot predictions
+        self.logger.info("  %-8s  %-8s  %-8s  %-8s  %-8s  %-6s", 
+                        "Time", "Avg", "Min", "Max", "Std", "N")
+        self.logger.info("  " + "-" * 52)
+        
+        for pred in prediction.get("predictions", []):
+            if pred.get("has_data"):
+                self.logger.info(
+                    "  %-8s  %8.2f  %8.2f  %8.2f  %8.2f  %6d",
+                    pred["slot_key"],
+                    pred.get("avg", 0),
+                    pred.get("min", 0),
+                    pred.get("max", 0),
+                    pred.get("std", 0),
+                    pred.get("sample_count", 0)
+                )
+            else:
+                self.logger.info("  %-8s  %8s  %8s  %8s  %8s  %6s",
+                               pred["slot_key"], "-", "-", "-", "-", "0")
+        
+        self.logger.info("-" * 70)
+        self.logger.info("Overall forecast statistics:")
+        if overall:
+            self.logger.info("  Average:  %.2f CHF/MW", overall.get("avg", 0))
+            self.logger.info("  Minimum:  %.2f CHF/MW", overall.get("min", 0))
+            self.logger.info("  Maximum:  %.2f CHF/MW", overall.get("max", 0))
+            self.logger.info("  Std Dev:  %.2f CHF/MW", overall.get("std", 0))
+            self.logger.info("  Data coverage: %d/%d slots", 
+                           overall.get("slot_count_with_data", 0),
+                           overall.get("slot_count_total", 0))
+        else:
+            self.logger.info("  No historical data available for prediction")
+        
+        self.logger.info("=" * 70)
+
+
+# =============================================================================
 # MAIN FLEXIBILITY MANAGER
 # =============================================================================
 
@@ -1517,6 +1947,9 @@ class FlexibilityManager:
     
     Key feature: Uses bid records from PostgreSQL database to know which strategy
     was used and which assets should be activated.
+    
+    Autonomous mode: When no bid is active, analyzes historical demand patterns
+    to predict when pre-activation (e.g., pre-heating) would be beneficial.
     """
     
     def __init__(
@@ -1527,7 +1960,8 @@ class FlexibilityManager:
         bid_repo: BidRecordRepository,
         logger: logging.Logger,
         nodes_authenticated: bool = False,
-        rabbitmq_publisher: 'RabbitMQPublisher' = None
+        rabbitmq_publisher: 'RabbitMQPublisher' = None,
+        demand_repo: DemandRecordRepository = None
     ):
         self.config = config
         self.fsp_id = fsp_id
@@ -1535,9 +1969,13 @@ class FlexibilityManager:
         self.asset_mapping = config.get("asset_mapping", {})
         self.logger = logger
         self.bid_repo = bid_repo
+        self.demand_repo = demand_repo
         self.nodes_authenticated = nodes_authenticated
         self.rabbitmq_publisher = rabbitmq_publisher
         
+        # Get community from config (fm.community)
+        self.community = config.get("fm", {}).get("community", "")
+
         # Get FSP's allowed assets (default from config)
         self.fsp_assets = self.fsp_config.get("assets", list(self.asset_mapping.keys()))
         
@@ -1547,8 +1985,32 @@ class FlexibilityManager:
         # Initialize components
         self.market_handler = MarketResultsHandler(nodes_interface, logger)
         self.allocator = FlexibilityAllocator(self.asset_mapping, logger)
-        self.controller = AssetController(self.asset_mapping, logger, rabbitmq_publisher)
+        self.controller = AssetController(self.asset_mapping, logger, rabbitmq_publisher, community=self.community)
         self.bid_handler = BidRecordHandler(bid_repo, logger)
+        
+        # Autonomous mode configuration
+        self.autonomous_config = config.get("autonomous", {})
+        self.autonomous_enabled = self.autonomous_config.get("enabled", False)
+        self.autonomous_dso_id = self.autonomous_config.get("dso_id", "AEM")
+        self.autonomous_lookahead = self.autonomous_config.get("lookahead_hours", 3.0)
+        self.autonomous_historical_days = self.autonomous_config.get("historical_days", 7)
+        self.autonomous_threshold_pct = self.autonomous_config.get("price_increase_threshold_pct", 20.0)
+        
+        # Initialize price predictor for autonomous mode
+        self.price_predictor = None
+        if self.autonomous_enabled and demand_repo:
+            self.price_predictor = PricePredictor(
+                demand_repo=demand_repo,
+                dso_id=self.autonomous_dso_id,
+                logger=logger,
+                historical_days=self.autonomous_historical_days
+            )
+            logger.info(
+                "Autonomous mode enabled: lookahead=%dh, history=%d days, threshold=%.1f%%",
+                self.autonomous_lookahead,
+                self.autonomous_historical_days,
+                self.autonomous_threshold_pct
+            )
         
         # Get organization ID from NODES only if authenticated
         self.organization_id = None
@@ -1605,6 +2067,219 @@ class FlexibilityManager:
         slot_end = slot_start + timedelta(minutes=15)
         return slot_start, slot_end
     
+    def _run_autonomous_analysis(self, slot_start: datetime, summary: Dict, dry_run: bool = True) -> None:
+        """
+        Run autonomous analysis when no bid record exists.
+        
+        Analyzes historical demand patterns to predict future DSO willingness
+        to pay and determine if pre-activation would be beneficial.
+        
+        When pre-activation is recommended and dry_run=False, this method will
+        actually send pre-heating commands to heat pump assets.
+
+        :param slot_start: Current slot start time
+        :param summary: Summary dictionary to update
+        :param dry_run: If True, only log what would be done; if False, send commands
+        """
+        self.logger.info("")
+        self.logger.info("=" * 70)
+        self.logger.info("AUTONOMOUS MODE ANALYSIS")
+        self.logger.info("=" * 70)
+        
+        # Get current demand/price (if any)
+        current_info = self.price_predictor.get_current_slot_price(slot_start)
+        current_price = current_info.get("price_offered", 0) if current_info else 0
+        
+        if current_info and current_price > 0:
+            self.logger.info("Current slot demand from DSO:")
+            self.logger.info("  Price offered: %.2f CHF/MW", current_price)
+            self.logger.info("  Quantity Up:   %.3f MW", current_info.get("quantity_up_mw", 0))
+            self.logger.info("  Quantity Down: %.3f MW", current_info.get("quantity_down_mw", 0))
+        else:
+            self.logger.info("No current DSO demand request for this slot")
+            current_price = 0
+        
+        # Print price forecast starting from the analyzed slot
+        self.price_predictor.print_price_forecast(
+            current_price=current_price,
+            lookahead_hours=self.autonomous_lookahead,
+            start_time=slot_start
+        )
+        
+        # Get pre-activation recommendation starting from the analyzed slot
+        recommendation = self.price_predictor.should_preactivate(
+            current_price=current_price,
+            lookahead_hours=self.autonomous_lookahead,
+            threshold_pct=self.autonomous_threshold_pct,
+            start_time=slot_start
+        )
+        
+        self.logger.info("")
+        self.logger.info("=" * 70)
+        self.logger.info("PRE-ACTIVATION RECOMMENDATION")
+        self.logger.info("=" * 70)
+        
+        if recommendation.get("recommend_preactivation"):
+            self.logger.info(">>> RECOMMENDATION: PRE-ACTIVATE ASSETS")
+            self.logger.info(">>> Reason: %s", recommendation.get("reason", "N/A"))
+            
+            # Show peak slot details
+            peak_slot = recommendation.get("peak_slot")
+            if peak_slot:
+                self.logger.info(">>> Peak expected at: %s with price %.2f CHF/MW",
+                               peak_slot.get("slot_key", "?"),
+                               peak_slot.get("avg", 0))
+            
+            # Show price improvement
+            self.logger.info(">>> Current price: %.2f CHF/MW", current_price)
+            self.logger.info(">>> Max predicted: %.2f CHF/MW (+%.1f%%)",
+                           recommendation.get("max_predicted_price", 0),
+                           recommendation.get("price_increase_pct", 0))
+            
+            # List assets that could be pre-activated (HPs for pre-heating)
+            self.logger.info("")
+            self.logger.info("Assets suitable for pre-activation (pre-heating):")
+
+            preactivation_assets = []
+            for asset_id in self.fsp_assets:
+                asset_config = self.asset_mapping.get(asset_id, {})
+                asset_type = asset_config.get("type", "")
+                if asset_type == "heat_pump":
+                    self.logger.info("  - %s (%s): capacity %.1f kW",
+                                   asset_id,
+                                   asset_config.get("description", ""),
+                                   asset_config.get("capacity_kw", 0))
+                    preactivation_assets.append(asset_id)
+
+            # Execute pre-activation if not in dry-run mode
+            if preactivation_assets:
+                if dry_run:
+                    self.logger.info("")
+                    self.logger.info("[DRY-RUN] Would send pre-heating (ON) commands to %d heat pump(s)",
+                                   len(preactivation_assets))
+                else:
+                    self.logger.info("")
+                    self.logger.info("=" * 70)
+                    self.logger.info("EXECUTING PRE-ACTIVATION COMMANDS")
+                    self.logger.info("=" * 70)
+
+                    preactivation_results = []
+                    for asset_id in preactivation_assets:
+                        result = self._send_preactivation_command(asset_id, slot_start)
+                        preactivation_results.append(result)
+
+                    # Publish pending commands to RabbitMQ if configured
+                    if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+                        slot_end = slot_start + timedelta(minutes=15)
+                        slot_info = {
+                            "fsp_id": self.fsp_id,
+                            "slot_start": slot_start.isoformat(),
+                            "slot_end": slot_end.isoformat(),
+                            "command_type": "preactivation",
+                            "dry_run": False
+                        }
+                        published = self.controller.publish_pending_commands(slot_info, dry_run=False)
+                        self.logger.info("Published %d pre-activation commands to RabbitMQ", published)
+
+                    summary["preactivation_executed"] = True
+                    summary["preactivation_results"] = preactivation_results
+                    self.logger.info("Pre-activation commands sent to %d asset(s)", len(preactivation_results))
+        else:
+            self.logger.info(">>> RECOMMENDATION: NO PRE-ACTIVATION NEEDED")
+            self.logger.info(">>> Reason: %s", recommendation.get("reason", "N/A"))
+        
+        self.logger.info("=" * 70)
+        
+        # Update summary with autonomous analysis results
+        summary["autonomous_analysis"] = {
+            "enabled": True,
+            "current_price": current_price,
+            "lookahead_hours": self.autonomous_lookahead,
+            "recommendation": recommendation.get("recommend_preactivation", False),
+            "reason": recommendation.get("reason", ""),
+            "max_predicted_price": recommendation.get("max_predicted_price", 0),
+            "avg_predicted_price": recommendation.get("avg_predicted_price", 0),
+            "price_increase_pct": recommendation.get("price_increase_pct", 0),
+            "peak_slot": recommendation.get("peak_slot", {}),
+            "historical_days_analyzed": self.autonomous_historical_days,
+            "threshold_pct": self.autonomous_threshold_pct
+        }
+    
+    def _send_preactivation_command(self, asset_id: str, slot_start: datetime) -> Dict:
+        """
+        Send a pre-activation (pre-heating) command to a heat pump asset.
+
+        Pre-activation means turning the heat pump ON to pre-heat the building
+        before an expected high-price period, so the building can coast through
+        the high-price period with the heat pump OFF.
+
+        :param asset_id: Asset identifier
+        :param slot_start: Start of the slot
+        :return: Result dictionary
+        """
+        asset_config = self.asset_mapping.get(asset_id, {})
+        description = asset_config.get("description", asset_id)
+        asset_type = asset_config.get("type", "heat_pump")
+        capacity_kw = asset_config.get("capacity_kw", 0)
+        site_id = asset_config.get("pod", "")
+
+        slot_end = slot_start + timedelta(minutes=15)
+
+        result = {
+            "asset_id": asset_id,
+            "description": description,
+            "command": "preactivate",
+            "target_state": "ON",
+            "slot_start": slot_start.isoformat(),
+            "slot_end": slot_end.isoformat(),
+            "status": "pending"
+        }
+
+        # Build command payload for RabbitMQ
+        command_payload = {
+            "community": self.community,
+            "site_id": site_id,
+            "asset_id": asset_id,
+            "description": description,
+            "asset_type": asset_type,
+            "modulation_type": "discrete",
+            "command": "preactivate",
+            "target_state": "ON",
+            "target_power_kw": capacity_kw,  # Full power for pre-heating
+            "capacity_kw": capacity_kw,
+            "duration_minutes": 15,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "dry_run": False,
+            "slot_start": slot_start.isoformat(),
+            "slot_end": slot_end.isoformat()
+        }
+
+        # Queue command for RabbitMQ
+        if self.rabbitmq_publisher:
+            self.controller._pending_commands.append({
+                "asset_id": asset_id,
+                "asset_type": asset_type,
+                "command_type": "preactivate",
+                "payload": command_payload,
+                "priority": 6  # Medium-high priority for pre-activation
+            })
+            result["status"] = "queued"
+            result["message"] = "Pre-activation command queued for RabbitMQ"
+            self.logger.info(
+                "Queued pre-activation: set %s (%s) to ON (%.1f kW) for pre-heating",
+                asset_id, description, capacity_kw
+            )
+        else:
+            # Direct actuation (not implemented yet)
+            self.logger.warning(
+                "No RabbitMQ publisher - cannot send pre-activation command to %s",
+                asset_id
+            )
+            result["status"] = "error"
+            result["message"] = "No RabbitMQ publisher configured"
+
+        return result
+
     def run(
         self,
         slot_override: str = None,
@@ -1700,6 +2375,10 @@ class FlexibilityManager:
                     summary["allowed_assets"] = allowed_assets
             
             self.logger.info("  Bid quantity: %.3f MW", bid_quantity_mw)
+            
+            # If bid quantity is 0, treat it as "no actual bidding" for autonomous mode
+            if bid_quantity_mw == 0:
+                self.logger.info("  Note: Bid quantity is 0 MW - no actual flexibility was bid")
         else:
             self.logger.warning("  No bid record found for this slot")
             self.logger.info("=" * 70)
@@ -1718,6 +2397,13 @@ class FlexibilityManager:
             summary["allocation"] = {}
             summary["activation_results"] = []
             
+            # ========================================================
+            # AUTONOMOUS MODE: Analyze price evolution when no bid exists
+            # When dry_run=False, pre-heating commands will actually be sent
+            # ========================================================
+            if self.autonomous_enabled and self.price_predictor:
+                self._run_autonomous_analysis(slot_start, summary, dry_run=dry_run)
+
             return summary
         
         # Step 1: Query market results
@@ -1767,6 +2453,15 @@ class FlexibilityManager:
             summary["allocation"] = {}
             summary["activation_results"] = []
             
+            # ========================================================
+            # AUTONOMOUS MODE: Analyze price evolution when no trades
+            # Even if a bid record exists, if there were no trades,
+            # we want to show the price forecast for the upcoming hours
+            # When dry_run=False, pre-heating commands will actually be sent
+            # ========================================================
+            if self.autonomous_enabled and self.price_predictor:
+                self._run_autonomous_analysis(slot_start, summary, dry_run=dry_run)
+
             return summary
         
         total_sold_kw = total_sold_mw * 1000
@@ -2074,6 +2769,28 @@ Examples:
         help="RabbitMQ exchange name (default: flexi_commands)"
     )
     
+    # Autonomous mode arguments
+    parser.add_argument(
+        "--autonomous",
+        action="store_true",
+        help="Enable autonomous mode (analyze price evolution when no bid exists)"
+    )
+    parser.add_argument(
+        "--no-autonomous",
+        action="store_true",
+        help="Disable autonomous mode (overrides config file)"
+    )
+    parser.add_argument(
+        "--autonomous-lookahead",
+        type=float,
+        help="Hours to look ahead for price prediction (default: from config or 3)"
+    )
+    parser.add_argument(
+        "--autonomous-history",
+        type=int,
+        help="Days of history to analyze (default: from config or 7)"
+    )
+    
     args = parser.parse_args()
     
     # Setup logging
@@ -2097,6 +2814,21 @@ Examples:
         logger.error("Invalid JSON in configuration file: %s", str(e))
         sys.exit(1)
     
+    # Override autonomous settings from command line
+    if "autonomous" not in config:
+        config["autonomous"] = {}
+    
+    if args.autonomous:
+        config["autonomous"]["enabled"] = True
+    elif args.no_autonomous:
+        config["autonomous"]["enabled"] = False
+    
+    if args.autonomous_lookahead is not None:
+        config["autonomous"]["lookahead_hours"] = args.autonomous_lookahead
+    
+    if args.autonomous_history is not None:
+        config["autonomous"]["historical_days"] = args.autonomous_history
+    
     # Handle --list-strategies before validating FSP
     if args.list_strategies:
         strategy_manager = StrategyManager(config, logger)
@@ -2114,6 +2846,7 @@ Examples:
     nodes_interface = None
     pg_interface = None
     bid_repo = None
+    demand_repo = None
     nodes_authenticated = False
     
     try:
@@ -2143,16 +2876,18 @@ Examples:
             logger.warning("Could not authenticate with NODES API: %s", str(e))
             logger.warning("Will run without market data (using bid record quantities)")
         
-        # Initialize PostgreSQL connection and bid record repository
+        # Initialize PostgreSQL connection and repositories
         pg_cfg = conns.get("postgreSQL", {})
+        demand_repo = None
         if pg_cfg:
             try:
                 pg_interface = PostgreSQLInterface(pg_cfg, logger)
                 bid_repo = BidRecordRepository(pg_interface, logger)
-                logger.info("Connected to PostgreSQL, bid record repository ready")
+                demand_repo = DemandRecordRepository(pg_interface, logger)
+                logger.info("Connected to PostgreSQL, bid and demand record repositories ready")
             except Exception as e:
                 logger.warning("Could not connect to PostgreSQL: %s", str(e))
-                logger.warning("Bid record loading will not be available")
+                logger.warning("Bid/demand record loading will not be available")
         
     except FileNotFoundError:
         logger.warning("Connections file not found - running in offline mode")
@@ -2190,7 +2925,8 @@ Examples:
         manager = FlexibilityManager(
             config, args.fsp, nodes_interface, bid_repo, logger,
             nodes_authenticated=nodes_authenticated,
-            rabbitmq_publisher=rabbitmq_publisher
+            rabbitmq_publisher=rabbitmq_publisher,
+            demand_repo=demand_repo
         )
     else:
         # Create a mock manager for testing
@@ -2205,7 +2941,8 @@ Examples:
         manager = FlexibilityManager(
             config, args.fsp, MockNodesInterface(), None, logger,
             nodes_authenticated=False,
-            rabbitmq_publisher=rabbitmq_publisher
+            rabbitmq_publisher=rabbitmq_publisher,
+            demand_repo=None
         )
     
     # Determine slot override from --slot or --offset

@@ -48,7 +48,15 @@ import logging
 import signal
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any
+from urllib.parse import urlparse, urlunparse
+
+# HTTP requests for forwarding to targets
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
 
 
 def get_env(name: str, default: str = None) -> str:
@@ -101,6 +109,573 @@ def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> lo
 
 
 # =============================================================================
+# TARGET HANDLERS - Forward commands to external systems
+# =============================================================================
+
+def _get_by_path(data: dict, path: str) -> Any:
+    """Resolve a dotted path like 'payload.slot_start' inside a dict."""
+    if not path:
+        return None
+    value = data
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _to_bool(value: Any) -> Optional[bool]:
+    """Convert common string/number representations to bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "on", "yes"}:
+            return True
+        if lowered in {"false", "0", "off", "no"}:
+            return False
+    return None
+
+
+def _to_on_off(value: Any) -> Optional[bool]:
+    """Convert ON/OFF string values to bool."""
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "on":
+            return True
+        if lowered == "off":
+            return False
+    return None
+
+
+def _format_datetime_utc(value: Any) -> Optional[str]:
+    """Parse an ISO-like datetime and return a UTC naive ISO string."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat()
+
+
+def _render_template(template: str, context: dict) -> str:
+    """Render a template string with {path} placeholders from the context."""
+    def _replace(match):
+        path = match.group(1)
+        value = _get_by_path(context, path)
+        return "" if value is None else str(value)
+
+    import re
+    return re.sub(r"\{([^}]+)\}", _replace, template)
+
+
+def _apply_template(template: Any, context: dict) -> Any:
+    """Apply a body template to the context data."""
+    if isinstance(template, dict):
+        if "$map" in template:
+            map_spec = template.get("$map", "")
+            if isinstance(map_spec, list):
+                value = None
+                for path in map_spec:
+                    value = _get_by_path(context, path)
+                    if value is not None:
+                        break
+            else:
+                value = _get_by_path(context, map_spec)
+            value_type = template.get("type")
+            if value_type == "bool":
+                converted = _to_bool(value)
+                return converted if converted is not None else value
+            if value_type == "on_off":
+                converted = _to_on_off(value)
+                return converted if converted is not None else value
+            if value_type == "datetime_utc":
+                converted = _format_datetime_utc(value)
+                return converted if converted is not None else value
+            return value
+        return {k: _apply_template(v, context) for k, v in template.items()}
+    if isinstance(template, list):
+        return [_apply_template(item, context) for item in template]
+    if isinstance(template, str):
+        return _render_template(template, context)
+    return template
+
+
+def _normalize_control_url(control_url: Optional[str], api_port: Optional[int]) -> Optional[str]:
+    """Ensure controlUrl has a scheme and optional port if missing."""
+    if not control_url:
+        return None
+    normalized = control_url.strip()
+    if "://" not in normalized:
+        normalized = f"https://{normalized.lstrip('/')}"
+
+    parsed = urlparse(normalized)
+    if not parsed.hostname:
+        return normalized
+
+    if parsed.port is None and api_port:
+        netloc = f"{parsed.hostname}:{api_port}"
+        parsed = parsed._replace(netloc=netloc)
+        normalized = urlunparse(parsed)
+
+    return normalized
+
+
+class TargetConfig:
+    """Configuration for a forwarding target."""
+
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        auth_user: str = None,
+        auth_password: str = None,
+        timeout: Optional[float] = None,
+        verify_ssl: bool = False,
+        asset_types: List[str] = None,
+        asset_ids: List[str] = None,
+        enabled: bool = True,
+        endpoint_template: Optional[str] = None,
+        body_template: Optional[dict] = None,
+        reference_api: Optional[str] = None,
+        timeout_is_configured: bool = False
+    ):
+        """
+        Initialize target configuration.
+
+        :param name: Target name (e.g., 'aem-server-simulator')
+        :param url: Base URL for the target API
+        :param auth_user: Username for Basic Auth (optional)
+        :param auth_password: Password for Basic Auth (optional)
+        :param timeout: Request timeout in seconds
+        :param verify_ssl: Whether to verify SSL certificates
+        :param asset_types: List of asset types this target handles (None = all)
+        :param asset_ids: List of asset IDs this target handles (None = all)
+        :param enabled: Whether this target is enabled
+        :param endpoint_template: Optional endpoint template for this target
+        :param body_template: Optional body template for this target
+        :param reference_api: Optional API key to load from conns.json
+        :param timeout_is_configured: Whether timeout was explicitly set in config
+        """
+        self.name = name
+        self.url = (url or "").rstrip('/')
+        self.auth_user = auth_user
+        self.auth_password = auth_password
+        self.timeout = 5.0 if timeout is None else timeout
+        self.verify_ssl = verify_ssl
+        self.asset_types = asset_types
+        self.asset_ids = asset_ids
+        self.enabled = enabled
+        self.endpoint_template = endpoint_template
+        self.body_template = body_template
+        self.reference_api = reference_api
+        self._timeout_is_configured = timeout_is_configured
+        self._api_config: Optional[dict] = None
+
+    def matches(self, asset_type: str, asset_id: str) -> bool:
+        """
+        Check if this target should handle the given asset.
+
+        :param asset_type: Asset type (e.g., 'heat_pump', 'ev_charger')
+        :param asset_id: Asset ID (e.g., 'ECM97.1')
+        :return: True if this target should handle the asset
+        """
+        if not self.enabled:
+            return False
+
+        # Check asset_ids first (more specific)
+        if self.asset_ids is not None:
+            return asset_id in self.asset_ids
+
+        # Check asset_types
+        if self.asset_types is not None:
+            return asset_type in self.asset_types
+
+        # No filter = handle all
+        return True
+
+    def get_auth(self):
+        """Get auth tuple for requests library."""
+        if self.auth_user and self.auth_password:
+            return (self.auth_user, self.auth_password)
+        return None
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'TargetConfig':
+        """Create TargetConfig from dictionary."""
+        timeout_is_configured = "timeout" in data
+        return cls(
+            name=data.get("name", "unknown"),
+            url=data.get("url", ""),
+            auth_user=data.get("user"),
+            auth_password=data.get("password"),
+            timeout=data.get("timeout"),
+            verify_ssl=data.get("verify_ssl", False),
+            asset_types=data.get("asset_types"),
+            asset_ids=data.get("asset_ids"),
+            enabled=data.get("enabled", True),
+            endpoint_template=data.get("endpoint_template"),
+            body_template=data.get("body_template"),
+            reference_api=data.get("reference_api"),
+            timeout_is_configured=timeout_is_configured
+        )
+
+    def apply_api_config(self, api_config: dict):
+        """Merge API config from conns.json into this target."""
+        self._api_config = dict(api_config)
+        control_url = api_config.get("controlUrl") or api_config.get("controlURL")
+        control_url = _normalize_control_url(control_url, api_config.get("port"))
+        if control_url:
+            self.url = control_url.rstrip('/')
+            self._api_config["controlUrl"] = control_url
+        if not self.auth_user and api_config.get("user"):
+            self.auth_user = api_config.get("user")
+        if not self.auth_password and api_config.get("password"):
+            self.auth_password = api_config.get("password")
+        if not self._timeout_is_configured and api_config.get("requestTimeout") is not None:
+            self.timeout = api_config.get("requestTimeout")
+
+    def build_request(self, message: dict) -> (str, dict):
+        """Build endpoint and body for this target, using templates when provided."""
+        command_type = message.get("command_type") or message.get("command") or "unknown"
+        payload = message.get("payload", {})
+        context = dict(message)
+        if self._api_config:
+            context["api"] = self._api_config
+
+        if self.endpoint_template:
+            if "api." in self.endpoint_template and "api" not in context:
+                raise ValueError("Endpoint template references api.* but reference_api is not loaded")
+            rendered = _render_template(self.endpoint_template, context)
+            if not rendered:
+                raise ValueError("Endpoint template rendered empty")
+            if rendered.startswith("http://") or rendered.startswith("https://"):
+                endpoint = rendered
+            else:
+                if not self.url:
+                    api_control_url = None
+                    if isinstance(self._api_config, dict):
+                        api_control_url = self._api_config.get("controlUrl") or self._api_config.get("controlURL")
+                    raise ValueError(
+                        "Endpoint template requires base URL but none is configured "
+                        f"(endpoint_template='{self.endpoint_template}', api.controlUrl='{api_control_url}')"
+                    )
+                endpoint = f"{self.url}/{rendered.lstrip('/')}"
+        else:
+            if command_type in ["curtail", "restore", "preactivate"]:
+                endpoint = f"{self.url}/control"
+            else:
+                endpoint = f"{self.url}/command"
+
+        if self.body_template:
+            request_body = _apply_template(self.body_template, context)
+        else:
+            request_body = {
+                "command": command_type,
+                "asset_id": message.get("asset_id"),
+                "asset_type": message.get("asset_type"),
+                "timestamp": message.get("timestamp"),
+                "payload": payload
+            }
+
+        return endpoint, request_body
+
+
+class TargetHandler:
+    """
+    Manages forwarding commands to external HTTP targets.
+
+    Supports multiple targets with different configurations.
+    Routes commands based on asset type or asset ID.
+    """
+
+    def __init__(self, logger: logging.Logger, dry_run: bool = True):
+        """
+        Initialize target handler.
+
+        :param logger: Logger instance
+        :param dry_run: If True, don't actually send HTTP requests
+        """
+        self.logger = logger
+        self.dry_run = dry_run
+        self.targets: Dict[str, TargetConfig] = {}
+        self.stats = {
+            "requests_sent": 0,
+            "requests_success": 0,
+            "requests_failed": 0,
+            "by_target": {}
+        }
+        self._conns_path: Optional[str] = None
+        self._conns_base_dirs: List[str] = []
+        self._conns_cache: dict = {}
+        self._conns_fallback_paths: List[str] = []
+
+        if not REQUESTS_AVAILABLE and not dry_run:
+            self.logger.warning("requests library not installed - HTTP forwarding disabled")
+
+    def set_conns_lookup(self, conns_path: str, base_dirs: List[str], conns_cache: dict, fallback_paths: Optional[List[str]] = None):
+        """Configure conns.json lookup for lazy reference_api loading."""
+        self._conns_path = conns_path
+        self._conns_base_dirs = base_dirs or []
+        self._conns_cache = conns_cache or {}
+        self._conns_fallback_paths = fallback_paths or []
+
+    def add_target(self, config: TargetConfig):
+        """
+        Add a forwarding target.
+
+        :param config: Target configuration
+        """
+        self.targets[config.name] = config
+        self.stats["by_target"][config.name] = {"sent": 0, "success": 0, "failed": 0}
+        self.logger.info(
+            "Added target '%s': %s (auth: %s, types: %s, ids: %s)",
+            config.name,
+            config.url,
+            "enabled" if config.get_auth() else "disabled",
+            config.asset_types or "all",
+            config.asset_ids or "all"
+        )
+
+    def add_target_from_env(self, prefix: str = "TARGET"):
+        """
+        Add a target from environment variables.
+
+        Looks for variables like:
+        - TARGET_NAME, TARGET_URL, TARGET_USER, TARGET_PASSWORD, etc.
+
+        :param prefix: Environment variable prefix
+        """
+        name = get_env(f"{prefix}_NAME")
+        url = get_env(f"{prefix}_URL")
+
+        if not name or not url:
+            return
+
+        asset_types_str = get_env(f"{prefix}_ASSET_TYPES")
+        asset_ids_str = get_env(f"{prefix}_ASSET_IDS")
+
+        config = TargetConfig(
+            name=name,
+            url=url,
+            auth_user=get_env(f"{prefix}_USER"),
+            auth_password=get_env(f"{prefix}_PASSWORD"),
+            timeout=float(get_env(f"{prefix}_TIMEOUT", "5.0")),
+            verify_ssl=get_env(f"{prefix}_VERIFY_SSL", "false").lower() == "true",
+            asset_types=asset_types_str.split(",") if asset_types_str else None,
+            asset_ids=asset_ids_str.split(",") if asset_ids_str else None,
+            enabled=get_env(f"{prefix}_ENABLED", "true").lower() == "true"
+        )
+
+        self.add_target(config)
+
+    def get_targets_for_asset(self, asset_type: str, asset_id: str) -> List[TargetConfig]:
+        """
+        Get all targets that should handle a given asset.
+
+        :param asset_type: Asset type
+        :param asset_id: Asset ID
+        :return: List of matching target configs
+        """
+        return [t for t in self.targets.values() if t.matches(asset_type, asset_id)]
+
+    def forward_command(self, message: dict) -> bool:
+        """
+        Forward a command to all matching targets.
+
+        :param message: Command message dictionary
+        :return: True if forwarded successfully to at least one target
+        """
+        asset_id = message.get("asset_id", "unknown")
+        asset_type = message.get("asset_type", "unknown")
+        payload = message.get("payload", {})
+
+        matching_targets = self.get_targets_for_asset(asset_type, asset_id)
+
+        if not matching_targets:
+            self.logger.debug("No targets configured for asset %s (type: %s)", asset_id, asset_type)
+            return True  # Not an error - just no targets configured
+
+        success = False
+
+        for target in matching_targets:
+            result = self._send_to_target(target, message)
+            if result:
+                success = True
+
+        return success
+
+    def _send_to_target(self, target: TargetConfig, message: dict) -> bool:
+        """
+        Send a command to a specific target.
+
+        :param target: Target configuration
+        :param message: Command message dictionary
+        :return: True if sent successfully
+        """
+        self.stats["requests_sent"] += 1
+        self.stats["by_target"][target.name]["sent"] += 1
+
+        if target.reference_api and not target._api_config:
+            api_config = self._conns_cache.get(target.reference_api)
+            if not api_config and self._conns_path:
+                self.logger.info(
+                    "Loading reference_api '%s' from conns.json (%s)",
+                    target.reference_api, self._conns_path
+                )
+                self._conns_cache = _load_conns_config(
+                    self._conns_path,
+                    self.logger,
+                    extra_base_dirs=self._conns_base_dirs
+                )
+                api_config = self._conns_cache.get(target.reference_api)
+            if not api_config and self._conns_fallback_paths:
+                for fallback_path in self._conns_fallback_paths:
+                    self.logger.info("Trying fallback conns.json at: %s", fallback_path)
+                    self._conns_cache = _load_conns_config(fallback_path, self.logger)
+                    api_config = self._conns_cache.get(target.reference_api)
+                    if api_config:
+                        break
+            if api_config:
+                target.apply_api_config(api_config)
+
+        try:
+            endpoint, request_body = target.build_request(message)
+        except ValueError as exc:
+            self.logger.error(
+                "Target '%s' endpoint template error: %s (reference_api=%s, url='%s').",
+                target.name, str(exc), target.reference_api, target.url
+            )
+            self.stats["requests_failed"] += 1
+            self.stats["by_target"][target.name]["failed"] += 1
+            return False
+
+        parsed_endpoint = urlparse(endpoint)
+        socket_info = parsed_endpoint.netloc or parsed_endpoint.path
+        self.logger.info(
+            "Target '%s' endpoint resolved: %s (socket: %s)",
+            target.name, endpoint, socket_info
+        )
+        if not parsed_endpoint.scheme or not parsed_endpoint.netloc:
+            self.logger.error(
+                "Target '%s' has invalid endpoint '%s'. Check reference_api and conns.json.",
+                target.name, endpoint
+            )
+            self.stats["requests_failed"] += 1
+            self.stats["by_target"][target.name]["failed"] += 1
+            return False
+
+        if isinstance(request_body, dict) and "power" in request_body:
+            if not isinstance(request_body.get("power"), bool):
+                payload_keys = []
+                try:
+                    payload_keys = list((message.get("payload") or {}).keys())
+                except Exception:
+                    payload_keys = []
+                self.logger.error(
+                    "Target '%s' invalid power type: %s (value=%r, message_keys=%s, payload_keys=%s)",
+                    target.name,
+                    type(request_body.get("power")).__name__,
+                    request_body.get("power"),
+                    list(message.keys()),
+                    payload_keys
+                )
+                self.stats["requests_failed"] += 1
+                self.stats["by_target"][target.name]["failed"] += 1
+                return False
+
+        # Check dry_run:
+        # - The message's dry_run flag controls whether HTTP requests are sent
+        # - This allows live commands to be forwarded even when forwarder is in dry-run mode
+        payload = message.get("payload", {})
+        message_dry_run = payload.get("dry_run", True)  # Default to True if not specified
+        is_dry_run = message_dry_run  # Let the message control dry_run for forwarding
+
+        self.logger.debug(
+            "Forwarding decision for %s: message_dry_run=%s, is_dry_run=%s",
+            message.get("asset_id", "?"), message_dry_run, is_dry_run
+        )
+
+        if is_dry_run:
+            self.logger.info(
+                "[DRY-RUN] Would forward to target '%s': POST %s",
+                target.name, endpoint
+            )
+            self.logger.debug("[DRY-RUN] Body: %s", json.dumps(request_body, indent=2))
+            self.stats["requests_success"] += 1
+            self.stats["by_target"][target.name]["success"] += 1
+            return True
+
+        if not REQUESTS_AVAILABLE:
+            self.logger.error("Cannot forward - requests library not installed")
+            self.stats["requests_failed"] += 1
+            self.stats["by_target"][target.name]["failed"] += 1
+            return False
+
+        try:
+            self.logger.info("Forwarding to target '%s': POST %s", target.name, endpoint)
+
+            response = requests.post(
+                endpoint,
+                json=request_body,
+                auth=target.get_auth(),
+                timeout=target.timeout,
+                verify=target.verify_ssl
+            )
+
+            response_text = " ".join((response.text or "").split())
+
+            if response.status_code in [200, 201, 202, 204]:
+                self.logger.info(
+                    "Target '%s' responded: %d - %s",
+                    target.name, response.status_code, response_text[:200]
+                )
+                self.stats["requests_success"] += 1
+                self.stats["by_target"][target.name]["success"] += 1
+                return True
+            else:
+                self.logger.warning(
+                    "Target '%s' returned error: %d - %s",
+                    target.name, response.status_code, response_text[:200]
+                )
+                self.stats["requests_failed"] += 1
+                self.stats["by_target"][target.name]["failed"] += 1
+                return False
+
+        except requests.exceptions.Timeout:
+            self.logger.error("Target '%s' request timed out after %.1fs", target.name, target.timeout)
+            self.stats["requests_failed"] += 1
+            self.stats["by_target"][target.name]["failed"] += 1
+            return False
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error("Target '%s' connection error: %s", target.name, str(e))
+            self.stats["requests_failed"] += 1
+            self.stats["by_target"][target.name]["failed"] += 1
+            return False
+        except Exception as e:
+            self.logger.error("Target '%s' request failed: %s", target.name, str(e))
+            self.stats["requests_failed"] += 1
+            self.stats["by_target"][target.name]["failed"] += 1
+            return False
+
+    def get_statistics(self) -> dict:
+        """Get forwarding statistics."""
+        return self.stats
+
+
+# =============================================================================
 # COMMAND HANDLERS (DRY-RUN MODE)
 # =============================================================================
 
@@ -115,17 +690,27 @@ class CommandHandler:
     The dry_run mode can be:
     - Set globally via --dry-run flag (overrides message flag)
     - Read from each message's payload (if no global override)
+
+    When targets are configured, commands are forwarded to the matching
+    HTTP endpoints (e.g., aem-server-simulator).
     """
     
-    def __init__(self, logger: logging.Logger, force_dry_run: bool = True):
+    def __init__(
+        self,
+        logger: logging.Logger,
+        force_dry_run: bool = True,
+        target_handler: TargetHandler = None
+    ):
         """
         Initialize command handler.
         
         :param logger: Logger instance
         :param force_dry_run: If True, always use dry-run mode regardless of message flag
+        :param target_handler: Optional TargetHandler for forwarding to external systems
         """
         self.logger = logger
         self.force_dry_run = force_dry_run
+        self.target_handler = target_handler
         self.commands_received = 0
         self.commands_by_type = {}
         self.commands_by_asset = {}
@@ -145,7 +730,7 @@ class CommandHandler:
         
         asset_id = message.get("asset_id", "unknown")
         asset_type = message.get("asset_type", "unknown")
-        command_type = message.get("command_type", "unknown")
+        command_type = message.get("command_type") or message.get("command") or "unknown"
         payload = message.get("payload", {})
         timestamp = message.get("timestamp", "")
         
@@ -230,9 +815,22 @@ class CommandHandler:
                 )
         
         else:
-            self.logger.info("  Payload:      %s", json.dumps(payload, indent=4))
+            # Log payload only at DEBUG level
+            self.logger.debug("  Payload: %s", json.dumps(payload, indent=4))
         
         self.logger.info("=" * 60)
+
+        # Forward to configured targets (if any)
+        if self.target_handler and self.target_handler.targets:
+            self.logger.info("-" * 60)
+            self.logger.info("FORWARDING TO TARGETS...")
+            forward_success = self.target_handler.forward_command(message)
+            if forward_success:
+                self.logger.info("Forwarding completed successfully")
+            else:
+                self.logger.warning("Forwarding failed for some targets")
+            self.logger.info("=" * 60)
+
         return True
     
     def handle_measurement(self, message: dict) -> bool:
@@ -530,6 +1128,44 @@ class RabbitMQConsumer:
 
 
 # =============================================================================
+# CONNS.JSON LOADER
+# =============================================================================
+
+def _load_conns_config(path: str, logger: logging.Logger, extra_base_dirs: Optional[List[str]] = None) -> dict:
+    """Load conns.json configuration if present."""
+    if not path:
+        return {}
+
+    candidate_paths = []
+    if os.path.isabs(path):
+        candidate_paths.append(path)
+    else:
+        script_dir = os.path.dirname(__file__)
+        candidate_paths.append(os.path.join(script_dir, path))
+        candidate_paths.append(os.path.join(os.getcwd(), path))
+        for base_dir in extra_base_dirs or []:
+            candidate_paths.append(os.path.join(base_dir, path))
+
+    candidate_paths = [os.path.normpath(p) for p in candidate_paths]
+
+    for config_path in candidate_paths:
+        if not os.path.exists(config_path):
+            logger.debug("conns.json not found at: %s", config_path)
+            continue
+        try:
+            with open(config_path, 'r') as f:
+                data = json.load(f)
+            logger.info("Loaded conns.json from %s (keys: %s)", config_path, sorted(data.keys()))
+            return data
+        except Exception as e:
+            logger.error("Failed to load conns.json from %s: %s", config_path, str(e))
+            return {}
+
+    logger.warning("conns.json not found. Paths tried: %s", candidate_paths)
+    return {}
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -539,20 +1175,23 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Start forwarder in dry-run mode (default)
-  python forwarder.py --dry-run
+  # Start forwarder with default config file (conf/forwarder_targets.json)
+  python forwarder.py
+
+  # Start forwarder with custom config file
+  python forwarder.py --config ../conf/forwarder_targets.json
+
+  # Start in live mode (actually forward commands)
+  python forwarder.py --live --config ../conf/forwarder_targets.json
 
   # Listen with verbose logging
-  python forwarder.py --dry-run --log-level DEBUG
+  python forwarder.py --log-level DEBUG
 
   # Filter by asset types
-  python forwarder.py --dry-run --asset-types heat_pump,ev_charger
+  python forwarder.py --asset-types heat_pump,ev_charger
 
   # Custom RabbitMQ server
-  python forwarder.py --dry-run --rabbitmq-host rabbitmq.local
-
-  # With logging to file
-  python forwarder.py --dry-run --log-file /var/log/forwarder.log
+  python forwarder.py --rabbitmq-host rabbitmq.local
         """
     )
     
@@ -625,6 +1264,18 @@ Examples:
         help="Path to log file (env: FORWARDER_LOG_FILE)"
     )
     
+    # Target configuration arguments
+    parser.add_argument(
+        "--config", "-c",
+        default=get_env("FORWARDER_CONFIG", "../conf/forwarder_targets.json"),
+        help="Path to targets configuration file (env: FORWARDER_CONFIG)"
+    )
+    parser.add_argument(
+        "--conns",
+        default=get_env("FORWARDER_CONNS", "../conf/private/conns.json"),
+        help="Path to conns.json file (env: FORWARDER_CONNS)"
+    )
+
     args = parser.parse_args()
     
     # Setup logging
@@ -672,9 +1323,77 @@ Examples:
     
     logger.info("Queues: %s", queues_to_consume)
     
+    # Create target handler for forwarding to external systems
+    target_handler = TargetHandler(logger, dry_run=force_dry_run)
+
+    # Resolve targets config path
+    config_path = args.config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(os.path.dirname(__file__), config_path)
+    config_dir = os.path.dirname(config_path)
+    fallback_conns_path = os.path.join(config_dir, "private", "conns.json")
+    fallback_conns_loaded = False
+
+    # Load conns.json (optional, used for reference_api targets)
+    logger.info("Using conns.json path: %s", args.conns)
+    conns_config = _load_conns_config(args.conns, logger, extra_base_dirs=[config_dir])
+    target_handler.set_conns_lookup(args.conns, [config_dir], conns_config, [fallback_conns_path])
+
+    # Load targets from config file
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                targets_config = json.load(f)
+
+            for target_data in targets_config.get("targets", []):
+                target_config = TargetConfig.from_dict(target_data)
+                reference_api = target_config.reference_api
+                if reference_api:
+                    api_config = conns_config.get(reference_api)
+                    if not api_config and not fallback_conns_loaded and os.path.exists(fallback_conns_path):
+                        logger.info("Attempting fallback conns.json at: %s", fallback_conns_path)
+                        conns_config = _load_conns_config(fallback_conns_path, logger)
+                        target_handler.set_conns_lookup(fallback_conns_path, [config_dir], conns_config, [fallback_conns_path])
+                        fallback_conns_loaded = True
+                        api_config = conns_config.get(reference_api)
+                    if api_config:
+                        target_config.apply_api_config(api_config)
+                        logger.info(
+                            "Target '%s' reference_api '%s' resolved controlUrl '%s' (user: %s)",
+                            target_config.name,
+                            reference_api,
+                            target_config.url or "",
+                            target_config.auth_user or ""
+                        )
+                    else:
+                        logger.warning(
+                            "Target '%s' references unknown API '%s' in conns.json",
+                            target_config.name, reference_api
+                        )
+                else:
+                    logger.debug("Target '%s' has no reference_api configured", target_config.name)
+                target_handler.add_target(target_config)
+
+            logger.info("Loaded %d target(s) from config file: %s",
+                       len(target_handler.targets), config_path)
+        except Exception as e:
+            logger.error("Failed to load targets config from %s: %s", config_path, str(e))
+    else:
+        logger.warning("Config file not found: %s", config_path)
+        logger.info("No forwarding targets configured - commands will only be logged")
+
+    if target_handler.targets:
+        logger.info("-" * 60)
+        logger.info("Configured forwarding targets:")
+        for name, target in target_handler.targets.items():
+            logger.info("  - %s: %s (auth: %s)",
+                       name, target.url,
+                       "enabled" if target.get_auth() else "disabled")
+        logger.info("-" * 60)
+
     # Create handler
-    handler = CommandHandler(logger, force_dry_run=force_dry_run)
-    
+    handler = CommandHandler(logger, force_dry_run=force_dry_run, target_handler=target_handler)
+
     # Create consumer
     consumer = RabbitMQConsumer(
         host=args.rabbitmq_host,
@@ -744,3 +1463,4 @@ Examples:
 
 if __name__ == "__main__":
     main()
+
