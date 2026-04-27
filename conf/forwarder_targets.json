@@ -10,12 +10,23 @@
       "asset_ids": null,
       "description": "AEM API (test instance)",
       "endpoint_template": "{api.controlUrl}/{payload.community}/{payload.site_id}/{payload.asset_id}",
+      "asset_request_profiles": {
+        "ECM96.2": {
+          "endpoint": "/ECM/ECM96/hp",
+          "body_mode": "hp_control"
+        },
+        "ECM63.1": {
+          "endpoint": "/ECM/ECM63/charge_point_ev_1",
+          "body_mode": "ev_power_timeseries"
+        },
+        "ECM63.2": {
+          "endpoint": "/ECM/ECM63/charge_point_ev_2",
+          "body_mode": "ev_power_timeseries"
+        }
+      },
       "body_template": {
         "power": {"$map": ["payload.discrete_state", "payload.target_state", "target_state"], "type": "on_off"},
         "time": {"$map": "payload.slot_start", "type": "datetime_utc_future_minute"}
-      },
-      "endpoint_overrides": {
-        "ECM96.2": "/ECM/ECM96/hp"
       }
     }
   ],

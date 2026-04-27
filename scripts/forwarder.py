@@ -124,6 +124,15 @@ def _get_by_path(data: dict, path: str) -> Any:
     return value
 
 
+def _first_by_paths(data: dict, paths: List[str]) -> Any:
+    """Return the first non-None value found for the given dotted paths."""
+    for path in paths:
+        value = _get_by_path(data, path)
+        if value is not None:
+            return value
+    return None
+
+
 def _to_bool(value: Any) -> Optional[bool]:
     """Convert common string/number representations to bool."""
     if isinstance(value, bool):
@@ -194,6 +203,109 @@ def _format_datetime_utc_future_minute(value: Any, now: Optional[datetime] = Non
 
     next_minute = reference_now.replace(second=0, microsecond=0) + timedelta(minutes=1)
     return max(dt, next_minute).isoformat(timespec="seconds")
+
+
+def _coerce_float(value: Any, field_name: str) -> float:
+    """Convert a value to float or raise a clear ValueError."""
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} value {value!r} is not a valid float") from exc
+
+
+def _build_ev_power_timeseries_body(context: dict) -> dict:
+    """Build the AEM EV request body from a single step or schedule."""
+    payload = context.get("payload") or {}
+    schedule = payload.get("schedule")
+
+    if schedule is not None:
+        if isinstance(schedule, list):
+            if not schedule:
+                raise ValueError("EV schedule is empty")
+
+            body = {}
+            for index, entry in enumerate(schedule):
+                if not isinstance(entry, dict):
+                    raise ValueError(f"EV schedule entry at index {index} must be an object")
+
+                timestamp = None
+                for key in ["time", "slot_start", "timestamp"]:
+                    if entry.get(key) is not None:
+                        timestamp = entry.get(key)
+                        break
+                if timestamp is None:
+                    raise ValueError(
+                        f"EV schedule entry at index {index} is missing timestamp "
+                        "(time/slot_start/timestamp)"
+                    )
+
+                formatted_time = _format_datetime_utc(timestamp)
+                if formatted_time is None:
+                    raise ValueError(
+                        f"EV schedule entry at index {index} has invalid timestamp {timestamp!r}"
+                    )
+
+                power_value = None
+                for key in ["power_kw", "target_power_kw", "kw", "power"]:
+                    if entry.get(key) is not None:
+                        power_value = entry.get(key)
+                        break
+                if power_value is None:
+                    raise ValueError(
+                        f"EV schedule entry at index {index} is missing power "
+                        "(power_kw/target_power_kw/kw/power)"
+                    )
+
+                body[formatted_time] = _coerce_float(
+                    power_value,
+                    f"EV schedule entry at index {index} power",
+                )
+
+            return body
+
+        if isinstance(schedule, dict):
+            if not schedule:
+                raise ValueError("EV schedule is empty")
+
+            body = {}
+            for timestamp, power_value in schedule.items():
+                formatted_time = _format_datetime_utc(timestamp)
+                if formatted_time is None:
+                    raise ValueError(f"EV schedule entry timestamp {timestamp!r} is invalid")
+                body[formatted_time] = _coerce_float(
+                    power_value,
+                    f"EV schedule entry for {formatted_time} power",
+                )
+
+            return body
+
+        raise ValueError("EV schedule must be a list or object")
+
+    timestamp = _first_by_paths(
+        context,
+        ["payload.slot_start", "payload.time", "payload.timestamp", "timestamp"],
+    )
+    if timestamp is None:
+        raise ValueError(
+            "EV request is missing timestamp "
+            "(payload.slot_start/payload.time/payload.timestamp/timestamp)"
+        )
+
+    formatted_time = _format_datetime_utc(timestamp)
+    if formatted_time is None:
+        raise ValueError(f"EV request timestamp {timestamp!r} is invalid")
+
+    power_value = _first_by_paths(
+        context,
+        ["payload.power_kw", "payload.target_power_kw", "payload.kw", "payload.power"],
+    )
+    if power_value is None:
+        raise ValueError(
+            "EV request is missing power "
+            "(payload.power_kw/payload.target_power_kw/payload.kw/payload.power)"
+        )
+
+    return {formatted_time: _coerce_float(power_value, "EV request power")}
 
 
 def _render_template(template: str, context: dict) -> str:
@@ -286,6 +398,7 @@ class TargetConfig:
         enabled: bool = True,
         endpoint_template: Optional[str] = None,
         endpoint_overrides: Optional[dict] = None,
+        asset_request_profiles: Optional[dict] = None,
         body_template: Optional[dict] = None,
         reference_api: Optional[str] = None,
         timeout_is_configured: bool = False
@@ -304,6 +417,7 @@ class TargetConfig:
         :param enabled: Whether this target is enabled
         :param endpoint_template: Optional endpoint template for this target
         :param endpoint_overrides: Optional asset-specific endpoint overrides
+        :param asset_request_profiles: Optional asset-specific request profiles
         :param body_template: Optional body template for this target
         :param reference_api: Optional API key to load from conns.json
         :param timeout_is_configured: Whether timeout was explicitly set in config
@@ -319,6 +433,7 @@ class TargetConfig:
         self.enabled = enabled
         self.endpoint_template = endpoint_template
         self.endpoint_overrides = endpoint_overrides or {}
+        self.asset_request_profiles = asset_request_profiles or {}
         self.body_template = body_template
         self.reference_api = reference_api
         self._timeout_is_configured = timeout_is_configured
@@ -368,6 +483,7 @@ class TargetConfig:
             enabled=data.get("enabled", True),
             endpoint_template=data.get("endpoint_template"),
             endpoint_overrides=data.get("endpoint_overrides") or data.get("custom_commands") or data.get("custom_commans"),
+            asset_request_profiles=data.get("asset_request_profiles"),
             body_template=data.get("body_template"),
             reference_api=data.get("reference_api"),
             timeout_is_configured=timeout_is_configured
@@ -388,6 +504,49 @@ class TargetConfig:
         if not self._timeout_is_configured and api_config.get("requestTimeout") is not None:
             self.timeout = api_config.get("requestTimeout")
 
+    def _resolve_configured_endpoint(self, endpoint_value: Any, context: dict, asset_id: Optional[str], label: str) -> str:
+        """Resolve an absolute or relative endpoint value against the base URL."""
+        rendered = _render_template(str(endpoint_value), context)
+        if not rendered:
+            raise ValueError(f"{label} rendered empty for asset_id='{asset_id}'")
+
+        if rendered.startswith("http://") or rendered.startswith("https://"):
+            return rendered
+
+        if not self.url:
+            api_control_url = None
+            if isinstance(self._api_config, dict):
+                api_control_url = self._api_config.get("controlUrl") or self._api_config.get("controlURL")
+            raise ValueError(
+                f"{label} requires base URL but none is configured "
+                f"(asset_id='{asset_id}', value='{endpoint_value}', api.controlUrl='{api_control_url}')"
+            )
+
+        return f"{self.url.rstrip('/')}/{rendered.lstrip('/')}"
+
+    def _build_default_request_body(self, message: dict, command_type: str, payload: dict, context: dict) -> dict:
+        """Build the request body using the legacy body_template/default behavior."""
+        if self.body_template:
+            return _apply_template(self.body_template, context)
+
+        return {
+            "command": command_type,
+            "asset_id": message.get("asset_id"),
+            "asset_type": message.get("asset_type"),
+            "timestamp": message.get("timestamp"),
+            "payload": payload
+        }
+
+    def _build_body_for_mode(self, body_mode: Optional[str], message: dict, command_type: str, payload: dict, context: dict) -> dict:
+        """Build the request body for the selected profile mode."""
+        if not body_mode or body_mode == "hp_control":
+            return self._build_default_request_body(message, command_type, payload, context)
+
+        if body_mode == "ev_power_timeseries":
+            return _build_ev_power_timeseries_body(context)
+
+        raise ValueError(f"Unsupported body_mode '{body_mode}'")
+
     def build_request(self, message: dict) -> (str, dict):
         """Build endpoint and body for this target, using templates when provided."""
         command_type = message.get("command_type") or message.get("command") or "unknown"
@@ -396,32 +555,47 @@ class TargetConfig:
         if self._api_config:
             context["api"] = self._api_config
         asset_id = message.get("asset_id") or payload.get("asset_id")
+        request_profile = self.asset_request_profiles.get(asset_id) if asset_id else None
+        profile_endpoint = None
+        profile_body_mode = None
+
+        if request_profile is not None:
+            if not isinstance(request_profile, dict):
+                raise ValueError(
+                    f"Target '{self.name}' request profile for asset '{asset_id}' must be an object"
+                )
+            profile_endpoint = request_profile.get("endpoint")
+            profile_body_mode = request_profile.get("body_mode")
+            logging.getLogger("forwarder").info(
+                "Target '%s' using request profile for asset '%s': body_mode=%s, endpoint=%s",
+                self.name,
+                asset_id,
+                profile_body_mode,
+                profile_endpoint,
+            )
+
         endpoint_override = self.endpoint_overrides.get(asset_id) if asset_id else None
 
-        if endpoint_override is not None:
-            rendered_override = _render_template(str(endpoint_override), context)
-            if not rendered_override:
-                raise ValueError(
-                    f"Endpoint override rendered empty for asset_id='{asset_id}'"
-                )
+        if profile_endpoint is not None:
+            endpoint = self._resolve_configured_endpoint(
+                profile_endpoint,
+                context,
+                asset_id,
+                "Request profile endpoint",
+            )
+        elif endpoint_override is not None:
             logging.getLogger("forwarder").info(
                 "Target '%s' using endpoint override for asset '%s': %s",
                 self.name,
                 asset_id,
-                rendered_override,
+                _render_template(str(endpoint_override), context),
             )
-            if rendered_override.startswith("http://") or rendered_override.startswith("https://"):
-                endpoint = rendered_override
-            else:
-                if not self.url:
-                    api_control_url = None
-                    if isinstance(self._api_config, dict):
-                        api_control_url = self._api_config.get("controlUrl") or self._api_config.get("controlURL")
-                    raise ValueError(
-                        "Endpoint override requires base URL but none is configured "
-                        f"(asset_id='{asset_id}', endpoint_override='{endpoint_override}', api.controlUrl='{api_control_url}')"
-                    )
-                endpoint = f"{self.url.rstrip('/')}/{rendered_override.lstrip('/')}"
+            endpoint = self._resolve_configured_endpoint(
+                endpoint_override,
+                context,
+                asset_id,
+                "Endpoint override",
+            )
         elif self.endpoint_template:
             if "api." in self.endpoint_template and "api" not in context:
                 raise ValueError("Endpoint template references api.* but reference_api is not loaded")
@@ -446,16 +620,13 @@ class TargetConfig:
             else:
                 endpoint = f"{self.url}/command"
 
-        if self.body_template:
-            request_body = _apply_template(self.body_template, context)
-        else:
-            request_body = {
-                "command": command_type,
-                "asset_id": message.get("asset_id"),
-                "asset_type": message.get("asset_type"),
-                "timestamp": message.get("timestamp"),
-                "payload": payload
-            }
+        request_body = self._build_body_for_mode(
+            profile_body_mode,
+            message,
+            command_type,
+            payload,
+            context,
+        )
 
         return endpoint, request_body
 
