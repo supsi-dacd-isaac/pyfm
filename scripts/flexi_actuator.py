@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+One-shot RabbitMQ actuator for flexibility assets.
+
+This script builds a direct command map such as:
+    {"ECM96.2": "force_off", "ECM97.1": "force_off"}
+
+It then translates supported commands into the same RabbitMQ command
+envelopes used by flexi_manager.py so the existing forwarder/consumer
+stack can process them, without running the full flexibility manager.
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional
+
+# RabbitMQ support (optional)
+try:
+    import pika
+
+    RABBITMQ_AVAILABLE = True
+except ImportError:
+    RABBITMQ_AVAILABLE = False
+
+
+SUPPORTED_COMMANDS = {
+    "force_off": "force_off",
+    "off": "force_off",
+    "force_on": "force_on",
+    "on": "force_on",
+    "restore": "restore",
+}
+
+MODULATION_DEFAULTS = {
+    "heat_pump": {"modulation_type": "discrete"},
+    "ev_charger": {"modulation_type": "continuous"},
+}
+
+
+class RabbitMQPublisher:
+    """
+    Publishes control commands to RabbitMQ using the same exchange, queue,
+    routing-key, and message serialization conventions as flexi_manager.py.
+    """
+
+    DEFAULT_EXCHANGE = "flexi_commands"
+    DEFAULT_QUEUE_COMMANDS = "asset_commands"
+    DEFAULT_QUEUE_MEASUREMENTS = "asset_measurements"
+
+    def __init__(
+        self,
+        host: str = "localhost",
+        port: int = 5672,
+        username: str = "guest",
+        password: str = "guest",
+        virtual_host: str = "/",
+        exchange: Optional[str] = None,
+        logger: Optional[logging.Logger] = None,
+    ):
+        if not RABBITMQ_AVAILABLE:
+            raise RuntimeError("pika library not installed. Run: pip install pika")
+
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.virtual_host = virtual_host
+        self.exchange = exchange or self.DEFAULT_EXCHANGE
+        self.logger = logger or logging.getLogger(__name__)
+
+        self.connection = None
+        self.channel = None
+        self._connected = False
+
+    def connect(self) -> bool:
+        """Establish connection to RabbitMQ server."""
+        try:
+            credentials = pika.PlainCredentials(self.username, self.password)
+            parameters = pika.ConnectionParameters(
+                host=self.host,
+                port=self.port,
+                virtual_host=self.virtual_host,
+                credentials=credentials,
+                heartbeat=600,
+                blocked_connection_timeout=300,
+            )
+
+            self.connection = pika.BlockingConnection(parameters)
+            self.channel = self.connection.channel()
+
+            self.channel.exchange_declare(
+                exchange=self.exchange,
+                exchange_type="topic",
+                durable=True,
+            )
+            self.channel.queue_declare(
+                queue=self.DEFAULT_QUEUE_COMMANDS,
+                durable=True,
+            )
+            self.channel.queue_declare(
+                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
+                durable=True,
+            )
+            self.channel.queue_bind(
+                exchange=self.exchange,
+                queue=self.DEFAULT_QUEUE_COMMANDS,
+                routing_key="commands.#",
+            )
+            self.channel.queue_bind(
+                exchange=self.exchange,
+                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
+                routing_key="measurements.#",
+            )
+
+            self._connected = True
+            self.logger.info(
+                "Connected to RabbitMQ at %s:%d (exchange: %s)",
+                self.host,
+                self.port,
+                self.exchange,
+            )
+            return True
+
+        except Exception as exc:
+            self.logger.error("Failed to connect to RabbitMQ: %s", str(exc))
+            self._connected = False
+            return False
+
+    def disconnect(self):
+        """Close RabbitMQ connection."""
+        if self.connection and self.connection.is_open:
+            try:
+                self.connection.close()
+                self.logger.info("Disconnected from RabbitMQ")
+            except Exception as exc:
+                self.logger.warning("Error closing RabbitMQ connection: %s", str(exc))
+        self._connected = False
+
+    def is_connected(self) -> bool:
+        """Check if connected to RabbitMQ."""
+        return self._connected and self.connection and self.connection.is_open
+
+    def publish_command(
+        self,
+        asset_id: str,
+        asset_type: str,
+        command_type: str,
+        payload: dict,
+        priority: int = 5,
+    ) -> bool:
+        """Publish a control command to RabbitMQ."""
+        if not self.is_connected():
+            self.logger.warning("Not connected to RabbitMQ - cannot publish command")
+            return False
+
+        routing_key = f"commands.{asset_type}.{asset_id}"
+        message = {
+            "message_type": "command",
+            "asset_id": asset_id,
+            "asset_type": asset_type,
+            "command_type": command_type,
+            "payload": payload,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "priority": priority,
+        }
+
+        try:
+            self.channel.basic_publish(
+                exchange=self.exchange,
+                routing_key=routing_key,
+                body=json.dumps(message),
+                properties=pika.BasicProperties(
+                    delivery_mode=2,
+                    content_type="application/json",
+                    priority=priority,
+                ),
+            )
+            self.logger.debug(
+                "Published command to %s: %s -> %s",
+                routing_key,
+                command_type,
+                asset_id,
+            )
+            return True
+
+        except Exception as exc:
+            self.logger.error("Failed to publish command: %s", str(exc))
+            return False
+
+    def publish_batch_commands(self, commands: List[dict], slot_info: Optional[dict] = None) -> int:
+        """Publish multiple commands as a batch."""
+        if not self.is_connected():
+            self.logger.warning("Not connected to RabbitMQ - cannot publish batch")
+            return 0
+
+        success_count = 0
+
+        if slot_info:
+            batch_header = {
+                "message_type": "batch_start",
+                "slot_info": slot_info,
+                "command_count": len(commands),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                self.channel.basic_publish(
+                    exchange=self.exchange,
+                    routing_key="commands.batch.header",
+                    body=json.dumps(batch_header),
+                    properties=pika.BasicProperties(
+                        delivery_mode=2,
+                        content_type="application/json",
+                    ),
+                )
+            except Exception as exc:
+                self.logger.warning("Failed to publish batch header: %s", str(exc))
+
+        for cmd in commands:
+            if self.publish_command(
+                asset_id=cmd.get("asset_id"),
+                asset_type=cmd.get("asset_type"),
+                command_type=cmd.get("command_type"),
+                payload=cmd.get("payload", {}),
+                priority=cmd.get("priority", 5),
+            ):
+                success_count += 1
+
+        self.logger.info(
+            "Published %d/%d commands to RabbitMQ",
+            success_count,
+            len(commands),
+        )
+        return success_count
+
+
+def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
+    """Configure logging with the same formatter used by flexi_manager.py."""
+    logger = logging.getLogger("flexi_actuator")
+    logger.setLevel(getattr(logging, log_level.upper()))
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter("%(asctime)s::%(levelname)s::%(funcName)s::%(message)s")
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    if log_file:
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+
+def _resolve_config_path(config_path: str) -> str:
+    """Resolve config path with the same relative-path behavior as flexi_manager.py."""
+    if os.path.isabs(config_path):
+        return config_path
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), config_path))
+
+
+def _load_config(config_path: str, logger: logging.Logger) -> dict:
+    """Load JSON configuration from disk."""
+    try:
+        with open(config_path, "r") as handle:
+            return json.load(handle)
+    except FileNotFoundError:
+        logger.error("Configuration file not found: %s", config_path)
+        sys.exit(1)
+    except json.JSONDecodeError as exc:
+        logger.error("Invalid JSON in configuration file: %s", str(exc))
+        sys.exit(1)
+
+
+def _collect_flexibilities(args) -> List[str]:
+    """Collect flexibility labels from both supported CLI styles."""
+    labels: List[str] = []
+    if args.flexibility:
+        labels.extend(args.flexibility)
+    if args.flexibilities:
+        labels.extend(args.flexibilities)
+    return labels
+
+
+def _deduplicate_labels(labels: List[str], logger: logging.Logger) -> List[str]:
+    """Preserve order while removing duplicates."""
+    seen = set()
+    unique_labels = []
+
+    for label in labels:
+        if label in seen:
+            logger.warning("Ignoring duplicate flexibility label: %s", label)
+            continue
+        seen.add(label)
+        unique_labels.append(label)
+
+    return unique_labels
+
+
+def _normalize_command(command: str, logger: logging.Logger) -> str:
+    """Normalize and validate the requested actuator command."""
+    normalized = (command or "").strip().lower()
+
+    if not normalized:
+        logger.error("Command must be non-empty")
+        sys.exit(1)
+
+    if normalized not in SUPPORTED_COMMANDS:
+        logger.error(
+            "Unsupported command '%s'. Supported commands: %s",
+            command,
+            sorted(SUPPORTED_COMMANDS.keys()),
+        )
+        sys.exit(1)
+
+    return SUPPORTED_COMMANDS[normalized]
+
+
+def _validate_labels(labels: List[str], config: dict, fsp: str, logger: logging.Logger) -> List[str]:
+    """Validate that all requested labels are defined and belong to the FSP."""
+    asset_mapping = config.get("asset_mapping", {})
+    fsp_assets = set(config.get("fm", {}).get("actors", {}).get("fsps", {}).get(fsp, {}).get("assets", []))
+
+    unknown = [label for label in labels if label not in asset_mapping]
+    if unknown:
+        logger.error("Unknown flexibility labels: %s", unknown)
+        logger.error("Available labels: %s", sorted(asset_mapping.keys()))
+        sys.exit(1)
+
+    if fsp_assets:
+        unavailable = [label for label in labels if label not in fsp_assets]
+        if unavailable:
+            logger.error("Flexibility labels not configured for FSP '%s': %s", fsp, unavailable)
+            logger.error("FSP '%s' assets: %s", fsp, sorted(fsp_assets))
+            sys.exit(1)
+
+    return labels
+
+
+def _get_modulation_type(asset_config: dict) -> str:
+    """Get modulation type with the same fallback behavior as flexi_manager.py."""
+    if "modulation_type" in asset_config:
+        return asset_config["modulation_type"]
+    asset_type = asset_config.get("type", "")
+    defaults = MODULATION_DEFAULTS.get(asset_type, {})
+    return defaults.get("modulation_type", "continuous")
+
+
+def _determine_discrete_state(asset_config: dict, curtailment_kw: float) -> tuple:
+    """Determine the target ON/OFF state using manager logic."""
+    capacity_kw = asset_config.get("capacity_kw", 0)
+    discrete_states = asset_config.get("discrete_states_kw", [0.0, capacity_kw])
+    threshold_pct = asset_config.get("curtailment_threshold_pct", 50.0)
+    threshold_kw = capacity_kw * (threshold_pct / 100.0)
+
+    if curtailment_kw >= threshold_kw:
+        return "OFF", min(discrete_states)
+    return "ON", max(discrete_states)
+
+
+def _build_curtail_command(
+    asset_id: str,
+    asset_config: dict,
+    community: Optional[str],
+    curtailment_kw: float,
+    duration_minutes: int,
+    original_command: str,
+    logger: logging.Logger,
+) -> tuple:
+    """Build a manager-compatible curtail command envelope."""
+    asset_type = asset_config.get("type", "unknown")
+    description = asset_config.get("description", asset_id)
+    site_id = asset_config.get("pod", "")
+    capacity_kw = float(asset_config.get("capacity_kw", 0) or 0)
+    modulation_type = _get_modulation_type(asset_config)
+
+    if modulation_type == "discrete":
+        discrete_state, target_power_kw = _determine_discrete_state(asset_config, curtailment_kw)
+        actual_curtailment_kw = capacity_kw - target_power_kw
+    else:
+        discrete_state = None
+        target_power_kw = max(0.0, capacity_kw - curtailment_kw)
+        actual_curtailment_kw = curtailment_kw
+
+    payload = {
+        "community": community,
+        "site_id": site_id,
+        "asset_id": asset_id,
+        "description": description,
+        "asset_type": asset_type,
+        "modulation_type": modulation_type,
+        "requested_curtailment_kw": curtailment_kw,
+        "actual_curtailment_kw": actual_curtailment_kw,
+        "target_power_kw": target_power_kw,
+        "capacity_kw": capacity_kw,
+        "duration_minutes": duration_minutes,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "requested_command": original_command,
+    }
+
+    if modulation_type == "discrete":
+        payload["discrete_state"] = discrete_state
+        logger.info(
+            "Queued command: set %s (%s) to %s (target: %.2f kW) for %d minutes",
+            asset_id,
+            description,
+            discrete_state,
+            target_power_kw,
+            duration_minutes,
+        )
+    else:
+        logger.info(
+            "Queued command: curtail %s (%s): %.2f kW (target: %.2f kW) for %d minutes",
+            asset_id,
+            description,
+            curtailment_kw,
+            target_power_kw,
+            duration_minutes,
+        )
+
+    command = {
+        "asset_id": asset_id,
+        "asset_type": asset_type,
+        "command_type": "curtail",
+        "payload": payload,
+        "priority": 7,
+    }
+
+    return command, actual_curtailment_kw
+
+
+def _build_restore_command(
+    asset_id: str,
+    asset_config: dict,
+    community: Optional[str],
+    original_command: str,
+    logger: logging.Logger,
+) -> tuple:
+    """Build a manager-compatible restore command envelope."""
+    asset_type = asset_config.get("type", "unknown")
+    description = asset_config.get("description", asset_id)
+    site_id = asset_config.get("pod", "")
+
+    payload = {
+        "community": community,
+        "site_id": site_id,
+        "asset_id": asset_id,
+        "description": description,
+        "asset_type": asset_type,
+        "action": "restore",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "requested_command": original_command,
+    }
+
+    logger.info("Queued restore command for %s (%s)", asset_id, description)
+
+    command = {
+        "asset_id": asset_id,
+        "asset_type": asset_type,
+        "command_type": "restore",
+        "payload": payload,
+        "priority": 5,
+    }
+
+    return command, 0.0
+
+
+def _build_rabbitmq_command(
+    asset_id: str,
+    asset_config: dict,
+    community: Optional[str],
+    normalized_command: str,
+    original_command: str,
+    duration_minutes: int,
+    logger: logging.Logger,
+) -> tuple:
+    """Translate direct actuator commands into manager-compatible RabbitMQ commands."""
+    if normalized_command == "force_off":
+        capacity_kw = float(asset_config.get("capacity_kw", 0) or 0)
+        return _build_curtail_command(
+            asset_id=asset_id,
+            asset_config=asset_config,
+            community=community,
+            curtailment_kw=capacity_kw,
+            duration_minutes=duration_minutes,
+            original_command=original_command,
+            logger=logger,
+        )
+
+    if normalized_command == "force_on":
+        return _build_curtail_command(
+            asset_id=asset_id,
+            asset_config=asset_config,
+            community=community,
+            curtailment_kw=0.0,
+            duration_minutes=duration_minutes,
+            original_command=original_command,
+            logger=logger,
+        )
+
+    if normalized_command == "restore":
+        return _build_restore_command(
+            asset_id=asset_id,
+            asset_config=asset_config,
+            community=community,
+            original_command=original_command,
+            logger=logger,
+        )
+
+    raise ValueError(f"Unsupported actuator command: {normalized_command}")
+
+
+def _build_slot_info(
+    fsp: str,
+    command_map: Dict[str, str],
+    duration_minutes: int,
+    dry_run: bool,
+    normalized_command: str,
+    total_flexibility_kw: float,
+) -> dict:
+    """Build minimal batch metadata for RabbitMQ publishing."""
+    slot_start = datetime.now(timezone.utc)
+    slot_end = slot_start + timedelta(minutes=duration_minutes)
+
+    return {
+        "fsp_id": fsp,
+        "slot_start": slot_start.isoformat(),
+        "slot_end": slot_end.isoformat(),
+        "total_flexibility_kw": total_flexibility_kw,
+        "allocation_strategy": "manual_actuation",
+        "strategy_id": "",
+        "dry_run": dry_run,
+        "requested_command": normalized_command,
+        "requested_payload": command_map,
+    }
+
+
+def _publish_commands(
+    publisher: RabbitMQPublisher,
+    commands: List[dict],
+    slot_info: dict,
+    dry_run: bool,
+    logger: logging.Logger,
+) -> int:
+    """Add runtime payload fields and publish the queued commands."""
+    logger.info("Publishing %d commands to RabbitMQ (dry_run=%s)...", len(commands), dry_run)
+
+    for command in commands:
+        command["payload"]["dry_run"] = dry_run
+        command["payload"]["slot_start"] = slot_info.get("slot_start")
+        command["payload"]["slot_end"] = slot_info.get("slot_end")
+
+    return publisher.publish_batch_commands(commands, slot_info=slot_info)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Flexibility Actuator - Publish one-shot flexibility commands to RabbitMQ",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibilities ECM96.2 ECM97.1 --command force_off
+  python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --flexibility ECM97.1 --command force_off
+  python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibilities ECM96.2 --command force_on --dry-run
+        """
+    )
+
+    parser.add_argument(
+        "--config_file", "-c",
+        default="../conf/test_fm01_aem.json",
+        help="Path to configuration file (default: ../conf/test_fm01_aem.json)",
+    )
+    parser.add_argument(
+        "--fsp", "-f",
+        required=True,
+        help="FSP identifier (e.g., supsi01)",
+    )
+    parser.add_argument(
+        "--flexibility",
+        action="append",
+        help="Flexibility label to actuate. Repeat the option to pass multiple labels.",
+    )
+    parser.add_argument(
+        "--flexibilities",
+        nargs="+",
+        help="Flexibility labels to actuate.",
+    )
+    parser.add_argument(
+        "--command",
+        required=True,
+        help="Direct command to apply (supported: force_off, force_on, restore)",
+    )
+    parser.add_argument(
+        "--duration-minutes",
+        type=int,
+        help="Command duration in minutes (default: config fm.granularity or 15)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print/log the generated payload without publishing to RabbitMQ",
+    )
+    parser.add_argument(
+        "--log-level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        default="INFO",
+        help="Logging level (default: INFO)",
+    )
+    parser.add_argument(
+        "--log_file",
+        help="Path to log file. If provided, logs will be written to this file in addition to console.",
+    )
+    parser.add_argument(
+        "--rabbitmq-host",
+        default="localhost",
+        help="RabbitMQ server hostname (default: localhost)",
+    )
+    parser.add_argument(
+        "--rabbitmq-port",
+        type=int,
+        default=5672,
+        help="RabbitMQ server port (default: 5672)",
+    )
+    parser.add_argument(
+        "--rabbitmq-user",
+        default="guest",
+        help="RabbitMQ username (default: guest)",
+    )
+    parser.add_argument(
+        "--rabbitmq-pass",
+        default="guest",
+        help="RabbitMQ password (default: guest)",
+    )
+    parser.add_argument(
+        "--rabbitmq-vhost",
+        default="/",
+        help="RabbitMQ virtual host (default: /)",
+    )
+    parser.add_argument(
+        "--rabbitmq-exchange",
+        default=RabbitMQPublisher.DEFAULT_EXCHANGE,
+        help=f"RabbitMQ exchange name (default: {RabbitMQPublisher.DEFAULT_EXCHANGE})",
+    )
+
+    args = parser.parse_args()
+
+    logger = setup_logging(args.log_level, args.log_file)
+
+    labels = _deduplicate_labels(_collect_flexibilities(args), logger)
+    if not labels:
+        logger.error("At least one flexibility label must be provided")
+        sys.exit(1)
+
+    normalized_command = _normalize_command(args.command, logger)
+
+    config_path = _resolve_config_path(args.config_file)
+    config = _load_config(config_path, logger)
+
+    fsps = config.get("fm", {}).get("actors", {}).get("fsps", {})
+    if args.fsp not in fsps:
+        logger.error("FSP '%s' not found in configuration", args.fsp)
+        logger.error("Available FSPs: %s", sorted(fsps.keys()))
+        sys.exit(1)
+
+    labels = _validate_labels(labels, config, args.fsp, logger)
+    command_map = {label: args.command.strip() for label in labels}
+
+    duration_minutes = args.duration_minutes
+    if duration_minutes is None:
+        duration_minutes = int(config.get("fm", {}).get("granularity", 15) or 15)
+    if duration_minutes <= 0:
+        logger.error("Duration must be a positive integer")
+        sys.exit(1)
+
+    logger.info("Requested actuator payload: %s", json.dumps(command_map, indent=2))
+
+    if args.dry_run:
+        logger.info("[DRY-RUN] Skipping RabbitMQ publish")
+        sys.exit(0)
+
+    if not RABBITMQ_AVAILABLE:
+        logger.error("pika library not installed. Run: pip install pika")
+        sys.exit(1)
+
+    community = config.get("fm", {}).get("community")
+    asset_mapping = config.get("asset_mapping", {})
+    commands = []
+    total_flexibility_kw = 0.0
+
+    for asset_id in labels:
+        try:
+            command, actual_curtailment_kw = _build_rabbitmq_command(
+                asset_id=asset_id,
+                asset_config=asset_mapping[asset_id],
+                community=community,
+                normalized_command=normalized_command,
+                original_command=args.command.strip(),
+                duration_minutes=duration_minutes,
+                logger=logger,
+            )
+            commands.append(command)
+            total_flexibility_kw += actual_curtailment_kw
+        except Exception as exc:
+            logger.error("Failed to prepare command for %s: %s", asset_id, str(exc))
+            sys.exit(1)
+
+    slot_info = _build_slot_info(
+        fsp=args.fsp,
+        command_map=command_map,
+        duration_minutes=duration_minutes,
+        dry_run=False,
+        normalized_command=normalized_command,
+        total_flexibility_kw=total_flexibility_kw,
+    )
+
+    publisher = RabbitMQPublisher(
+        host=args.rabbitmq_host,
+        port=args.rabbitmq_port,
+        username=args.rabbitmq_user,
+        password=args.rabbitmq_pass,
+        virtual_host=args.rabbitmq_vhost,
+        exchange=args.rabbitmq_exchange,
+        logger=logger,
+    )
+
+    try:
+        if not publisher.connect():
+            logger.error("Could not connect to RabbitMQ")
+            sys.exit(1)
+
+        expected_count = len(commands)
+        published_count = _publish_commands(
+            publisher=publisher,
+            commands=commands,
+            slot_info=slot_info,
+            dry_run=False,
+            logger=logger,
+        )
+
+        if published_count != expected_count:
+            logger.error(
+                "RabbitMQ publish incomplete: published %d/%d commands",
+                published_count,
+                expected_count,
+            )
+            sys.exit(1)
+
+        logger.info(
+            "Successfully published actuator payload for FSP '%s' to RabbitMQ: %s",
+            args.fsp,
+            json.dumps(command_map, separators=(",", ":")),
+        )
+        sys.exit(0)
+
+    except Exception as exc:
+        logger.error("RabbitMQ publish failed: %s", str(exc))
+        sys.exit(1)
+    finally:
+        publisher.disconnect()
+
+
+if __name__ == "__main__":
+    main()
