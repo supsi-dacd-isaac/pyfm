@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  aem-server-simulator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aem-server-simulator
+    ports:
+      - "6000:6000"
+    environment:
+      - AEM_SERVER_HOST=0.0.0.0
+      - AEM_SERVER_PORT=6000
+      - AEM_SERVER_USER=supsi
+      - AEM_SERVER_PASSWORD=supsi1234
+      - AEM_SERVER_LOG_DIR=/app/logs
+    volumes:
+      - ./logs:/app/logs
+    networks:
+      - pyfm_network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:6000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+networks:
+  pyfm_network:
+    name: pyfm_network
+    driver: bridge
+
