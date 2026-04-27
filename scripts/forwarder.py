@@ -213,6 +213,14 @@ def _apply_template(template: Any, context: dict) -> Any:
     return template
 
 
+def _format_request_body_for_log(request_body: Any) -> str:
+    """Serialize a request body to a stable single-line string for logging."""
+    try:
+        return json.dumps(request_body, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(request_body)
+
+
 def _normalize_control_url(control_url: Optional[str], api_port: Optional[int]) -> Optional[str]:
     """Ensure controlUrl has a scheme and optional port if missing."""
     if not control_url:
@@ -643,7 +651,11 @@ class TargetHandler:
                 "[DRY-RUN] Would forward to target '%s': POST %s",
                 target.name, endpoint
             )
-            self.logger.debug("[DRY-RUN] Body: %s", json.dumps(request_body, indent=2))
+            self.logger.info(
+                "[DRY-RUN] Payload for target '%s': %s",
+                target.name,
+                _format_request_body_for_log(request_body)
+            )
             self.stats["requests_success"] += 1
             self.stats["by_target"][target.name]["success"] += 1
             return True
@@ -656,6 +668,11 @@ class TargetHandler:
 
         try:
             self.logger.info("Forwarding to target '%s': POST %s", target.name, endpoint)
+            self.logger.info(
+                "Forwarding payload to target '%s': %s",
+                target.name,
+                _format_request_body_for_log(request_body)
+            )
 
             response = requests.post(
                 endpoint,
