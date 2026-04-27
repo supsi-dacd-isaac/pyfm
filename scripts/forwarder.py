@@ -248,6 +248,7 @@ class TargetConfig:
         asset_ids: List[str] = None,
         enabled: bool = True,
         endpoint_template: Optional[str] = None,
+        endpoint_overrides: Optional[dict] = None,
         body_template: Optional[dict] = None,
         reference_api: Optional[str] = None,
         timeout_is_configured: bool = False
@@ -265,6 +266,7 @@ class TargetConfig:
         :param asset_ids: List of asset IDs this target handles (None = all)
         :param enabled: Whether this target is enabled
         :param endpoint_template: Optional endpoint template for this target
+        :param endpoint_overrides: Optional asset-specific endpoint overrides
         :param body_template: Optional body template for this target
         :param reference_api: Optional API key to load from conns.json
         :param timeout_is_configured: Whether timeout was explicitly set in config
@@ -279,6 +281,7 @@ class TargetConfig:
         self.asset_ids = asset_ids
         self.enabled = enabled
         self.endpoint_template = endpoint_template
+        self.endpoint_overrides = endpoint_overrides or {}
         self.body_template = body_template
         self.reference_api = reference_api
         self._timeout_is_configured = timeout_is_configured
@@ -327,6 +330,7 @@ class TargetConfig:
             asset_ids=data.get("asset_ids"),
             enabled=data.get("enabled", True),
             endpoint_template=data.get("endpoint_template"),
+            endpoint_overrides=data.get("endpoint_overrides") or data.get("custom_commands") or data.get("custom_commans"),
             body_template=data.get("body_template"),
             reference_api=data.get("reference_api"),
             timeout_is_configured=timeout_is_configured
@@ -354,8 +358,34 @@ class TargetConfig:
         context = dict(message)
         if self._api_config:
             context["api"] = self._api_config
+        asset_id = message.get("asset_id") or payload.get("asset_id")
+        endpoint_override = self.endpoint_overrides.get(asset_id) if asset_id else None
 
-        if self.endpoint_template:
+        if endpoint_override is not None:
+            rendered_override = _render_template(str(endpoint_override), context)
+            if not rendered_override:
+                raise ValueError(
+                    f"Endpoint override rendered empty for asset_id='{asset_id}'"
+                )
+            logging.getLogger("forwarder").info(
+                "Target '%s' using endpoint override for asset '%s': %s",
+                self.name,
+                asset_id,
+                rendered_override,
+            )
+            if rendered_override.startswith("http://") or rendered_override.startswith("https://"):
+                endpoint = rendered_override
+            else:
+                if not self.url:
+                    api_control_url = None
+                    if isinstance(self._api_config, dict):
+                        api_control_url = self._api_config.get("controlUrl") or self._api_config.get("controlURL")
+                    raise ValueError(
+                        "Endpoint override requires base URL but none is configured "
+                        f"(asset_id='{asset_id}', endpoint_override='{endpoint_override}', api.controlUrl='{api_control_url}')"
+                    )
+                endpoint = f"{self.url.rstrip('/')}/{rendered_override.lstrip('/')}"
+        elif self.endpoint_template:
             if "api." in self.endpoint_template and "api" not in context:
                 raise ValueError("Endpoint template references api.* but reference_api is not loaded")
             rendered = _render_template(self.endpoint_template, context)
@@ -555,7 +585,7 @@ class TargetHandler:
             endpoint, request_body = target.build_request(message)
         except ValueError as exc:
             self.logger.error(
-                "Target '%s' endpoint template error: %s (reference_api=%s, url='%s').",
+                "Target '%s' request build error: %s (reference_api=%s, url='%s').",
                 target.name, str(exc), target.reference_api, target.url
             )
             self.stats["requests_failed"] += 1
@@ -1463,4 +1493,3 @@ Examples:
 
 if __name__ == "__main__":
     main()
-
