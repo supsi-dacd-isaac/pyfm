@@ -5,6 +5,7 @@ import os
 import sys
 import json
 import datetime
+import time
 from datetime import datetime, timedelta
 from typing import Tuple
 import pandas as pd
@@ -547,8 +548,10 @@ if __name__ == "__main__":
     else:
         log_file = args.log_file
     logger = logging.getLogger()
+    logging.Formatter.converter = time.gmtime
     logging.basicConfig(
-        format="%(asctime)-15s::%(levelname)s::%(funcName)s::%(message)s",
+        format="%(asctime)sZ::%(levelname)s::%(funcName)s::%(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
         level=logging.INFO,
         filename=log_file,
     )
@@ -731,7 +734,7 @@ if __name__ == "__main__":
 
     # Get flexibility forecast for the current slot
     logger.info("=" * 70)
-    logger.info("FLEXIBILITY ANALYSIS FOR SLOT: %s", slot_time.strftime("%Y-%m-%d %H:%M"))
+    logger.info("FLEXIBILITY ANALYSIS FOR SLOT (UTC): %sZ", slot_time.strftime("%Y-%m-%d %H:%M"))
     logger.info("=" * 70)
     
     # Check if this is a peak hour
