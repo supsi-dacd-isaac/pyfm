@@ -696,25 +696,26 @@ if __name__ == "__main__":
     dso_demands = []
     if dso_org_id:
         filter_dict = {
-            "ownerOrganizationId": dso_org_id,
+            "marketId": fsp.markets[0]["id"],
+            "orderSide": "Buy",
             "periodFrom": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "periodTo": (slot_time + timedelta(minutes=cfg["fm"]["granularity"])).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "type": "Buy",
             "quantityType": "Power",
         }
         filter_str = "?" + "&".join("%s=%s" % (k, v) for k, v in filter_dict.items())
         res = fsp.nodes_interface.get_request(
-            "%s%s" % (fsp.nodes_interface.cfg["mainEndpoint"], "orders%s" % filter_str)
+            "%s%s" % (fsp.nodes_interface.cfg["mainEndpoint"], "orderbook%s" % filter_str)
         )
         orders = res.get("items", [])
         for order in orders:
             if order["completionType"] is None:
                 request = {}
+                order_quantity = float(order.get("remainingQuantity", order.get("quantity", 0)))
                 if order["regulationType"] == "Down":
-                    request["Down"] = float(order["quantity"])
+                    request["Down"] = order_quantity
                     request["Up"] = 0.0
                 elif order["regulationType"] == "Up":
-                    request["Up"] = float(order["quantity"])
+                    request["Up"] = order_quantity
                     request["Down"] = 0.0
                 request["unitPrice"] = float(order["unitPrice"])
                 dso_demands.append(request)
