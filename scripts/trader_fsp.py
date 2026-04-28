@@ -282,7 +282,8 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
 
 def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time, 
                       asset_breakdown, flex_forecaster, dry_run, logger, 
-                      bid_record_id=None, demand_record_id=None):
+                      bid_record_id=None, demand_record_id=None,
+                      force_strategy_bid=False):
     """
     Run strategy-based bidding mode with discretization-aware flexibility calculation.
     
@@ -300,6 +301,9 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
     logger.info("Time slot: %s", bid_params["slot_name"])
     logger.info("Strategy bid price: %.2f CHF/MW", bid_params["bid_price"])
     logger.info("Strategy flexibility target: %.4f MW", bid_params["flexibility_mw"])
+    strategy_target_mw = bid_params["flexibility_mw"]
+    if bid_params.get("ev_flexibility_mw", 0) > 0:
+        strategy_target_mw += bid_params["ev_flexibility_mw"]
     
     # Filter assets based on strategy and calculate flexibility
     total_available_flex_kw = 0
@@ -343,14 +347,34 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
     flexibility_to_bid_mw, achievable_details = get_strategy_flexibility_discrete(
         strategy, slot_time, flex_forecaster, logger
     )
+
+    if force_strategy_bid:
+        logger.info(
+            "FORCE STRATEGY BID: using configured strategy target %.6f MW instead of forecast/discrete recommendation %.6f MW",
+            strategy_target_mw,
+            flexibility_to_bid_mw,
+        )
+        flexibility_to_bid_mw = strategy_target_mw
     
     if dry_run:
         logger.info("-" * 70)
         logger.info("DRY-RUN: Simulating order placement (no actual orders will be placed)")
     
     orders_summary = []
+
+    demands_to_process = dso_demands
+    if force_strategy_bid and not dso_demands:
+        logger.info(
+            "FORCE STRATEGY BID: no DSO demand found; posting unsolicited Up sell order at strategy price"
+        )
+        demands_to_process = [{
+            "Up": flexibility_to_bid_mw,
+            "Down": 0.0,
+            "unitPrice": bid_params["bid_price"],
+            "_forced_strategy_bid": True,
+        }]
     
-    for dso_demand in dso_demands:
+    for dso_demand in demands_to_process:
         dso_price = dso_demand.get("unitPrice", 0)
         
         # Check if DSO price is acceptable according to strategy
@@ -494,10 +518,19 @@ if __name__ == "__main__":
         action="store_true",
         help="Estimate flexibility without placing orders on the market"
     )
+    arg_parser.add_argument(
+        "--force-strategy-bid",
+        action="store_true",
+        help=(
+            "In strategy mode, post the configured strategy bid even if the "
+            "forecast/discrete recommendation is lower or no DSO buy order is found."
+        )
+    )
     args = arg_parser.parse_args()
     
     # Dry run mode
     dry_run = args.dry_run
+    force_strategy_bid = args.force_strategy_bid
 
     # Load the main parameters
     config_file = args.config_file
@@ -578,10 +611,17 @@ if __name__ == "__main__":
         # No strategy specified - use simple mode
         use_strategy_mode = False
 
+    if force_strategy_bid and not use_strategy_mode:
+        print("\nERROR: --force-strategy-bid can only be used in strategy mode")
+        print("Pass --strategy or configure a strategy for the selected FSP.")
+        sys.exit(1)
+
     if dry_run:
         logger.info("Starting program (DRY-RUN MODE - no orders will be placed)")
     else:
         logger.info("Starting program")
+    if force_strategy_bid:
+        logger.info("Force strategy bid: ENABLED")
     
     logger.info("=" * 70)
     logger.info("FSP: %s", fsp_identifier)
@@ -886,7 +926,8 @@ if __name__ == "__main__":
         orders_summary, used_strategy = run_strategy_mode(
             strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             asset_breakdown, flex_forecaster, dry_run, logger, 
-            bid_record_id=bid_record_id, demand_record_id=demand_record_id
+            bid_record_id=bid_record_id, demand_record_id=demand_record_id,
+            force_strategy_bid=force_strategy_bid
         )
     else:
         orders_summary = run_simple_mode(
