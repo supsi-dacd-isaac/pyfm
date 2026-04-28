@@ -12,8 +12,8 @@ from influxdb import InfluxDBClient
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from classes.dso import DSO
 from classes.fsp import FSP
+from classes.player import Player
 from classes.fmo import FMO
 from classes.postgresql_interface import PostgreSQLInterface
 from classes.flexibility_forecaster import FlexibilityForecaster
@@ -622,10 +622,8 @@ if __name__ == "__main__":
     )
 
     # Actors definition
-    # DSO
-    dso = DSO(cfg["fm"]["actors"]["dso"], cfg, logger)
-    dso.set_organization(filter_dict={"name": dso.cfg["id"]})
-    slot_time = dso.get_adjusted_time(
+    # Slot time (static computation, no actor needed)
+    slot_time = Player.get_adjusted_time(
         cfg["fm"]["granularity"], cfg["fm"]["ordersTimeShift"]
     )
 
@@ -639,10 +637,48 @@ if __name__ == "__main__":
     logger.info("market id: %s" % fsp.markets[0]["id"])
     logger.info("market name: %s" % fsp.markets[0]["name"])
 
-    # Get quantities demanded by the DSO (DSO runs 1 minute before FSP)
-    dso_demands = dso.get_flexibility_requests(
-        slot_time, cfg["fm"]["granularity"], "Buy", "Power"
+    # Resolve DSO organization ID via the FSP's own NODES token
+    dso_cfg = cfg["fm"]["actors"]["dso"]
+    dso_orgs = fsp.nodes_interface.get_request(
+        "%s%s" % (fsp.nodes_interface.cfg["mainEndpoint"],
+                   "organizations?name=%s" % dso_cfg["id"])
     )
+    dso_org_id = None
+    if "items" in dso_orgs and len(dso_orgs["items"]) == 1:
+        dso_org_id = dso_orgs["items"][0]["id"]
+    else:
+        logger.error("Unable to resolve DSO organization '%s' via FSP token", dso_cfg["id"])
+
+    # Get quantities demanded by the DSO (DSO runs 1 minute before FSP)
+    dso_demands = []
+    if dso_org_id:
+        filter_dict = {
+            "ownerOrganizationId": dso_org_id,
+            "periodFrom": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "periodTo": (slot_time + timedelta(minutes=cfg["fm"]["granularity"])).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "type": "Buy",
+            "quantityType": "Power",
+        }
+        filter_str = "?" + "&".join("%s=%s" % (k, v) for k, v in filter_dict.items())
+        res = fsp.nodes_interface.get_request(
+            "%s%s" % (fsp.nodes_interface.cfg["mainEndpoint"], "orders%s" % filter_str)
+        )
+        orders = res.get("items", [])
+        for order in orders:
+            if order["completionType"] is None:
+                request = {}
+                if order["regulationType"] == "Down":
+                    request["Down"] = float(order["quantity"])
+                    request["Up"] = 0.0
+                elif order["regulationType"] == "Up":
+                    request["Up"] = float(order["quantity"])
+                    request["Down"] = 0.0
+                request["unitPrice"] = float(order["unitPrice"])
+                dso_demands.append(request)
+                logger.info(
+                    "Flexibility demanded by the DSO (Power): Up = %.3f MW, Down = %.3f MW, Price = %.3f",
+                    request.get("Up", 0), request.get("Down", 0), request["unitPrice"]
+                )
 
     # Set current baselines for FSP
     fsp.download_baselines(slot_time)
@@ -782,7 +818,7 @@ if __name__ == "__main__":
                     })
             
             demand_record_id = demand_repo.save_demand_record(
-                dso_id=dso.cfg["id"],
+                dso_id=dso_cfg["id"],
                 slot_start=slot_time,
                 slot_end=slot_end,
                 quantity_up_mw=float(total_dso_demand_up) if total_dso_demand_up > 0 else None,
@@ -796,7 +832,7 @@ if __name__ == "__main__":
                 request_reason="DSO demand observed by FSP before bidding",
                 orders=demand_orders
             )
-            logger.info("Demand record created with ID: %s (DSO: %s)", demand_record_id, dso.cfg["id"])
+            logger.info("Demand record created with ID: %s (DSO: %s)", demand_record_id, dso_cfg["id"])
         except Exception as e:
             logger.error("Error saving demand record: %s", str(e))
 
