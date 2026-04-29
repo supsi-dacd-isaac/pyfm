@@ -37,7 +37,7 @@ The Strategy Evaluator calculates expected revenue, costs, and net profit for di
 | `--config_file` | Yes | - | Path to configuration file |
 | `--start_date` | No | 30 days ago | Start date of evaluation (YYYY-MM-DD) |
 | `--end_date` | No | Today | End date of evaluation (YYYY-MM-DD) |
-| `--strategy` | No | all | Strategy to evaluate (`strategy_1` to `strategy_5` or `all`) |
+| `--strategy` | No | all | Strategy to evaluate (`strategy_1` to `strategy_7` or `all`) |
 | `--output` | No | - | Export results to JSON file |
 | `--verbose` | No | False | Show detailed breakdown per time period |
 
@@ -73,27 +73,85 @@ The Strategy Evaluator calculates expected revenue, costs, and net profit for di
 - **EV Chargers:** ✅ Used during evening peak
 - **Approach:** Aggressive morning + EV inclusion in evening
 
+### Strategy 6: Smart Preheat
+- **Description:** Preheat buildings 04:00-06:00 to guarantee 100% HP flexibility during morning peak 07:00-10:00
+- **Assets:** All 3 heat pumps
+- **EV Chargers:** ❌ Not used
+- **Approach:** Exploit building thermal inertia for maximum morning peak flexibility
+
+### Strategy 7: Double Pre-heating ⭐⭐ BEST PERFORMER
+- **Description:** Dual preheat (04:00-06:00 + 12:00-15:00) for maximum flexibility during BOTH morning (07:00-11:00) and evening (16:00-20:00) peaks
+- **Assets:** ECM96.2 and ECM97.3 (heat pumps)
+- **EV Chargers:** ❌ Not used
+- **Approach:** Data-driven strategy targeting the two highest-value periods identified from demand analysis
+
+**Key advantages:**
+- **Evening peak capture:** Data shows 16:00-20:00 has highest prices (up to 12.1 CHF/MW) AND highest demand (up to 130 kW)
+- **Double flexibility windows:** 8 hours of premium flexibility per day vs 3-4 hours in other strategies
+- **Afternoon lull exploitation:** Pre-heat 2 during 12:00-15:00 when demand/prices are lowest
+- **140% better than Strategy 6:** 106.49 CHF vs 44.26 CHF over 30 days
+
+**How it works:**
+1. **04:00-06:00 (Pre-heat 1):** Force HP ON during off-peak (prepares for morning)
+2. **06:00-07:00 (Transition 1):** HP winding down
+3. **07:00-11:00 (Morning Flex):** HP OFF - full flexibility for morning peak
+4. **11:00-12:00 (Transition 2):** HP recovery if needed
+5. **12:00-15:00 (Pre-heat 2):** Force HP ON during afternoon lull (prepares for evening)
+6. **15:00-16:00 (Transition 3):** HP winding down
+7. **16:00-20:00 (Evening Flex):** HP OFF - full flexibility for evening peak (PREMIUM!)
+8. **20:00-04:00 (Night Recovery):** Normal operation
+
+**Data-driven design:**
+Based on analysis of `data/csv/demand/` files:
+- `price_by_hour_boxplot_15min.csv`: Evening peak prices 10-12 CHF/MW (highest)
+- `demand_by_hour_boxplot_15min.csv`: Evening demand 105-130 kW (highest)
+- `heatmap_quantity_kw.csv`: Thu/Fri evenings reach 600+ kW total demand
+
+See [README_strategy_7_analysis.md](../docs/README_strategy_7_analysis.md) for detailed analysis.
+
+**How it works:**
+1. **04:00-06:00 (Preheat):** Force HP ON during off-peak hours (cheap electricity). No flexibility bids.
+2. **06:00-07:00 (Transition):** HP winding down, building warm. Partial flexibility available.
+3. **07:00-10:00 (Morning Peak):** HP OFF - 100% flexibility available! Building thermal mass maintains comfort.
+4. **10:00-19:00 (Normal):** Standard operation with moderate flexibility.
+5. **19:00-04:00 (Night):** Low flexibility, building cooling.
+
+**Key advantages:**
+- **100% reliability:** DSO gets guaranteed load reduction capability
+- **Higher activation rate:** 50% vs 30% for conventional strategies
+- **Premium pricing:** 10.5 CHF/MW vs 9.5 CHF/MW (DSO willingness-to-pay for reliability)
+- **Lower activation cost:** HP already OFF, just maintain state
+- **Electricity arbitrage:** Off-peak preheat (0.08 CHF/kWh) vs avoided peak (0.12 CHF/kWh)
+
+**Integration with Energy Signature Analyzer:**
+The `HeatingDemandEstimator` class in `energy_signature_analyzer.py` provides:
+- Temperature-dependent preheat energy calculation
+- Maximum safe HP-off duration estimation
+- Seasonal flexibility factor adjustment
+
 ## Output Example
 
 ```
 Configuration loaded from: conf/test_fm01_aem.json
-Evaluation period: 2025-12-01 to 2025-12-31 (31 days)
+Evaluation period: 2026-01-13 to 2026-02-11 (30 days)
 
 ======================================================================
 STRATEGY COMPARISON
 ======================================================================
 Strategy                            Net Profit      Slots     Avg/Slot     Uses EV   
 ------------------------------------------------------------------------------------------
-Strategy 4: Hybrid (S3+S1)              33.82 CHF    361       0.094 CHF  No     ⭐ BEST
-Strategy 5: Hybrid2 (S3+S2)             29.35 CHF    374       0.078 CHF  Yes    
-Strategy 1: HP Only                     26.03 CHF    330       0.079 CHF  No     
-Strategy 3: Morning Peak Focus          20.38 CHF    218       0.094 CHF  No     
-Strategy 2: Full Portfolio + Evening EV 16.56 CHF    314       0.053 CHF  Yes    
+Strategy 7: Double Pre-heating         106.49 CHF    543       0.196 CHF  No     ⭐ BEST
+Strategy 6: Smart Preheat               44.26 CHF    418       0.106 CHF  No     
+Strategy 4: Hybrid (S3+S1)              32.84 CHF    351       0.094 CHF  No     
+Strategy 5: Hybrid2 (S3+S2)             28.42 CHF    363       0.078 CHF  Yes    
+Strategy 1: HP Only                     25.30 CHF    321       0.079 CHF  No     
+Strategy 3: Morning Peak Focus          19.75 CHF    211       0.094 CHF  No     
+Strategy 2: Full Portfolio + Evening EV 16.11 CHF    306       0.053 CHF  Yes    
 ======================================================================
 
-✅ RECOMMENDATION: Strategy 4: Hybrid (S3+S1)
-   Period: 2025-12-01 to 2025-12-31 (31 days)
-   Expected net profit: 33.82 CHF
+✅ RECOMMENDATION: Strategy 7: Double Pre-heating
+   Period: 2026-01-13 to 2026-02-11 (30 days)
+   Expected net profit: 106.49 CHF
 ```
 
 ## Calculation Methodology

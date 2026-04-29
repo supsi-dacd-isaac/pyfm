@@ -22,7 +22,7 @@ The flexibility command forwarding system separates the **decision logic** (what
 - **Scalability**: Multiple forwarders can consume from the same queue
 - **Reliability**: RabbitMQ provides message persistence and acknowledgments
 - **Testability**: Dry-run mode allows testing without affecting real devices
-- **Protocol Translation**: The forwarder can translate to different device protocols (MQTT, HTTP, Modbus, OCPP)
+- **Protocol Translation**: The forwarder translates manager commands into configured HTTP target requests
 - **Decoupling**: flexi_manager and forwarder can be deployed and scaled independently
 
 ### Data Flow
@@ -102,8 +102,8 @@ The message broker provides:
 
 The forwarder is responsible for:
 - Consuming commands from RabbitMQ
-- Translating commands to device protocols
-- Sending commands to actual devices (or logging in dry-run mode)
+- Translating commands into configured HTTP target requests
+- Sending commands to matching targets in live mode, or logging them in dry-run mode
 
 **Key Classes:**
 - `RabbitMQConsumer`: Handles connection and message consumption
@@ -161,6 +161,9 @@ docker-compose logs -f
 ```bash
 cd scripts
 python forwarder.py --dry-run --log-level DEBUG
+
+# AEM target setup
+python forwarder.py --dry-run --config ../conf/forwarder_targets_aem.json
 ```
 
 ### Step 4: Verify Services
@@ -206,9 +209,12 @@ export RABBITMQ_PORT=5672
 export RABBITMQ_USER=guest
 export RABBITMQ_PASS=guest
 export RABBITMQ_VHOST=/
+export RABBITMQ_EXCHANGE=flexi_commands
+export FORWARDER_CONFIG=../conf/forwarder_targets_aem.json
+export FORWARDER_CONNS=../conf/private/conns.json
 ```
 
-### Configuration File (conns.json)
+### Connection File (conns.json)
 
 You can also add RabbitMQ configuration to your `conf/private/conns.json`:
 
@@ -226,6 +232,25 @@ You can also add RabbitMQ configuration to your `conf/private/conns.json`:
   }
 }
 ```
+
+The forwarder target configuration can also reference API entries in `conns.json`. For example, `conf/forwarder_targets_aem.json` uses `reference_api: "aemAPI"` and resolves the target base URL, credentials, and timeout from that connection entry.
+
+### Target Configuration
+
+Targets are loaded from `--config` / `FORWARDER_CONFIG` and describe where matching commands are forwarded. The current forwarder supports:
+
+| Field | Description |
+|-------|-------------|
+| `name` | Logical target name used in logs |
+| `url` | Base target URL, unless resolved from `reference_api` |
+| `reference_api` | Key in `conns.json` containing `controlUrl`, credentials, and timeout |
+| `asset_types` / `asset_ids` | Optional filters for which assets this target handles |
+| `endpoint_template` | Template for building an endpoint from message payload/API fields |
+| `endpoint_overrides` | Asset-specific endpoint overrides |
+| `asset_request_profiles` | Asset-specific endpoint and body mode settings |
+| `body_template` | Template for default request bodies |
+
+Supported request body modes are `hp_control` (default/body template behavior) and `ev_power_timeseries` for EV charger time-series power requests.
 
 ---
 
@@ -253,6 +278,12 @@ cd scripts
 
 # Basic dry-run mode (uses default guest/guest credentials)
 python forwarder.py --dry-run
+
+# Dry-run with AEM target config
+python forwarder.py --dry-run --config ../conf/forwarder_targets_aem.json
+
+# Live forwarding; each message payload still controls whether the HTTP request is dry-run
+python forwarder.py --live --config ../conf/forwarder_targets_aem.json
 
 # With verbose logging
 python forwarder.py --dry-run --log-level DEBUG
@@ -292,7 +323,7 @@ python flexi_manager.py --fsp supsi01 --offset 30m --dry-run --rabbitmq
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--dry-run` / `-d` | enabled | Dry-run mode (log only) |
-| `--live` / `-l` | disabled | Live mode (NOT IMPLEMENTED) |
+| `--live` / `-l` | disabled | Allow live HTTP forwarding when message payload `dry_run=false` |
 | `--asset-types` | all | Comma-separated list of asset types to filter |
 | `--queues` | `commands` | Queues to consume: `commands`, `measurements` |
 | `--rabbitmq-host` | `localhost` | RabbitMQ server hostname |
@@ -303,6 +334,8 @@ python flexi_manager.py --fsp supsi01 --offset 30m --dry-run --rabbitmq
 | `--rabbitmq-exchange` | `flexi_commands` | RabbitMQ exchange name |
 | `--log-level` | `INFO` | Logging level |
 | `--log-file` | none | Log file path |
+| `--config` / `-c` | `../conf/forwarder_targets.json` | Forwarding target configuration |
+| `--conns` | `../conf/private/conns.json` | Connection file used by `reference_api` targets |
 
 ---
 
@@ -329,9 +362,12 @@ Published by `flexi_manager.py` when flexibility needs to be activated:
     "capacity_kw": 15.0,
     "duration_minutes": 15,
     "discrete_state": "OFF",
-    "timestamp": "2026-01-16T10:00:00+00:00"
+    "slot_start": "2026-01-16T10:00:00",
+    "slot_end": "2026-01-16T10:15:00",
+    "dry_run": true,
+    "timestamp": "2026-01-16T09:59:30+00:00"
   },
-  "timestamp": "2026-01-16T10:00:00+00:00",
+  "timestamp": "2026-01-16T09:59:30+00:00",
   "priority": 7
 }
 ```
@@ -371,12 +407,33 @@ Published when flexibility activation period ends:
     "description": "Heat Pump Building A",
     "asset_type": "heat_pump",
     "action": "restore",
-    "timestamp": "2026-01-16T10:15:00+00:00"
+    "target_state": "ON",
+    "discrete_state": "ON",
+    "target_power_kw": 15.0,
+    "capacity_kw": 15.0,
+    "slot_start": "2026-01-16T10:15:00",
+    "slot_end": "2026-01-16T10:30:00",
+    "dry_run": true,
+    "timestamp": "2026-01-16T10:14:30+00:00"
   },
-  "timestamp": "2026-01-16T10:15:00+00:00",
+  "timestamp": "2026-01-16T10:14:30+00:00",
   "priority": 5
 }
 ```
+
+For EV charger commands, `flexi_manager.py` enriches the payload with `power_kw` and a `schedule` dictionary containing one power value per 15-minute point in the slot window.
+
+### Dry-Run and Live Forwarding
+
+The forwarder has two levels of dry-run control:
+
+| Forwarder mode | Message payload `dry_run` | Result |
+|----------------|---------------------------|--------|
+| `--dry-run` | any value | Logs only; no HTTP request is sent |
+| `--live` | `true` | Logs only; no HTTP request is sent |
+| `--live` | `false` | Sends HTTP POST requests to configured matching targets |
+
+The built-in local protocol handlers in `CommandHandler` still only log actions. Actual external actuation happens through configured HTTP targets such as the AEM simulator/API.
 
 ---
 
@@ -526,10 +583,14 @@ Configure the forwarder via environment variables or `.env` file:
 | `FORWARDER_LOG_FILE` | `/app/logs/forwarder.log` | Log file path (Docker mount: `./logs`) |
 | `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
 | `FORWARDER_QUEUES` | `commands` | Queues: `commands,measurements` |
+| `FORWARDER_CONFIG` | `../conf/forwarder_targets.json` | Target configuration path |
+| `FORWARDER_CONNS` | `../conf/private/conns.json` | Connection file for `reference_api` targets |
 | `RABBITMQ_HOST` | `localhost` | RabbitMQ hostname |
 | `RABBITMQ_PORT` | `5672` | RabbitMQ port |
 | `RABBITMQ_USER` | `guest` | RabbitMQ username |
 | `RABBITMQ_PASS` | `guest` | RabbitMQ password |
+| `RABBITMQ_VHOST` | `/` | RabbitMQ virtual host |
+| `RABBITMQ_EXCHANGE` | `flexi_commands` | RabbitMQ exchange |
 | `RABBITMQ_CONNECT_RETRIES` | `10` | Connection retry attempts |
 | `RABBITMQ_CONNECT_RETRY_DELAY` | `5` | Seconds between retries |
 
@@ -575,11 +636,10 @@ docker-compose down
 
 ## Future Enhancements
 
-The current implementation includes dry-run mode only for the forwarder. Future enhancements may include:
+The current implementation can forward live HTTP requests to configured targets. Future enhancements may include:
 
-1. **Live Mode Implementation**
+1. **Additional Protocol Handlers**
    - MQTT protocol handler for IoT devices
-   - HTTP/REST handler for API-based devices
    - Modbus handler for industrial equipment
    - OCPP handler for EV chargers
 

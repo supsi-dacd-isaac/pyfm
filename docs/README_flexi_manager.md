@@ -25,16 +25,16 @@ This script manages the **activation** of flexibility for an FSP. After the FSP 
 │                          │                                               │
 │                          ▼                                               │
 │  11:59 (flexi_manager.py)                                               │
-    │    │                                                                     │
-    │    ▼                                                                     │
-    │  ┌──────────────────────────────────────┐                               │
-    │  │  ACTIVATE: Read bid record           │                               │
-    │  │  → Only activate allowed assets      │                               │
-    │  │  → ECM97.1: 15 kW → OFF (discrete)   │                               │
-    │  │  → ECM96.2:  4 kW → OFF (discrete)   │                               │
-    │  │  → Total: 19 kW delivered            │                               │
-    │  │  → EV chargers: EXCLUDED             │                               │
-    │  └──────────────────────────────────────┘                               │
+│    │                                                                     │
+│    ▼                                                                     │
+│  ┌──────────────────────────────────────┐                               │
+│  │  ACTIVATE: Read bid record           │                               │
+│  │  → Only activate allowed assets      │                               │
+│  │  → ECM97.1: 15 kW → OFF (discrete)   │                               │
+│  │  → ECM96.2:  4 kW → OFF (discrete)   │                               │
+│  │  → Total: 19 kW delivered            │                               │
+│  │  → EV chargers: EXCLUDED             │                               │
+│  └──────────────────────────────────────┘                               │
 │                                                                          │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -181,13 +181,23 @@ python flexi_manager.py --fsp supsi01 --allocation priority
 python flexi_manager.py --fsp supsi01 --allocation cost_optimal
 ```
 
+### Strategy Utilities
+
+```bash
+# List configured bidding strategies and exit
+python flexi_manager.py --fsp supsi01 --list-strategies
+
+# Use a configured strategy as a fallback asset filter when no bid record exists
+python flexi_manager.py --fsp supsi01 --fallback-strategy strategy_4 --dry-run
+```
+
 ### Save Output to File
 
 ```bash
 python flexi_manager.py --fsp supsi01 --dry-run --output activation_result.json
 ```
 
-### Autonomous Mode (Dry-Run Only)
+### Autonomous Mode
 
 ```
 python flexi_manager.py --fsp supsi01 --dry-run --autonomous
@@ -210,11 +220,12 @@ Configuration defaults live in `conf/test_fm01_aem.json` under the new `autonomo
   "lookahead_hours": 3,
   "historical_days": 7,
   "price_increase_threshold_pct": 20,
-  "dso_id": "AEM"
+  "dso_id": "AEM",
+  "preactivation_enabled": false
 }
 ```
 
-Even though autonomous mode does not trigger actual control commands, it lets you **see how the price is expected to evolve** so you can warm up assets in advance and be ready for a future activation.
+Autonomous mode can publish actual pre-activation commands when you run with `--live` and `autonomous.preactivation_enabled` is `true`. For the AEM setup, keep the analysis but suppress pre-heating by setting `preactivation_enabled` to `false`.
 
 ---
 
@@ -229,9 +240,23 @@ Even though autonomous mode does not trigger actual control commands, it lets yo
 | `--dry-run`     | `-d` | Simulate only | Yes |
 | `--live`        | `-l` | Send actual commands | No |
 | `--allocation`  | `-a` | Allocation strategy | `modulation_aware` |
+| `--fallback-strategy` | - | Strategy to use when no bid record exists | - |
+| `--list-strategies` | - | List configured strategies and exit | No |
+| `--state-file`  | - | Path to the controlled-asset state file | `logs/flexi_manager_state.json` |
 | `--log-level`   | - | Logging verbosity | `INFO` |
 | `--log_file`    | - | Path to log file | - |
 | `--output`      | `-o` | JSON output file | - |
+| `--rabbitmq`    | - | Enable RabbitMQ command publishing | No |
+| `--rabbitmq-host` | - | RabbitMQ hostname | `localhost` |
+| `--rabbitmq-port` | - | RabbitMQ port | `5672` |
+| `--rabbitmq-user` | - | RabbitMQ username | `guest` |
+| `--rabbitmq-pass` | - | RabbitMQ password | `guest` |
+| `--rabbitmq-vhost` | - | RabbitMQ virtual host | `/` |
+| `--rabbitmq-exchange` | - | RabbitMQ exchange name | `flexi_commands` |
+| `--autonomous` | - | Enable autonomous analysis when no activation is required | From config |
+| `--no-autonomous` | - | Disable autonomous analysis, overriding config | From config |
+| `--autonomous-lookahead` | - | Hours to forecast for autonomous analysis | From config or `3` |
+| `--autonomous-history` | - | Historical days to analyze | From config or `7` |
 
 ### Offset Format Examples
 
@@ -251,7 +276,7 @@ Even though autonomous mode does not trigger actual control commands, it lets yo
 First, the script queries PostgreSQL for a bid record from `trader_fsp.py`:
 
 ```sql
-SELECT * FROM pyfm.bid_records 
+SELECT * FROM public.bid_records
 WHERE fsp_id = 'supsi01' AND slot_start = '2026-01-09 12:00:00'
 ```
 
@@ -263,14 +288,14 @@ The record contains:
 | total_quantity_mw | 0.015 |
 | status | pending |
 
-Related assets from `pyfm.bid_record_assets`:
+Related assets from `public.bid_record_assets`:
 | asset_id | asset_type | available_flexibility_kw |
 |----------|------------|--------------------------|
 | ECM96.2 | heat_pump | 1.65 |
 | ECM97.1 | heat_pump | 2.64 |
 | ECM97.2 | heat_pump | 9.58 |
 
-**If no bid record found:** The script stops and no assets are activated. This is a safety measure - without a bid record, we don't know which assets were intended to be used.
+**If no bid record is found:** The script does not activate new curtailable assets from the bid path. It may still restore assets that were controlled in a previous slot, and if autonomous mode is enabled it can run price-forecast analysis and optionally queue pre-activation commands for heat pumps.
 
 ### Step 1: Query Market Results
 
@@ -352,6 +377,209 @@ Send curtailment commands to each asset based on modulation type:
 |------------|----------------|
 | Heat Pump | MQTT, HTTP API, Modbus |
 | EV Charger | OCPP, HTTP API |
+
+When RabbitMQ is enabled (`--rabbitmq`), the manager also queues **restore commands** for any previously controlled assets that are no longer selected for the current slot (see [Previously Controlled Assets](#previously-controlled-assets) below).
+
+### Step 4: Publish to RabbitMQ
+
+When `--rabbitmq` is active, all pending commands (curtailment + restore) are published as a batch to the `flexi_commands` exchange. Each command payload is enriched with:
+
+- **Clean `slot_start` / `slot_end`** timestamps (`YYYY-MM-DDTHH:MM:SS`, no timezone suffix, no microseconds)
+- **`dry_run`** flag
+- **EV `schedule`** dictionary (for EV charger commands only)
+
+The forwarder (`forwarder.py`) consumes these commands from the `asset_commands` queue and translates them into AEM-specific HTTP requests.
+
+---
+
+## RabbitMQ Command Forwarding
+
+### Architecture
+
+```
+flexi_manager.py
+    -> RabbitMQ exchange: flexi_commands
+    -> RabbitMQ queue: asset_commands
+    -> forwarder.py
+    -> AEM API
+```
+
+The **manager** decides **what** should happen for the next market slot. The **forwarder** decides **how** to translate that into AEM-specific HTTP requests. AEM-specific endpoint paths, body modes, and URL quirks stay in the forwarder and its `forwarder_targets.json` configuration.
+
+### Routing Keys
+
+```
+commands.{asset_type}.{asset_id}
+```
+
+Examples: `commands.heat_pump.ECM96.2`, `commands.ev_charger.ECM63.1`
+
+### Timestamp Formatting
+
+All timestamps in command payloads use a clean UTC format:
+
+```
+YYYY-MM-DDTHH:MM:SS
+```
+
+- No timezone suffix (`+00:00`, `Z`)
+- No microseconds
+- No arbitrary seconds
+- Seconds always `:00`
+
+Example: `2026-04-27T12:15:00`
+
+### HP Curtailment Payload
+
+When a heat pump is curtailed (switched OFF) for a market slot:
+
+```json
+{
+  "asset_id": "ECM96.2",
+  "asset_type": "heat_pump",
+  "modulation_type": "discrete",
+  "discrete_state": "OFF",
+  "target_power_kw": 0.0,
+  "capacity_kw": 4.0,
+  "slot_start": "2026-04-27T12:15:00",
+  "slot_end": "2026-04-27T12:30:00",
+  "dry_run": false
+}
+```
+
+### HP Restore Payload
+
+When a heat pump is restored (switched back ON) for the next slot:
+
+```json
+{
+  "asset_id": "ECM96.2",
+  "asset_type": "heat_pump",
+  "target_state": "ON",
+  "discrete_state": "ON",
+  "target_power_kw": 4.0,
+  "capacity_kw": 4.0,
+  "slot_start": "2026-04-27T12:30:00",
+  "slot_end": "2026-04-27T12:45:00",
+  "dry_run": false
+}
+```
+
+**Important:** An AEM HP `force_off` command may persist longer than the 15-minute market slot (~1 hour). The manager therefore acts as a **slot-based desired-state publisher**: if flexibility is still needed in the next slot, it sends OFF again; if not, it sends ON/restore.
+
+### EV Curtailment Payload
+
+When an EV charger is curtailed for a market slot:
+
+```json
+{
+  "asset_id": "ECM63.1",
+  "asset_type": "ev_charger",
+  "target_power_kw": 0.0,
+  "power_kw": 0.0,
+  "slot_start": "2026-04-27T12:15:00",
+  "slot_end": "2026-04-27T12:30:00",
+  "schedule": {
+    "2026-04-27T12:15:00": 0.0
+  },
+  "dry_run": false
+}
+```
+
+The `schedule` dictionary contains one entry every 15 minutes from `slot_start` up to (but not including) `slot_end`. For a standard 15-minute slot this is a single entry. For a 30-minute slot it would be two entries.
+
+### EV Restore Payload
+
+When an EV charger is restored to normal charging:
+
+```json
+{
+  "asset_id": "ECM63.1",
+  "asset_type": "ev_charger",
+  "target_power_kw": 6.0,
+  "power_kw": 6.0,
+  "slot_start": "2026-04-27T12:30:00",
+  "slot_end": "2026-04-27T12:45:00",
+  "schedule": {
+    "2026-04-27T12:30:00": 6.0
+  },
+  "dry_run": false
+}
+```
+
+The restore power is chosen using this fallback chain:
+
+1. `restore_power_kw` (explicit restore power in asset config)
+2. `default_power_kw` (default charging power)
+3. `capacity_kw` (full capacity)
+
+### Dry-Run Behaviour
+
+| Mode | RabbitMQ enabled | What happens |
+|------|------------------|--------------|
+| `--dry-run` | No | Commands logged locally, nothing sent |
+| `--dry-run` | Yes (`--rabbitmq`) | Commands published to RabbitMQ with `dry_run=true`; forwarder sees the flag and does not POST to AEM |
+| `--live` | No | Direct local actuation (MQTT/HTTP/OCPP/simulation) |
+| `--live` | Yes (`--rabbitmq`) | Commands published to RabbitMQ with `dry_run=false`; forwarder sends real requests to AEM |
+
+### Slot Timing
+
+The manager is intended to run shortly before the next quarter-hour slot:
+
+| Run time | Prepares commands for slot |
+|----------|---------------------------|
+| 12:14 | 12:15 – 12:30 |
+| 12:29 | 12:30 – 12:45 |
+| 12:44 | 12:45 – 13:00 |
+
+All command timestamps use the **market slot** (`slot_start`, `slot_end`), not "next quarter-hour from now". If the manager is late and `slot_start <= now`, it logs a warning but does **not** silently shift the slot, because shifting would break the market-cleared activation interval.
+
+---
+
+## Previously Controlled Assets
+
+The manager maintains a lightweight JSON state file to track which assets are currently under control. This enables **automatic restore** when an asset is no longer selected for the next slot.
+
+### State File
+
+Default path: `logs/flexi_manager_state.json` (configurable with `--state-file`).
+
+Example contents after curtailing two assets:
+
+```json
+{
+  "ECM96.2": {
+    "asset_type": "heat_pump",
+    "slot_start": "2026-04-27T12:15:00",
+    "slot_end": "2026-04-27T12:30:00"
+  },
+  "ECM63.1": {
+    "asset_type": "ev_charger",
+    "slot_start": "2026-04-27T12:15:00",
+    "slot_end": "2026-04-27T12:30:00"
+  }
+}
+```
+
+### Restore Logic
+
+On each run the manager:
+
+1. **Loads** the previous state file.
+2. **Determines** which assets are selected for curtailment in the current slot.
+3. For each previously controlled asset that is **not** in the current selection: queues a **restore command** for the current slot.
+4. **Publishes** all commands (curtailment + restore) to RabbitMQ.
+5. **Saves** the new state (only currently curtailed assets).
+
+This handles three scenarios:
+
+| Scenario | Previous state | Current selection | Action |
+|----------|---------------|-------------------|--------|
+| No trades | ECM96.2=OFF | (empty) | Restore ECM96.2 to ON |
+| Asset rotated out | ECM96.2=OFF, ECM97.1=OFF | ECM97.1 only | Restore ECM96.2, keep ECM97.1 OFF |
+| All assets still needed | ECM96.2=OFF | ECM96.2 | Re-send ECM96.2 OFF for new slot |
+
+If the state file cannot be read (missing, corrupted), the manager logs a warning and continues with an empty state. If it cannot be written, it logs an error but does not crash after commands were already published.
 
 ---
 
@@ -470,6 +698,7 @@ To enable actual asset control, configure each asset in `asset_mapping` with:
       "flexibility_factor": 0.70,
       "modulation_type": "continuous",
       "min_power_kw": 0.0,
+      "restore_power_kw": 6.0,
       "control": {
         "type": "ocpp",
         "charger_id": "CP001",
@@ -487,8 +716,12 @@ To enable actual asset control, configure each asset in `asset_mapping` with:
 | `modulation_type` | string | `"continuous"` or `"discrete"` | By asset type* |
 | `discrete_states_kw` | array | Valid power states for discrete assets | `[0, capacity_kw]` |
 | `min_power_kw` | number | Minimum power for continuous assets | `0.0` |
+| `restore_power_kw` | number | EV restore power (highest priority) | - |
+| `default_power_kw` | number | EV default charging power (second priority) | - |
 
 *Default by type: `heat_pump` → `discrete`, `ev_charger` → `continuous`
+
+The EV restore power fallback chain is: `restore_power_kw` → `default_power_kw` → `capacity_kw`.
 
 **Example discrete states:**
 ```json
@@ -505,9 +738,10 @@ To enable actual asset control, configure each asset in `asset_mapping` with:
 |------|-------------|-------------|
 | `mqtt` | HP, EV | Publish JSON to MQTT topic |
 | `http` | HP, EV | POST to REST API endpoint |
-| `modbus` | HP | Write to Modbus register |
 | `ocpp` | EV | OCPP SetChargingProfile |
 | `simulation` | All | Log only (default) |
+
+Direct local `mqtt`, `http`, and `ocpp` handlers currently log the intended action and are placeholders for protocol-specific clients. The production AEM path is `--rabbitmq` -> `forwarder.py`, where HTTP target forwarding is implemented from target configuration.
 
 ---
 
@@ -595,7 +829,7 @@ The typical workflow is:
 
 1. **trader_fsp.py** runs at e.g., 11:00 to bid for 12:00 slot
    - Uses strategy (e.g., strategy_4 = HP only)
-   - Saves bid record to PostgreSQL database (`pyfm.bid_records`)
+   - Saves bid record to PostgreSQL database (`public.bid_records`)
 2. Market clears, trades are matched
 3. **flexi_manager.py** runs at 11:59 to activate flexibility for 12:00 slot
    - Reads bid record from database to know which assets to activate
@@ -607,8 +841,9 @@ The typical workflow is:
 # trader_fsp.py runs at minute 0 to bid for slot starting at minute 30 (90-min ahead)
 0 * * * *  cd /path/to/pyfm && .venv/bin/python scripts/trader_fsp.py --config conf/test_fm01_aem.json --fsp supsi01
 
-# flexi_manager.py runs at minute 14, 29, 44, 59 to activate the just-passed slot
-14,29,44,59 * * * * cd /path/to/pyfm && .venv/bin/python scripts/flexi_manager.py --fsp supsi01 --offset 15m --live
+# flexi_manager.py runs at minute 14, 29, 44, 59 to activate the upcoming slot.
+# With --rabbitmq, commands go through RabbitMQ -> forwarder -> AEM.
+14,29,44,59 * * * * cd /path/to/pyfm && .venv/bin/python scripts/flexi_manager.py --fsp supsi01 --live --rabbitmq
 ```
 
 ### Database Tables
@@ -743,6 +978,36 @@ Configure per asset if needed:
   "curtailment_threshold_pct": 30.0  // More aggressive switching
 }
 ```
+
+---
+
+## Testing
+
+Unit tests for the command-preparation helpers live in:
+
+```
+unittest/test_flexi_manager_commands.py
+```
+
+Run them with:
+
+```bash
+cd /path/to/pyfm
+.venv/bin/python -m pytest unittest/test_flexi_manager_commands.py -v
+```
+
+The tests cover:
+
+| Test class | What it validates |
+|---|---|
+| `TestParseSlotDatetime` | Naive/aware/string parsing, TZ conversion, second stripping |
+| `TestFormatAemUtc` | Clean formatting, no TZ suffix, no microseconds |
+| `TestBuildEvSchedule` | Single slot, multi-slot, empty window, float conversion |
+| `TestPrepareCommandPayload` | HP/EV curtail/restore slot injection, dry_run flag |
+| `TestCurtailPayloads` | HP `discrete_state`, EV `power_kw` in curtail commands |
+| `TestRestorePayloads` | HP ON state, EV restore fallback chain (3 cases) |
+| `TestPublishPendingCommands` | End-to-end HP/EV curtail+restore publish, batch publishing |
+| `TestControlledStatePersistence` | State file round-trip, missing file handling |
 
 ---
 
