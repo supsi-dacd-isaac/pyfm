@@ -961,6 +961,29 @@ class CommandHandler:
         self.commands_received = 0
         self.commands_by_type = {}
         self.commands_by_asset = {}
+
+    def _resolve_dry_run(self, message: dict, default: bool = True) -> bool:
+        """
+        Resolve the effective dry-run mode for a message.
+
+        Command messages carry ``dry_run`` in ``payload`` while batch headers
+        carry it in ``slot_info``. When ``force_dry_run`` is enabled it always
+        takes precedence.
+        """
+        if self.force_dry_run:
+            return True
+
+        for section in ("payload", "slot_info"):
+            data = message.get(section, {})
+            if isinstance(data, dict) and "dry_run" in data:
+                return data["dry_run"]
+
+        return default
+
+    @staticmethod
+    def _mode_label(is_dry_run: bool) -> str:
+        """Return the log label for the effective mode."""
+        return "[DRY-RUN]" if is_dry_run else "[LIVE]"
     
     def handle_command(self, message: dict) -> bool:
         """
@@ -983,10 +1006,8 @@ class CommandHandler:
         
         # Determine if this should be dry-run
         # Global force_dry_run takes precedence, otherwise use message flag
-        message_dry_run = payload.get("dry_run", True)
-        is_dry_run = self.force_dry_run or message_dry_run
-        
-        mode_label = "[DRY-RUN]" if is_dry_run else "[LIVE]"
+        is_dry_run = self._resolve_dry_run(message, default=True)
+        mode_label = self._mode_label(is_dry_run)
         
         # Update statistics
         self.commands_by_type[command_type] = self.commands_by_type.get(command_type, 0) + 1
@@ -1082,7 +1103,7 @@ class CommandHandler:
     
     def handle_measurement(self, message: dict) -> bool:
         """
-        Handle a measurement message in dry-run mode.
+        Handle a measurement message.
         
         :param message: Measurement message dictionary
         :return: True if handled successfully
@@ -1092,9 +1113,11 @@ class CommandHandler:
         measurement_type = message.get("measurement_type", "unknown")
         payload = message.get("payload", {})
         timestamp = message.get("timestamp", "")
+        is_dry_run = self._resolve_dry_run(message, default=False)
+        mode_label = self._mode_label(is_dry_run)
         
         self.logger.info("-" * 40)
-        self.logger.info("[DRY-RUN] MEASUREMENT RECEIVED")
+        self.logger.info("%s MEASUREMENT RECEIVED", mode_label)
         self.logger.info("  Asset ID:     %s", asset_id)
         self.logger.info("  Type:         %s", measurement_type)
         self.logger.info("  Timestamp:    %s", timestamp)
@@ -1113,16 +1136,18 @@ class CommandHandler:
         slot_info = message.get("slot_info", {})
         command_count = message.get("command_count", 0)
         timestamp = message.get("timestamp", "")
+        is_dry_run = self._resolve_dry_run(message, default=False)
+        mode_label = self._mode_label(is_dry_run)
         
         self.logger.info("*" * 60)
-        self.logger.info("[DRY-RUN] BATCH START - Expecting %d commands", command_count)
+        self.logger.info("%s BATCH START - Expecting %d commands", mode_label, command_count)
         self.logger.info("*" * 60)
         self.logger.info("  FSP ID:       %s", slot_info.get("fsp_id", "unknown"))
         self.logger.info("  Slot Start:   %s", slot_info.get("slot_start", ""))
         self.logger.info("  Slot End:     %s", slot_info.get("slot_end", ""))
         self.logger.info("  Total Flex:   %.2f kW", slot_info.get("total_flexibility_kw", 0))
         self.logger.info("  Strategy:     %s", slot_info.get("allocation_strategy", ""))
-        self.logger.info("  Dry Run:      %s", slot_info.get("dry_run", True))
+        self.logger.info("  Dry Run:      %s", is_dry_run)
         self.logger.info("*" * 60)
         
         return True
