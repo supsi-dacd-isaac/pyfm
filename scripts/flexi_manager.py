@@ -596,9 +596,13 @@ class AssetController:
         
         if modulation_type == "discrete":
             command_payload["discrete_state"] = state_name
-        
+
+        if asset_type == "ev_charger":
+            command_payload["power_kw"] = float(target_power_kw)
+
         # Queue command for RabbitMQ (always, regardless of dry_run)
-        # Note: slot_start/slot_end and dry_run will be added by publish_pending_commands
+        # Note: slot_start/slot_end, dry_run, and EV schedule will be added
+        # by publish_pending_commands via _prepare_command_payload_for_slot
         if self.rabbitmq_publisher:
             self._pending_commands.append({
                 "asset_id": asset_id,
@@ -797,7 +801,11 @@ class AssetController:
     def restore_asset(self, asset_id: str, dry_run: bool = True) -> Dict:
         """
         Restore asset to normal operation after flexibility activation.
-        
+
+        For heat pumps the desired state is ON at full capacity.
+        For EV chargers the restore power is chosen from
+        ``restore_power_kw`` > ``default_power_kw`` > ``capacity_kw``.
+
         :param asset_id: Asset identifier
         :param dry_run: If True, only log what would be done
         :return: Result dictionary
@@ -806,41 +814,63 @@ class AssetController:
         description = asset_config.get("description", asset_id)
         asset_type = asset_config.get("type", "unknown")
         site_id = asset_config.get("pod", "")
+        capacity_kw = float(asset_config.get("capacity_kw", 0) or 0)
+
+        restore_payload = {
+            "community": self.community,
+            "site_id": site_id,
+            "asset_id": asset_id,
+            "description": description,
+            "asset_type": asset_type,
+            "action": "restore",
+            "capacity_kw": capacity_kw,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        modulation_type = self._get_modulation_type(asset_config)
+
+        if modulation_type == "discrete":
+            restore_payload["target_state"] = "ON"
+            restore_payload["discrete_state"] = "ON"
+            restore_payload["target_power_kw"] = capacity_kw
+            restore_payload["modulation_type"] = "discrete"
+
+        if asset_type == "ev_charger":
+            if asset_config.get("restore_power_kw") is not None:
+                restore_power_kw = float(asset_config["restore_power_kw"])
+            elif asset_config.get("default_power_kw") is not None:
+                restore_power_kw = float(asset_config["default_power_kw"])
+            else:
+                restore_power_kw = capacity_kw
+            restore_payload["target_power_kw"] = restore_power_kw
+            restore_payload["power_kw"] = restore_power_kw
 
         # Queue restore command for RabbitMQ
         if self.rabbitmq_publisher:
-            restore_payload = {
-                "community": self.community,
-                "site_id": site_id,
-                "asset_id": asset_id,
-                "description": description,
-                "asset_type": asset_type,
-                "action": "restore",
-                "timestamp": datetime.now(timezone.utc).isoformat()
-            }
             self._pending_commands.append({
                 "asset_id": asset_id,
                 "asset_type": asset_type,
                 "command_type": "restore",
                 "payload": restore_payload,
-                "priority": 5
+                "priority": 5,
             })
-        
+
         if dry_run:
             self.logger.info("[DRY-RUN] Would restore %s (%s) to normal operation", asset_id, description)
             return {"asset_id": asset_id, "status": "simulated", "action": "restore"}
         else:
             self.logger.info("Restoring %s (%s) to normal operation", asset_id, description)
-            # TODO: Implement actual restore logic
             return {"asset_id": asset_id, "status": "success", "action": "restore"}
     
     def publish_pending_commands(self, slot_info: dict = None, dry_run: bool = True) -> int:
         """
         Publish all pending commands to RabbitMQ.
-        
-        This method should be called after all curtail_asset calls to
-        batch-publish commands to the message broker.
-        
+
+        Each command payload is enriched with clean ``slot_start`` /
+        ``slot_end`` timestamps (no timezone suffix, no microseconds) and
+        the ``dry_run`` flag.  EV charger commands also receive a
+        ``schedule`` dictionary.
+
         :param slot_info: Optional slot information for batch header
         :param dry_run: Whether forwarder should operate in dry-run mode
         :return: Number of successfully published commands
@@ -848,29 +878,96 @@ class AssetController:
         if not self.rabbitmq_publisher:
             self.logger.debug("No RabbitMQ publisher configured - skipping publish")
             return 0
-        
+
         if not self._pending_commands:
             self.logger.debug("No pending commands to publish")
             return 0
-        
-        self.logger.info("Publishing %d commands to RabbitMQ (dry_run=%s)...", 
-                        len(self._pending_commands), dry_run)
-        
-        # Add slot_start, slot_end, and dry_run to each command's payload
+
+        self.logger.info(
+            "Publishing %d commands to RabbitMQ (dry_run=%s)...",
+            len(self._pending_commands), dry_run,
+        )
+
+        # Parse market slot boundaries from slot_info
+        slot_start_dt = None
+        slot_end_dt = None
+        if slot_info:
+            raw_start = slot_info.get("slot_start")
+            raw_end = slot_info.get("slot_end")
+            if raw_start is not None:
+                slot_start_dt = _parse_slot_datetime(raw_start)
+            if raw_end is not None:
+                slot_end_dt = _parse_slot_datetime(raw_end)
+
+        # Warn if the slot start is already in the past
+        if slot_start_dt is not None:
+            now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+            if slot_start_dt <= now_utc:
+                self.logger.warning(
+                    "slot_start %s is not in the future (now=%s). "
+                    "AEM controls require future timestamps. "
+                    "NOT shifting the slot to avoid breaking the market-cleared interval.",
+                    _format_aem_utc(slot_start_dt),
+                    now_utc.strftime("%Y-%m-%dT%H:%M:%S"),
+                )
+
+        # Enrich each command payload with timing, dry_run, and EV schedule
         for cmd in self._pending_commands:
-            cmd["payload"]["dry_run"] = dry_run
-            if slot_info:
-                cmd["payload"]["slot_start"] = slot_info.get("slot_start")
-                cmd["payload"]["slot_end"] = slot_info.get("slot_end")
-        
+            if slot_start_dt is not None and slot_end_dt is not None:
+                _prepare_command_payload_for_slot(
+                    command=cmd,
+                    slot_start=slot_start_dt,
+                    slot_end=slot_end_dt,
+                    dry_run=dry_run,
+                )
+            else:
+                cmd.setdefault("payload", {})["dry_run"] = dry_run
+
+            # Log prepared command
+            payload = cmd.get("payload", {})
+            asset_id = cmd.get("asset_id", "?")
+            asset_type = cmd.get("asset_type", "?")
+            cmd_type = cmd.get("command_type", "?")
+
+            if asset_type == "ev_charger":
+                self.logger.info(
+                    "Prepared EV schedule for %s: power=%.2f kW, "
+                    "slot=%s -> %s, points=%d, dry_run=%s",
+                    asset_id,
+                    payload.get("target_power_kw", 0.0),
+                    payload.get("slot_start", "?"),
+                    payload.get("slot_end", "?"),
+                    len(payload.get("schedule", {})),
+                    dry_run,
+                )
+            elif asset_type == "heat_pump":
+                state = payload.get("discrete_state", payload.get("target_state", "?"))
+                self.logger.info(
+                    "Prepared HP command for %s: state=%s, "
+                    "slot=%s -> %s, dry_run=%s",
+                    asset_id,
+                    state,
+                    payload.get("slot_start", "?"),
+                    payload.get("slot_end", "?"),
+                    dry_run,
+                )
+            else:
+                self.logger.info(
+                    "Prepared %s command for %s: slot=%s -> %s, dry_run=%s",
+                    cmd_type, asset_id,
+                    payload.get("slot_start", "?"),
+                    payload.get("slot_end", "?"),
+                    dry_run,
+                )
+
         published = self.rabbitmq_publisher.publish_batch_commands(
             self._pending_commands,
-            slot_info=slot_info
+            slot_info=slot_info,
         )
-        
+
         # Clear pending commands after publishing
         self._pending_commands = []
-        
+
         return published
     
     def get_pending_commands(self) -> List[dict]:
@@ -1015,6 +1112,97 @@ MODULATION_DEFAULTS = {
     "heat_pump": {"modulation_type": "discrete", "discrete_states_kw": [0.0, 1.0]},  # 0 or 100% of capacity
     "ev_charger": {"modulation_type": "continuous", "min_power_kw": 0.0},
 }
+
+DEFAULT_EV_INTERVAL_MINUTES = 15
+
+
+def _parse_slot_datetime(value) -> datetime:
+    """Parse a slot datetime from a string or datetime, returning a naive UTC datetime
+    with seconds and microseconds zeroed out."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    else:
+        raise TypeError(f"Expected str or datetime, got {type(value).__name__}")
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.replace(second=0, microsecond=0)
+
+
+def _format_aem_utc(dt: datetime) -> str:
+    """Format a datetime as a naive UTC ISO string with second precision.
+
+    Converts timezone-aware values to UTC and strips tzinfo.
+    Example output: ``2026-04-27T12:15:00``
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt.isoformat(timespec="seconds")
+
+
+def _build_ev_schedule(
+    slot_start: datetime,
+    slot_end: datetime,
+    power_kw: float,
+    interval_minutes: int = DEFAULT_EV_INTERVAL_MINUTES,
+) -> dict:
+    """Build an EV power schedule dict keyed by clean UTC timestamp strings.
+
+    One entry every *interval_minutes* from *slot_start* up to (but not
+    including) *slot_end*.  Raises ``ValueError`` if the resulting schedule
+    would be empty.
+    """
+    if interval_minutes <= 0:
+        raise ValueError("interval_minutes must be a positive integer")
+
+    power_value = float(power_kw)
+    schedule: dict = {}
+    current = slot_start
+
+    while current < slot_end:
+        schedule[_format_aem_utc(current)] = power_value
+        current += timedelta(minutes=interval_minutes)
+
+    if not schedule:
+        raise ValueError(
+            f"EV schedule is empty for start={_format_aem_utc(slot_start)} "
+            f"end={_format_aem_utc(slot_end)}"
+        )
+    return schedule
+
+
+def _prepare_command_payload_for_slot(
+    command: dict,
+    slot_start: datetime,
+    slot_end: datetime,
+    dry_run: bool,
+    ev_interval_minutes: int = DEFAULT_EV_INTERVAL_MINUTES,
+) -> None:
+    """Enrich a pending command's payload with slot timing and dry-run flag.
+
+    For EV charger commands the method also builds and injects the
+    ``schedule`` dictionary.  Operates **in-place** on *command*.
+    """
+    payload = command.setdefault("payload", {})
+    payload["dry_run"] = dry_run
+    payload["slot_start"] = _format_aem_utc(slot_start)
+    payload["slot_end"] = _format_aem_utc(slot_end)
+
+    if command.get("asset_type") == "ev_charger":
+        power_kw = payload.get("power_kw")
+        if power_kw is None:
+            power_kw = payload.get("target_power_kw")
+        if power_kw is not None:
+            power_value = float(power_kw)
+            payload["target_power_kw"] = power_value
+            payload["power_kw"] = power_value
+            payload["schedule"] = _build_ev_schedule(
+                slot_start=slot_start,
+                slot_end=slot_end,
+                power_kw=power_value,
+                interval_minutes=ev_interval_minutes,
+            )
 
 
 class FlexibilityAllocator:
@@ -1961,7 +2149,8 @@ class FlexibilityManager:
         logger: logging.Logger,
         nodes_authenticated: bool = False,
         rabbitmq_publisher: 'RabbitMQPublisher' = None,
-        demand_repo: DemandRecordRepository = None
+        demand_repo: DemandRecordRepository = None,
+        state_file: str = None,
     ):
         self.config = config
         self.fsp_id = fsp_id
@@ -1972,6 +2161,10 @@ class FlexibilityManager:
         self.demand_repo = demand_repo
         self.nodes_authenticated = nodes_authenticated
         self.rabbitmq_publisher = rabbitmq_publisher
+        self.state_file = state_file or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "logs", "flexi_manager_state.json",
+        )
         
         # Get community from config (fm.community)
         self.community = config.get("fm", {}).get("community", "")
@@ -2043,6 +2236,68 @@ class FlexibilityManager:
         else:
             logger.info("NODES API not authenticated - will use bid record data only")
     
+    # ------------------------------------------------------------------
+    # Persistent controlled-asset state
+    # ------------------------------------------------------------------
+
+    def _load_controlled_state(self) -> Dict:
+        """Load the set of assets currently under manager control from disk.
+
+        Returns a dict mapping asset_id to metadata (asset_type, slot, etc.).
+        If the file is missing or unreadable the method returns an empty dict
+        and logs a warning.
+        """
+        try:
+            with open(self.state_file, "r") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+            self.logger.warning("Controlled-state file has unexpected format, ignoring")
+            return {}
+        except FileNotFoundError:
+            return {}
+        except Exception as exc:
+            self.logger.warning(
+                "Could not read controlled-state file %s: %s",
+                self.state_file, exc,
+            )
+            return {}
+
+    def _save_controlled_state(self, state: Dict) -> None:
+        """Persist the controlled-asset state to disk.
+
+        Logs an error (but does not crash) if the write fails.
+        """
+        try:
+            state_dir = os.path.dirname(self.state_file)
+            if state_dir:
+                os.makedirs(state_dir, exist_ok=True)
+            with open(self.state_file, "w") as fh:
+                json.dump(state, fh, indent=2)
+        except Exception as exc:
+            self.logger.error(
+                "Could not write controlled-state file %s: %s",
+                self.state_file, exc,
+            )
+
+    def _queue_restores_for_previous_state(
+        self,
+        previous_state: Dict,
+        current_curtailed: set,
+        dry_run: bool,
+    ) -> None:
+        """Queue restore commands for assets that were previously controlled
+        but are *not* selected for curtailment in the current slot."""
+        for asset_id, meta in previous_state.items():
+            if asset_id in current_curtailed:
+                continue
+            slot_str = meta.get("slot_start", "?")
+            self.logger.info(
+                "Restoring previously controlled asset %s (last slot=%s)",
+                asset_id, slot_str,
+            )
+            self.controller.restore_asset(asset_id, dry_run=dry_run)
+
     def get_target_slot(self, slot_override: str = None) -> Tuple[datetime, datetime]:
         """
         Determine the target time slot for flexibility activation.
@@ -2173,10 +2428,10 @@ class FlexibilityManager:
                         slot_end = slot_start + timedelta(minutes=15)
                         slot_info = {
                             "fsp_id": self.fsp_id,
-                            "slot_start": slot_start.isoformat(),
-                            "slot_end": slot_end.isoformat(),
+                            "slot_start": _format_aem_utc(slot_start),
+                            "slot_end": _format_aem_utc(slot_end),
                             "command_type": "preactivation",
-                            "dry_run": False
+                            "dry_run": False,
                         }
                         published = self.controller.publish_pending_commands(slot_info, dry_run=False)
                         self.logger.info("Published %d pre-activation commands to RabbitMQ", published)
@@ -2230,12 +2485,11 @@ class FlexibilityManager:
             "description": description,
             "command": "preactivate",
             "target_state": "ON",
-            "slot_start": slot_start.isoformat(),
-            "slot_end": slot_end.isoformat(),
-            "status": "pending"
+            "slot_start": _format_aem_utc(slot_start),
+            "slot_end": _format_aem_utc(slot_end),
+            "status": "pending",
         }
 
-        # Build command payload for RabbitMQ
         command_payload = {
             "community": self.community,
             "site_id": site_id,
@@ -2244,14 +2498,15 @@ class FlexibilityManager:
             "asset_type": asset_type,
             "modulation_type": "discrete",
             "command": "preactivate",
+            "discrete_state": "ON",
             "target_state": "ON",
-            "target_power_kw": capacity_kw,  # Full power for pre-heating
-            "capacity_kw": capacity_kw,
+            "target_power_kw": float(capacity_kw),
+            "capacity_kw": float(capacity_kw),
             "duration_minutes": 15,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "dry_run": False,
-            "slot_start": slot_start.isoformat(),
-            "slot_end": slot_end.isoformat()
+            "slot_start": _format_aem_utc(slot_start),
+            "slot_end": _format_aem_utc(slot_end),
         }
 
         # Queue command for RabbitMQ
@@ -2303,7 +2558,11 @@ class FlexibilityManager:
         :return: Summary of actions taken
         """
         slot_start, slot_end = self.get_target_slot(slot_override)
-        
+
+        # Load previously controlled assets so we can restore any that are
+        # no longer needed for the current slot.
+        previous_state = self._load_controlled_state()
+
         self.logger.info("=" * 70)
         self.logger.info("FLEXIBILITY MANAGER - %s", self.fsp_id)
         self.logger.info("=" * 70)
@@ -2312,6 +2571,8 @@ class FlexibilityManager:
                         slot_end.strftime("%H:%M"))
         self.logger.info("Mode: %s", "DRY-RUN" if dry_run else "LIVE")
         self.logger.info("Allocation strategy: %s", allocation_strategy)
+        if previous_state:
+            self.logger.info("Previously controlled assets: %s", list(previous_state.keys()))
         self.logger.info("-" * 70)
         
         summary = {
@@ -2396,7 +2657,22 @@ class FlexibilityManager:
             summary["total_flexibility_sold_kw"] = 0
             summary["allocation"] = {}
             summary["activation_results"] = []
-            
+
+            # Restore all previously controlled assets
+            if previous_state:
+                self._queue_restores_for_previous_state(
+                    previous_state, current_curtailed=set(), dry_run=dry_run,
+                )
+                if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+                    restore_slot_info = {
+                        "fsp_id": self.fsp_id,
+                        "slot_start": _format_aem_utc(slot_start),
+                        "slot_end": _format_aem_utc(slot_end),
+                        "dry_run": dry_run,
+                    }
+                    self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
+                self._save_controlled_state({})
+
             # ========================================================
             # AUTONOMOUS MODE: Analyze price evolution when no bid exists
             # When dry_run=False, pre-heating commands will actually be sent
@@ -2452,7 +2728,22 @@ class FlexibilityManager:
             summary["total_flexibility_sold_kw"] = 0
             summary["allocation"] = {}
             summary["activation_results"] = []
-            
+
+            # Restore all previously controlled assets
+            if previous_state:
+                self._queue_restores_for_previous_state(
+                    previous_state, current_curtailed=set(), dry_run=dry_run,
+                )
+                if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+                    restore_slot_info = {
+                        "fsp_id": self.fsp_id,
+                        "slot_start": _format_aem_utc(slot_start),
+                        "slot_end": _format_aem_utc(slot_end),
+                        "dry_run": dry_run,
+                    }
+                    self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
+                self._save_controlled_state({})
+
             # ========================================================
             # AUTONOMOUS MODE: Analyze price evolution when no trades
             # Even if a bid record exists, if there were no trades,
@@ -2543,7 +2834,9 @@ class FlexibilityManager:
         # Step 3: Send control commands
         self.logger.info("-" * 70)
         self.logger.info("Step 3: Sending control commands...")
-        
+
+        current_curtailed = set(allocations.keys())
+
         for asset_id, curtailment_kw in allocations.items():
             result = self.controller.curtail_asset(
                 asset_id,
@@ -2552,26 +2845,44 @@ class FlexibilityManager:
                 dry_run=dry_run
             )
             summary["control_results"][asset_id] = result
-        
+
+        # Queue restore commands for previously controlled assets that are
+        # no longer selected for curtailment in the current slot.
+        if previous_state:
+            self._queue_restores_for_previous_state(
+                previous_state, current_curtailed=current_curtailed, dry_run=dry_run,
+            )
+
         # Step 4: Publish commands to RabbitMQ (if configured)
         if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
             self.logger.info("-" * 70)
             self.logger.info("Step 4: Publishing commands to RabbitMQ...")
             self.logger.info("  Forwarder mode: %s", "DRY-RUN" if dry_run else "LIVE ACTUATION")
-            
+
             slot_info = {
                 "fsp_id": self.fsp_id,
-                "slot_start": slot_start.isoformat(),
-                "slot_end": slot_end.isoformat(),
+                "slot_start": _format_aem_utc(slot_start),
+                "slot_end": _format_aem_utc(slot_end),
                 "total_flexibility_kw": total_sold_kw,
                 "allocation_strategy": allocation_strategy,
-                "dry_run": dry_run
+                "dry_run": dry_run,
             }
-            
+
             published = self.controller.publish_pending_commands(slot_info, dry_run=dry_run)
             summary["rabbitmq_published"] = published
             summary["forwarder_dry_run"] = dry_run
             self.logger.info("Published %d commands to RabbitMQ", published)
+
+        # Persist currently curtailed assets for next run
+        new_state = {}
+        for asset_id in current_curtailed:
+            ac = self.asset_mapping.get(asset_id, {})
+            new_state[asset_id] = {
+                "asset_type": ac.get("type", "unknown"),
+                "slot_start": _format_aem_utc(slot_start),
+                "slot_end": _format_aem_utc(slot_end),
+            }
+        self._save_controlled_state(new_state)
         
         # Step 5: Save activation records to database
         if self.bid_repo:
@@ -2729,6 +3040,12 @@ Examples:
     parser.add_argument(
         "--output", "-o",
         help="Output file for JSON summary"
+    )
+    parser.add_argument(
+        "--state-file",
+        default=None,
+        help="Path to the controlled-asset state file "
+             "(default: logs/flexi_manager_state.json)"
     )
     
     # RabbitMQ arguments
@@ -2926,7 +3243,8 @@ Examples:
             config, args.fsp, nodes_interface, bid_repo, logger,
             nodes_authenticated=nodes_authenticated,
             rabbitmq_publisher=rabbitmq_publisher,
-            demand_repo=demand_repo
+            demand_repo=demand_repo,
+            state_file=args.state_file,
         )
     else:
         # Create a mock manager for testing
@@ -2942,7 +3260,8 @@ Examples:
             config, args.fsp, MockNodesInterface(), None, logger,
             nodes_authenticated=False,
             rabbitmq_publisher=rabbitmq_publisher,
-            demand_repo=None
+            demand_repo=None,
+            state_file=args.state_file,
         )
     
     # Determine slot override from --slot or --offset
