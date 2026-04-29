@@ -2,17 +2,21 @@
   "targets": [
     {
       "name": "aem-api",
-      "reference_api": "aemAPITest",
+      "reference_api": "aemAPI",
       "timeout": 5.0,
       "verify_ssl": false,
       "enabled": true,
       "asset_types": null,
       "asset_ids": null,
-      "description": "AEM API (test instance)",
+      "description": "AEM API",
       "endpoint_template": "{api.controlUrl}/{payload.community}/{payload.site_id}/{payload.asset_id}",
       "asset_request_profiles": {
         "ECM96.2": {
           "endpoint": "/ECM/ECM96/hp",
+          "body_mode": "hp_control"
+        },
+        "ECM97.3": {
+          "endpoint": "/ECM/ECM97/hp",
           "body_mode": "hp_control"
         },
         "ECM63.1": {

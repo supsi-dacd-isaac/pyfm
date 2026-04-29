@@ -1,5 +1,10 @@
 {
   "connectionsFile": "../conf/private/conns.json",
+  "location": {
+    "name": "Lugano",
+    "latitude": 46.0037,
+    "longitude": 8.9511
+  },  
   "baseline": {
     "source": "db",
     "shiftMinutes": 30,
@@ -12,6 +17,7 @@
     }
   },
   "fm": {
+	"community": "ECM",
     "granularity": 15,
     "ordersTimeShift": 90,
     "marketName": "Opentunity-CH",
@@ -94,7 +100,7 @@
             "activationCost": 2.5
           },
           "strategy": "strategy_4",
-          "assets": ["ECM96.2", "ECM97.1", "ECM97.2", "ECM63.1", "ECM63.2"],
+          "assets": ["ECM96.2", "ECM97.3", "ECM63.1", "ECM63.2"],
           "forecast":{
             "source": "aem",
             "filename": "../data/forecast/example01.csv"
@@ -140,6 +146,7 @@
   "asset_mapping": {
     "ECM63.1": {
       "device_name_tag": "charge_point_ev_1",
+      "pod": "ECM63",
       "field": "power",
       "type": "ev_charger",
       "description": "EV Charger 1",
@@ -150,6 +157,7 @@
     },
     "ECM63.2": {
       "device_name_tag": "charge_point_ev_2",
+      "pod": "ECM63",
       "field": "power",
       "type": "ev_charger",
       "description": "EV Charger 2",  
@@ -160,6 +168,7 @@
     },
     "ECM96.2": {
       "device_name_tag": "shelly_3em_pro_heat_pump_ext_unit",
+      "pod": "ECM96",
       "field": "active_power",
       "type": "heat_pump",
       "description": "HP Small",
@@ -170,6 +179,7 @@
     },
     "ECM97.1": {
       "device_name_tag": "shelly_3em_pro_heat_pump_1",
+      "pod": "ECM97",
       "field": "active_power",
       "type": "heat_pump",
       "description": "HP Cinema 1",
@@ -180,6 +190,7 @@
     },
     "ECM97.2": {
       "device_name_tag": "shelly_3em_pro_heat_pump_2",
+      "pod": "ECM97",
       "field": "active_power",
       "type": "heat_pump",
       "description": "HP Cinema 2",
@@ -187,6 +198,17 @@
       "flexibility_factor": 1.0,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 15.0]
+    },
+	"ECM97.3": {
+      "device_name_tag": "v_shelly_3em_pro_heat_pump",
+      "pod": "ECM97",
+      "field": "active_power",
+      "type": "heat_pump",
+      "description": "HP Cinema",
+      "capacity_kw": 30.0,
+      "flexibility_factor": 1.0,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 30.0]
     }
   },
   "assets_grouping": {
@@ -223,6 +245,13 @@
       }
     }
   },
+  "autonomous": {
+    "enabled": true,
+    "lookahead_hours": 3,
+    "historical_days": 7,
+    "price_increase_threshold_pct": 20,
+    "dso_id": "AEM"
+  },  
   "bidding_strategies": {
     "strategy_1": {
       "name": "HP Only",
@@ -251,7 +280,7 @@
       "name": "Morning Peak Focus",
       "description": "Aggressive bidding during morning peak when Cinema HPs are at maximum",
       "asset_types": ["heat_pump"],
-      "assets_filter": ["ECM97.1", "ECM97.2"],
+      "assets_filter": ["ECM97.3"],
       "time_slots": [
         {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
         {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.010, "bid_price": 7.5, "activation_cost": 2.5},
@@ -263,6 +292,7 @@
       "name": "Hybrid (S3+S1)",
       "description": "Morning peak aggressive (S3) + full day HP coverage (S1) - RECOMMENDED",
       "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM96.2", "ECM97.3"],
       "time_slots": [
         {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
         {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
@@ -282,6 +312,150 @@
         {"name": "Evening Peak (Aggressive)", "start": "17:00", "end": "20:00", "flexibility_mw": 0.020, "bid_price": 9.5, "activation_cost": 2.5, "ev_flexibility_mw": 0.0008, "ev_bid_price": 10.0, "ev_activation_cost": 4.5},
         {"name": "Off-peak", "start": "20:00", "end": "06:30", "flexibility_mw": 0.005, "bid_price": 5.5, "activation_cost": 2.5}
       ]
-    }
+    },
+    "strategy_6": {
+      "name": "Smart Preheat",
+      "description": "Preheat 04-06h to increase/guarantee HP flexibility during morning peak 07-10h",
+      "asset_types": ["heat_pump"],
+      "time_slots": [
+        {
+          "name": "Preheat (HP ON)",
+          "start": "04:00",
+          "end": "06:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "preheat_power_mw": 0.02,
+          "preheat_elec_cost_chf_mwh": 20.0
+        },
+        {
+          "name": "Transition",
+          "start": "06:00",
+          "end": "07:00",
+          "flexibility_mw": 0.01,
+          "bid_price": 8.0,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Morning Peak (HP OFF - Full Flex)",
+          "start": "07:00",
+          "end": "10:00",
+          "flexibility_mw": 0.028,
+          "bid_price": 10.5,
+          "activation_cost": 1.0
+        },
+        {
+          "name": "Post-Peak Recovery",
+          "start": "10:00",
+          "end": "12:00",
+          "flexibility_mw": 0.01,
+          "bid_price": 7.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Afternoon",
+          "start": "12:00",
+          "end": "16:00",
+          "flexibility_mw": 0.008,
+          "bid_price": 7.0,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Evening Peak",
+          "start": "16:00",
+          "end": "19:00",
+          "flexibility_mw": 0.012,
+          "bid_price": 9.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Night",
+          "start": "19:00",
+          "end": "04:00",
+          "flexibility_mw": 0.005,
+          "bid_price": 5.5,
+          "activation_cost": 2.5
+        }
+      ]
+    },
+    "strategy_7": {
+      "name": "Double Pre-heating",
+      "description": "Dual preheat (04-06h + 12-15h) for maximum flex during BOTH morning (07-11h) and evening (16-20h) peaks",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM96.2"],
+      "time_slots": [
+        {
+          "name": "Pre-heat 1 (04:00-06:00)",
+          "start": "04:00",
+          "end": "06:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "preheat_power_mw": 0.018,
+          "preheat_elec_cost_chf_mwh": 15.0
+        },
+        {
+          "name": "Transition 1 (06:00-07:00)",
+          "start": "06:00",
+          "end": "07:00",
+          "flexibility_mw": 0.008,
+          "bid_price": 8.0,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Morning Peak Flex (07:00-11:00)",
+          "start": "07:00",
+          "end": "11:00",
+          "flexibility_mw": 0.025,
+          "bid_price": 10.0,
+          "activation_cost": 1.0
+        },
+        {
+          "name": "Transition 2 (11:00-12:00)",
+          "start": "11:00",
+          "end": "12:00",
+          "flexibility_mw": 0.006,
+          "bid_price": 7.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Pre-heat 2 (12:00-15:00)",
+          "start": "12:00",
+          "end": "15:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "preheat_power_mw": 0.018,
+          "preheat_elec_cost_chf_mwh": 10.0
+        },
+        {
+          "name": "Transition 3 (15:00-16:00)",
+          "start": "15:00",
+          "end": "16:00",
+          "flexibility_mw": 0.01,
+          "bid_price": 8.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Evening Peak Flex (16:00-20:00)",
+          "start": "16:00",
+          "end": "20:00",
+          "flexibility_mw": 0.028,
+          "bid_price": 11.5,
+          "activation_cost": 0.8
+        },
+        {
+          "name": "Night Recovery (20:00-04:00)",
+          "start": "20:00",
+          "end": "04:00",
+          "flexibility_mw": 0.004,
+          "bid_price": 5.5,
+          "activation_cost": 3.0
+        }
+      ]
+	}
   }
 }
