@@ -374,9 +374,16 @@ def plot_heatmap(df: pd.DataFrame, asset_id: str, description: str, output_dir: 
     
     df["is_occupied"] = df["power_w"] > 100
     
-    # Create pivot table: rows = hours (0-23), columns = days (0-6)
-    heatmap_data = df.groupby(["hour", "day_of_week"])["is_occupied"].mean().unstack()
-    
+    # Create pivot table: rows = 15-min slots (0-95), columns = days (0-6)
+    heatmap_data = df.groupby(["slot_idx", "day_of_week"])["is_occupied"].mean().unstack()
+
+    # Fill missing days/slots with 0
+    heatmap_data = heatmap_data.reindex(
+        index=range(96),
+        columns=range(7),
+        fill_value=0
+    )
+
     fig, ax = plt.subplots(figsize=(10, 8))
     
     im = ax.imshow(heatmap_data.values * 100, cmap='YlOrRd', aspect='auto', 
@@ -384,11 +391,11 @@ def plot_heatmap(df: pd.DataFrame, asset_id: str, description: str, output_dir: 
     
     ax.set_xticks(range(7))
     ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
-    ax.set_yticks(range(24))
+    ax.set_yticks(range(0, 96, 4))
     ax.set_yticklabels([f"{h:02d}:00" for h in range(24)])
     
     ax.set_xlabel("Day of Week")
-    ax.set_ylabel("Hour of Day")
+    ax.set_ylabel("Time of Day (15-min slots)")
     ax.set_title(f"{asset_id} - {description}: Occupancy Heatmap (%)")
     
     cbar = plt.colorbar(im, ax=ax, label='Occupancy Rate (%)')
@@ -442,13 +449,13 @@ def plot_flexibility_heatmap(df: pd.DataFrame, asset_id: str, description: str,
         # We need power_kw >= min_power_kw to provide that level of flexibility
         df[f"flex_{level_str}"] = df["power_kw"] >= min_power_kw
         
-        # Create pivot table: rows = hours (0-23), columns = days (0-6)
-        heatmap_data = df.groupby(["hour", "day_of_week"])[f"flex_{level_str}"].mean().unstack()
-        
-        # Fill missing days/hours with 0
+        # Create pivot table: rows = 15-min slots (0-95), columns = days (0-6)
+        heatmap_data = df.groupby(["slot_idx", "day_of_week"])[f"flex_{level_str}"].mean().unstack()
+
+        # Fill missing days/slots with 0
         heatmap_data = heatmap_data.reindex(
-            index=range(24), 
-            columns=range(7), 
+            index=range(96),
+            columns=range(7),
             fill_value=0
         )
         
@@ -457,24 +464,14 @@ def plot_flexibility_heatmap(df: pd.DataFrame, asset_id: str, description: str,
         
         ax.set_xticks(range(7))
         ax.set_xticklabels(['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'])
-        ax.set_yticks(range(24))
+        ax.set_yticks(range(0, 96, 4))
         ax.set_yticklabels([f"{h:02d}:00" for h in range(24)])
         
         ax.set_xlabel("Day of Week")
-        ax.set_ylabel("Hour of Day")
+        ax.set_ylabel("Time of Day (15-min slots)")
         ax.set_title(f"{level_str} Downward Flexibility ({power_str})")
         
         plt.colorbar(im, ax=ax, label='Probability (%)')
-        
-        # Add text annotations for cells with notable values
-        for i in range(24):
-            for j in range(7):
-                value = heatmap_data.values[i, j] * 100
-                if value > 0:
-                    # Choose text color based on background
-                    text_color = 'white' if value > 50 else 'black'
-                    ax.text(j, i, f'{value:.0f}', ha='center', va='center', 
-                           fontsize=6, color=text_color)
     
     fig.suptitle(f"{asset_id} - {description}: Downward Flexibility Heatmap\n"
                  f"(Nominal Power: {nominal_power_kw} kW - Probability of having curtailable load)", 
@@ -826,4 +823,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
