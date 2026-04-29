@@ -2188,6 +2188,10 @@ class FlexibilityManager:
         self.autonomous_lookahead = self.autonomous_config.get("lookahead_hours", 3.0)
         self.autonomous_historical_days = self.autonomous_config.get("historical_days", 7)
         self.autonomous_threshold_pct = self.autonomous_config.get("price_increase_threshold_pct", 20.0)
+        self.autonomous_preactivation_enabled = self.autonomous_config.get(
+            "preactivation_enabled",
+            True,
+        )
         
         # Initialize price predictor for autonomous mode
         self.price_predictor = None
@@ -2199,10 +2203,11 @@ class FlexibilityManager:
                 historical_days=self.autonomous_historical_days
             )
             logger.info(
-                "Autonomous mode enabled: lookahead=%dh, history=%d days, threshold=%.1f%%",
+                "Autonomous mode enabled: lookahead=%.1fh, history=%d days, threshold=%.1f%%, preactivation=%s",
                 self.autonomous_lookahead,
                 self.autonomous_historical_days,
-                self.autonomous_threshold_pct
+                self.autonomous_threshold_pct,
+                "enabled" if self.autonomous_preactivation_enabled else "disabled",
             )
         
         # Get organization ID from NODES only if authenticated
@@ -2330,7 +2335,7 @@ class FlexibilityManager:
         to pay and determine if pre-activation would be beneficial.
         
         When pre-activation is recommended and dry_run=False, this method will
-        actually send pre-heating commands to heat pump assets.
+        send pre-heating commands only if autonomous.preactivation_enabled is true.
 
         :param slot_start: Current slot start time
         :param summary: Summary dictionary to update
@@ -2408,7 +2413,14 @@ class FlexibilityManager:
 
             # Execute pre-activation if not in dry-run mode
             if preactivation_assets:
-                if dry_run:
+                if not self.autonomous_preactivation_enabled:
+                    self.logger.info("")
+                    self.logger.info(
+                        "Pre-activation command execution is disabled by configuration; skipping command publication"
+                    )
+                    summary["preactivation_executed"] = False
+                    summary["preactivation_skipped_reason"] = "disabled_by_configuration"
+                elif dry_run:
                     self.logger.info("")
                     self.logger.info("[DRY-RUN] Would send pre-heating (ON) commands to %d heat pump(s)",
                                    len(preactivation_assets))
@@ -2457,7 +2469,9 @@ class FlexibilityManager:
             "price_increase_pct": recommendation.get("price_increase_pct", 0),
             "peak_slot": recommendation.get("peak_slot", {}),
             "historical_days_analyzed": self.autonomous_historical_days,
-            "threshold_pct": self.autonomous_threshold_pct
+            "threshold_pct": self.autonomous_threshold_pct,
+            "preactivation_enabled": self.autonomous_preactivation_enabled,
+            "preactivation_execution_skipped_reason": summary.get("preactivation_skipped_reason", ""),
         }
     
     def _send_preactivation_command(self, asset_id: str, slot_start: datetime) -> Dict:

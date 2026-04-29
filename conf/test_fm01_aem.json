@@ -250,7 +250,8 @@
     "lookahead_hours": 3,
     "historical_days": 7,
     "price_increase_threshold_pct": 20,
-    "dso_id": "AEM"
+    "dso_id": "AEM",
+    "preactivation_enabled": false
   },  
   "bidding_strategies": {
     "strategy_1": {
