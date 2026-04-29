@@ -47,6 +47,7 @@ import argparse
 import logging
 import signal
 import time
+import warnings
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Any
 from urllib.parse import urlparse, urlunparse
@@ -55,8 +56,13 @@ from urllib.parse import urlparse, urlunparse
 try:
     import requests
     REQUESTS_AVAILABLE = True
+    try:
+        from urllib3.exceptions import InsecureRequestWarning
+    except ImportError:
+        InsecureRequestWarning = None
 except ImportError:
     REQUESTS_AVAILABLE = False
+    InsecureRequestWarning = None
 
 
 def get_env(name: str, default: str = None) -> str:
@@ -873,14 +879,21 @@ class TargetHandler:
                 target.name,
                 _format_request_body_for_log(request_body)
             )
+            request_kwargs = {
+                "json": request_body,
+                "auth": target.get_auth(),
+                "timeout": target.timeout,
+                "verify": target.verify_ssl,
+            }
 
-            response = requests.post(
-                endpoint,
-                json=request_body,
-                auth=target.get_auth(),
-                timeout=target.timeout,
-                verify=target.verify_ssl
-            )
+            if target.verify_ssl or InsecureRequestWarning is None:
+                response = requests.post(endpoint, **request_kwargs)
+            else:
+                # The target is explicitly configured to skip certificate validation.
+                # Suppress urllib3's noisy warning and rely on config-driven behavior.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", InsecureRequestWarning)
+                    response = requests.post(endpoint, **request_kwargs)
 
             response_text = " ".join((response.text or "").split())
 
