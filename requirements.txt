@@ -13,3 +13,10 @@ requests==2.31.0
 six==1.16.0
 tzdata==2024.1
 urllib3==2.2.1
+
+# For QRF training (tree ensemble + quantile extraction)
+scikit-learn==1.5.1
+joblib==1.4.2
+
+# Test runner
+pytest==9.0.2
