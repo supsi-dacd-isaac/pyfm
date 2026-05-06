@@ -9,6 +9,7 @@ data/hp_analysis/*
 data/market_results/*
 data/energy_signature/*
 data/pvgis/*
+data/*.json
 tkns/*
 .env
 .vscode

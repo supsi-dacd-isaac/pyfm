@@ -135,6 +135,88 @@ class FSP(Player):
         )
         return self.nodes_interface.post_csv_file_request(endpoint, tmp_baseline_file)
 
+    def save_portfolio_baseline_to_influx(self, portfolio_id, baseline_dataframe, bs_cfg):
+        influx_cfg = self.main_cfg["influxDB"]
+        if not influx_cfg.get("saveBaselineMeasurement", False):
+            self.logger.info(
+                "InfluxDB baseline saving disabled; baseline for portfolio %s "
+                "will not be saved",
+                portfolio_id,
+            )
+            return True
+
+        measurement = influx_cfg.get("baselineMeasurement")
+        if not measurement:
+            self.logger.warning(
+                "InfluxDB baselineMeasurement not configured; baseline will not be saved"
+            )
+            return True
+
+        df = baseline_dataframe.copy()
+        df["periodFrom"] = pd.to_datetime(df["periodFrom"], utc=True)
+        df["periodTo"] = pd.to_datetime(df["periodTo"], utc=True).dt.strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        df.rename(
+            columns={
+                "assetPortfolioId": "asset_portfolio_id",
+                "periodFrom": "period_from",
+                "periodTo": "period_to",
+                "quantityType": "quantity_type",
+            },
+            inplace=True,
+        )
+        df["quantity_w"] = df["quantity"] * 1e6
+        df.drop(columns=["quantity"], inplace=True)
+        df["fsp_id"] = self.cfg["id"]
+        df["fsp_name"] = self.cfg["name"]
+        df["market_name"] = self.main_cfg["fm"]["marketName"]
+        df["source"] = bs_cfg["source"]
+        df["granularity_minutes"] = self.main_cfg["fm"]["granularity"]
+        df.set_index("period_from", inplace=True)
+
+        tag_columns = [
+            "asset_portfolio_id",
+            "fsp_id",
+            "fsp_name",
+            "market_name",
+            "source",
+            "quantity_type",
+        ]
+        field_columns = ["quantity_w", "period_to", "granularity_minutes"]
+
+        try:
+            result = self.influx_client.write_points(
+                df[tag_columns + field_columns],
+                measurement,
+                tag_columns=tag_columns,
+                field_columns=field_columns,
+                time_precision=influx_cfg.get("timePrecision", "ms"),
+            )
+        except Exception as e:
+            self.logger.error(
+                "Error saving baseline for portfolio %s to InfluxDB measurement %s: %s",
+                portfolio_id,
+                measurement,
+                str(e),
+            )
+            return False
+        if result is False:
+            self.logger.error(
+                "InfluxDB write returned false for portfolio %s measurement %s",
+                portfolio_id,
+                measurement,
+            )
+            return False
+
+        self.logger.info(
+            "Saved %i baseline points to InfluxDB measurement %s for portfolio %s",
+            len(df),
+            measurement,
+            portfolio_id,
+        )
+        return True
+
     def get_assets_portfolios_assignments(self):
         tmp_assets_grid_assignments = {}
         for elem in self.get_assets_grid_assignments()["items"]:
@@ -260,7 +342,11 @@ class FSP(Player):
                     k_p,
                 )
                 continue
-            self.update_portfolio_baseline(k_p, df)
+            if self.update_portfolio_baseline(k_p, df) is False:
+                self.logger.error("Baseline upload failed for portfolio %s", k_p)
+                return False
+            if self.save_portfolio_baseline_to_influx(k_p, df, bs_cfg) is False:
+                return False
         return True
 
     def _build_zero_baseline_dataframe(self, portfolio, adjusted_time, bs_cfg):
@@ -335,15 +421,19 @@ class FSP(Player):
             return self._build_zero_baseline_dataframe(portfolio, adjusted_time, bs_cfg)
         
         # Query each asset individually (different assets may have different fields)
+        assets_measurement = self.main_cfg["influxDB"].get(
+            "assetsMeasurement", "assets_data"
+        )
         aggregated_data = {}
         
         for site, device_name, field, asset_name in asset_queries:
             query = (
-                "SELECT MEAN(%s) FROM assets_data WHERE "
+                "SELECT MEAN(%s) FROM %s WHERE "
                 "time>='%s' AND time<'%s' AND site='%s' AND device_name='%s' "
                 "GROUP BY time(%im)"
             ) % (
                 field,
+                assets_measurement,
                 start_dt_str,
                 end_dt_str,
                 site,

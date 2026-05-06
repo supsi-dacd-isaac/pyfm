@@ -60,6 +60,8 @@ if __name__ == "__main__":
     fsp.print_player_info()
 
     # Update baselines
-    fsp.update_baselines(cfg["baseline"])
+    if fsp.update_baselines(cfg["baseline"]) is False:
+        logger.error("Baseline update failed")
+        sys.exit(2)
 
     logger.info("Ending program")

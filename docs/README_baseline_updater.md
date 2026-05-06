@@ -10,9 +10,9 @@ It is intended to be run periodically (e.g., via cron or a scheduler) to refresh
 2. Merges it with the connection configuration pointed to by `connectionsFile`.
 3. Instantiates an `FSP` object using the configuration under `fm.actors.fsps[<FSP_ID>]`.
 4. Connects the FSP to the Nodes API (via `nodes_interface`) and prints basic information.
-5. Calls `fsp.update_baselines(cfg["baseline"])`, which actually performs the baseline update according to the `baseline` configuration section.
+5. Calls `fsp.update_baselines(cfg["baseline"])`, which performs the baseline update according to the `baseline` configuration section.
 
-All market details (market name, actors, baseline source, etc.) come from the JSON config file, for example `conf/test_fm01_aem.json`.
+All market details (market name, actors, baseline source, asset mappings, etc.) come from the JSON config file, for example `conf/test_fm01_aem.json`.
 
 ---
 
@@ -35,13 +35,28 @@ python scripts/baseline_updater.py \
 
 If the configuration file does not exist, the script exits with code 1 and prints an error.
 
-You can also use the provided shell wrapper:
+You can also use the provided shell wrapper from the `scripts/` directory:
+
+```bash
+cd scripts
+./baseline_updater.sh
+```
+
+The wrapper currently runs:
+
+```bash
+python baseline_updater.py --config_file ../conf/test_fm01_aem.json --fsp supsi01
+```
+
+So it expects the current working directory to be `scripts/`.
+
+If you prefer to run it from the project root, use:
 
 ```bash
 scripts/baseline_updater.sh
 ```
 
-(adjust it as needed to point to your config and FSP id.)
+after adjusting the wrapper command to `python scripts/baseline_updater.py --config_file conf/test_fm01_aem.json --fsp supsi01`.
 
 ---
 
@@ -75,7 +90,7 @@ Example from `conf/test_fm01_aem.json`:
 
 ```json
 "baseline": {
-  "source": "file",
+  "source": "db",
   "shiftMinutes": 30,
   "fileSettings": {
     "profileFile": "../data/baselines/example01.csv"
@@ -87,16 +102,23 @@ Example from `conf/test_fm01_aem.json`:
 }
 ```
 
-This object is passed as-is to `fsp.update_baselines()` and usually controls:
+This object is passed as-is to `fsp.update_baselines()` and controls:
 
 - **`source`**: how baselines are generated.
-  - `"file"`: load an external CSV profile (see `fileSettings.profileFile`).
-  - other values may be supported by `FSP.update_baselines` (e.g. `"db"`) depending on implementation.
-- **`shiftMinutes`**: temporal shift applied to baseline timestamps relative to current time.
-- **`fileSettings.profileFile`**: path to a CSV containing a reference profile used to build baselines.
-- **`dbSettings`**: parameters for DB-based baselines (if `source` uses them), e.g.:
+  - `"db"`: query historical asset measurements from InfluxDB and shift them forward as a persistence baseline.
+  - `"file"`: currently selected by the code path, but `FSP.create_df_baseline_from_file()` is not implemented in `classes/fsp.py`; using this source will fail unless that method is added.
+- **`shiftMinutes`**: temporal shift applied to the rounded current time before calculating the baseline window.
+- **`fileSettings.profileFile`**: intended path to a CSV profile for file-based baselines, but unused until file support is implemented.
+- **`dbSettings`**: parameters for DB-based baselines, e.g.:
   - `upcomingHoursToQuery`: horizon into the future.
   - `daysToGoBack`: history length for baseline calculation.
+
+DB baselines also require:
+
+- A root-level `asset_mapping` section. Each portfolio asset name is looked up in that mapping to determine the InfluxDB `device_name` tag and field to query. The asset MPID from Nodes is used as the InfluxDB `site`.
+- `influxDB.assetsMeasurement` in `connectionsFile`, which names the source measurement for historical asset data. In the current private config this is `assets_data`.
+- `influxDB.saveBaselineMeasurement` in `connectionsFile`, which enables or disables saving generated baselines back to InfluxDB.
+- `influxDB.baselineMeasurement` in `connectionsFile`, which names the destination measurement where generated baselines are saved when `saveBaselineMeasurement` is `true`. In the current private config this is `baseline_intervals`.
 
 ### `fm.actors.fsps[<FSP_ID>]`
 
@@ -150,7 +172,59 @@ Within `FSP`, the `baselines` subsection typically controls:
    - `fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})`.
    - `fsp.print_user_info(user_info)` and `fsp.print_player_info()` log useful info.
 5. **Baseline update**:
-   - `fsp.update_baselines(cfg["baseline"])` triggers creation/upload of baselines to the Node / DB. The details depend on the `FSP` implementation and the `baseline` config.
+   - `fsp.update_baselines(cfg["baseline"])` rounds the current UTC time down to a 15-minute boundary and adds `baseline.shiftMinutes`.
+   - For every portfolio managed by the FSP, it builds a baseline DataFrame.
+   - With `source: "db"`, it queries InfluxDB from `influxDB.assetsMeasurement` for the same time window `daysToGoBack` days in the past, aggregates all mapped asset measurements per timestamp, shifts those timestamps forward by `daysToGoBack`, converts W to MW, and formats the result as Nodes baseline intervals.
+   - If a portfolio has no mapped assets, it uploads a zero baseline over `upcomingHoursToQuery`.
+   - If mapped assets exist but no valid measurements are returned, that portfolio is skipped.
+   - `fsp.update_portfolio_baseline()` writes the DataFrame to `<tmpFolder>/<portfolio_id>.csv` and uploads it to the Nodes `BaselineIntervals/import` endpoint.
+   - If `influxDB.saveBaselineMeasurement` is `true`, `fsp.save_portfolio_baseline_to_influx()` writes the same generated baseline points to `influxDB.baselineMeasurement`.
+
+The generated CSV columns are:
+
+```text
+assetPortfolioId,periodFrom,periodTo,quantity,quantityType
+```
+
+When enabled, the generated InfluxDB baseline measurement uses `periodFrom` as the time index.
+
+Tags:
+
+- `asset_portfolio_id`
+- `fsp_id`
+- `fsp_name`
+- `market_name`
+- `source`
+- `quantity_type`
+
+Fields:
+
+- `quantity_w`
+- `period_to`
+- `granularity_minutes`
+
+## How to read a successful run log
+
+A successful DB-based run normally shows these phases:
+
+1. **Authentication and setup**
+   - Existing Nodes token is reused or refreshed.
+   - InfluxDB connection is opened.
+   - Nodes organization, portfolios, assets, grid assignments, market, and user information are fetched.
+2. **Asset mapping**
+   - Each portfolio asset is mapped to an InfluxDB query target, for example:
+     - `Asset ECM97.3 -> site=ECM97, device=v_shelly_3em_pro_heat_pump, field=active_power`
+     - `Asset ECM63.1 -> site=ECM63, device=charge_point_ev_1, field=power`
+3. **Historical InfluxDB queries**
+   - One query is executed per mapped asset.
+   - In a run started at `2026-05-06 10:31` with `shiftMinutes: 30`, the adjusted baseline start is `2026-05-06T09:00:00Z` because the code uses UTC time, rounds down to the previous 15-minute boundary, then adds 30 minutes.
+   - With `daysToGoBack: 7` and `upcomingHoursToQuery: 24`, the query window is `2026-04-29T09:00:00Z` to `2026-04-30T09:00:00Z`.
+4. **Baseline upload**
+   - The generated baseline is shifted forward by 7 days and uploaded for the current/future period.
+   - The log line `Update baseline of portfolio ..., period [2026-05-06 09:15:00+00:00-2026-05-07 09:00:00+00:00]` reports the first and last `periodTo` values. The corresponding `periodFrom` values start at `09:00` and end at `08:45`.
+   - The `Baseline times`, `Baseline values (MW)`, and `Baseline statistics (MW)` lines summarize the CSV payload before upload.
+   - A `POST ... BaselineIntervals/import, status code: 200` line confirms that Nodes accepted the baseline import.
+   - A `Saved ... baseline points to InfluxDB measurement baseline_intervals ...` line confirms that the same baseline was persisted to InfluxDB when `saveBaselineMeasurement` is enabled. If disabled, the log reports that baseline saving was skipped.
 
 ---
 
@@ -168,6 +242,7 @@ Within `FSP`, the `baselines` subsection typically controls:
 - Project modules available in `classes/` (notably `classes.fsp.FSP`).
 - Configuration file structured as shown above.
 - Access to the Nodes platform and/or database as configured in `connectionsFile`.
+- For `source: "db"`, InfluxDB access, root-level `asset_mapping` entries for the portfolio assets, and write permission on `influxDB.baselineMeasurement`.
 
-The script assumes it is executed from the project root or with paths in the configuration adjusted accordingly.
+The script resolves `config_file`, `connectionsFile`, and other relative paths against the current working directory, not against the location of the config file. Run it from the directory expected by the paths, or use paths adjusted for your working directory.
 
