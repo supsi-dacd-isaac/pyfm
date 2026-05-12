@@ -19,6 +19,11 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--log_file", help="log file (optional, if empty log redirected on stdout)"
     )
+    arg_parser.add_argument(
+        "--dry_run",
+        action="store_true",
+        help="build and log the baseline payload without uploading or saving it",
+    )
     args = arg_parser.parse_args()
 
     # Load the main parameters
@@ -31,6 +36,15 @@ if __name__ == "__main__":
     cfg = json.loads(open(config_file).read())
     cfg_conns = json.loads(open(cfg["connectionsFile"]).read())
     cfg.update(cfg_conns)
+    cfg.setdefault("baseline", {})
+    cfg["baseline"].setdefault("strategy", "persistence")
+    if (
+        "missingAssetPolicy" not in cfg["baseline"]
+        and "missing_asset_policy" not in cfg["baseline"]
+    ):
+        cfg["baseline"]["missingAssetPolicy"] = "persistence_fallback"
+    if args.dry_run:
+        cfg["baseline"]["dryRun"] = True
 
     # Logger object
     if not args.log_file:
@@ -48,6 +62,15 @@ if __name__ == "__main__":
     fsp_identifier = args.fsp
 
     logger.info("Starting program")
+    logger.info(
+        "Baseline config: source=%s strategy=%s missing_asset_policy=%s dry_run=%s",
+        cfg["baseline"].get("source"),
+        cfg["baseline"].get("strategy"),
+        cfg["baseline"].get(
+            "missingAssetPolicy", cfg["baseline"].get("missing_asset_policy")
+        ),
+        cfg["baseline"].get("dryRun", cfg["baseline"].get("dry_run", False)),
+    )
 
     # Main features
     fsp = FSP(cfg["fm"]["actors"]["fsps"][fsp_identifier], cfg, logger)

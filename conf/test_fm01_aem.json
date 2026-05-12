@@ -7,6 +7,7 @@
   },  
   "baseline": {
     "source": "db",
+    "strategy": "aem_forecast_actual",
     "shiftMinutes": 30,
     "fileSettings": {
       "profileFile": "../data/baselines/example01.csv"
@@ -14,6 +15,9 @@
     "dbSettings": {
       "upcomingHoursToQuery": 24,
       "daysToGoBack": 7
+    },
+    "aemForecastActualSettings": {
+      "measurement": "hyp_baseline_forecast_actual"
     }
   },
   "fm": {
