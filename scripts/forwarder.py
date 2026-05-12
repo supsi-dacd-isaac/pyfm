@@ -65,6 +65,10 @@ except ImportError:
     InsecureRequestWarning = None
 
 
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10.0
+DEFAULT_REQUEST_RETRIES = 3
+
+
 def get_env(name: str, default: str = None) -> str:
     """Get environment variable with optional default."""
     return os.environ.get(name, default)
@@ -217,6 +221,28 @@ def _coerce_float(value: Any, field_name: str) -> float:
         return float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} value {value!r} is not a valid float") from exc
+
+
+def _coerce_request_timeout_seconds(value: Any, default: float = DEFAULT_REQUEST_TIMEOUT_SECONDS) -> float:
+    """Convert a timeout to a positive float, or fall back to the default."""
+    if isinstance(value, bool):
+        return default
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        return default
+    return timeout if timeout > 0 else default
+
+
+def _coerce_request_retries(value: Any, default: int = DEFAULT_REQUEST_RETRIES) -> int:
+    """Convert retries to a non-negative integer, or fall back to the default."""
+    if isinstance(value, bool):
+        return default
+    try:
+        retries = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    return retries if retries >= 0 else default
 
 
 def _build_ev_power_timeseries_body(context: dict) -> dict:
@@ -398,6 +424,8 @@ class TargetConfig:
         auth_user: str = None,
         auth_password: str = None,
         timeout: Optional[float] = None,
+        request_timeout_seconds: Optional[float] = None,
+        request_retries: Optional[int] = None,
         verify_ssl: bool = False,
         asset_types: List[str] = None,
         asset_ids: List[str] = None,
@@ -407,6 +435,8 @@ class TargetConfig:
         asset_request_profiles: Optional[dict] = None,
         body_template: Optional[dict] = None,
         reference_api: Optional[str] = None,
+        default_request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_request_retries: int = DEFAULT_REQUEST_RETRIES,
         timeout_is_configured: bool = False
     ):
         """
@@ -416,7 +446,9 @@ class TargetConfig:
         :param url: Base URL for the target API
         :param auth_user: Username for Basic Auth (optional)
         :param auth_password: Password for Basic Auth (optional)
-        :param timeout: Request timeout in seconds
+        :param timeout: Legacy request timeout in seconds
+        :param request_timeout_seconds: Request timeout in seconds
+        :param request_retries: Number of retries after the initial attempt
         :param verify_ssl: Whether to verify SSL certificates
         :param asset_types: List of asset types this target handles (None = all)
         :param asset_ids: List of asset IDs this target handles (None = all)
@@ -426,13 +458,34 @@ class TargetConfig:
         :param asset_request_profiles: Optional asset-specific request profiles
         :param body_template: Optional body template for this target
         :param reference_api: Optional API key to load from conns.json
+        :param default_request_timeout_seconds: Default request timeout in seconds
+        :param default_request_retries: Default number of retries
         :param timeout_is_configured: Whether timeout was explicitly set in config
         """
         self.name = name
         self.url = (url or "").rstrip('/')
         self.auth_user = auth_user
         self.auth_password = auth_password
-        self.timeout = 5.0 if timeout is None else timeout
+        self._default_request_timeout_seconds = _coerce_request_timeout_seconds(
+            default_request_timeout_seconds,
+            DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        )
+        self._default_request_retries = _coerce_request_retries(
+            default_request_retries,
+            DEFAULT_REQUEST_RETRIES,
+        )
+        configured_timeout = request_timeout_seconds
+        if configured_timeout is None:
+            configured_timeout = timeout
+        self.request_timeout_seconds = _coerce_request_timeout_seconds(
+            configured_timeout,
+            self._default_request_timeout_seconds,
+        )
+        self.timeout = self.request_timeout_seconds
+        self.request_retries = _coerce_request_retries(
+            request_retries,
+            self._default_request_retries,
+        )
         self.verify_ssl = verify_ssl
         self.asset_types = asset_types
         self.asset_ids = asset_ids
@@ -474,15 +527,25 @@ class TargetConfig:
         return None
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'TargetConfig':
+    def from_dict(
+        cls,
+        data: dict,
+        default_request_timeout_seconds: float = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        default_request_retries: int = DEFAULT_REQUEST_RETRIES,
+    ) -> 'TargetConfig':
         """Create TargetConfig from dictionary."""
-        timeout_is_configured = "timeout" in data
+        timeout_is_configured = (
+            data.get("timeout") is not None or
+            data.get("request_timeout_seconds") is not None
+        )
         return cls(
             name=data.get("name", "unknown"),
             url=data.get("url", ""),
             auth_user=data.get("user"),
             auth_password=data.get("password"),
             timeout=data.get("timeout"),
+            request_timeout_seconds=data.get("request_timeout_seconds"),
+            request_retries=data.get("request_retries"),
             verify_ssl=data.get("verify_ssl", False),
             asset_types=data.get("asset_types"),
             asset_ids=data.get("asset_ids"),
@@ -492,6 +555,8 @@ class TargetConfig:
             asset_request_profiles=data.get("asset_request_profiles"),
             body_template=data.get("body_template"),
             reference_api=data.get("reference_api"),
+            default_request_timeout_seconds=default_request_timeout_seconds,
+            default_request_retries=default_request_retries,
             timeout_is_configured=timeout_is_configured
         )
 
@@ -508,7 +573,11 @@ class TargetConfig:
         if not self.auth_password and api_config.get("password"):
             self.auth_password = api_config.get("password")
         if not self._timeout_is_configured and api_config.get("requestTimeout") is not None:
-            self.timeout = api_config.get("requestTimeout")
+            self.request_timeout_seconds = _coerce_request_timeout_seconds(
+                api_config.get("requestTimeout"),
+                self._default_request_timeout_seconds,
+            )
+            self.timeout = self.request_timeout_seconds
 
     def _resolve_configured_endpoint(self, endpoint_value: Any, context: dict, asset_id: Optional[str], label: str) -> str:
         """Resolve an absolute or relative endpoint value against the base URL."""
@@ -716,7 +785,9 @@ class TargetHandler:
             url=url,
             auth_user=get_env(f"{prefix}_USER"),
             auth_password=get_env(f"{prefix}_PASSWORD"),
-            timeout=float(get_env(f"{prefix}_TIMEOUT", "5.0")),
+            timeout=get_env(f"{prefix}_TIMEOUT"),
+            request_timeout_seconds=get_env(f"{prefix}_REQUEST_TIMEOUT_SECONDS"),
+            request_retries=get_env(f"{prefix}_REQUEST_RETRIES"),
             verify_ssl=get_env(f"{prefix}_VERIFY_SSL", "false").lower() == "true",
             asset_types=asset_types_str.split(",") if asset_types_str else None,
             asset_ids=asset_ids_str.split(",") if asset_ids_str else None,
@@ -872,63 +943,97 @@ class TargetHandler:
             self.stats["by_target"][target.name]["failed"] += 1
             return False
 
-        try:
-            self.logger.info("Forwarding to target '%s': POST %s", target.name, endpoint)
-            self.logger.info(
-                "Forwarding payload to target '%s': %s",
-                target.name,
-                _format_request_body_for_log(request_body)
-            )
-            request_kwargs = {
-                "json": request_body,
-                "auth": target.get_auth(),
-                "timeout": target.timeout,
-                "verify": target.verify_ssl,
-            }
+        self.logger.info("Forwarding to target '%s': POST %s", target.name, endpoint)
+        self.logger.info(
+            "Forwarding payload to target '%s': %s",
+            target.name,
+            _format_request_body_for_log(request_body)
+        )
+        request_kwargs = {
+            "json": request_body,
+            "auth": target.get_auth(),
+            "timeout": target.request_timeout_seconds,
+            "verify": target.verify_ssl,
+        }
 
+        def _post_request():
             if target.verify_ssl or InsecureRequestWarning is None:
-                response = requests.post(endpoint, **request_kwargs)
-            else:
-                # The target is explicitly configured to skip certificate validation.
-                # Suppress urllib3's noisy warning and rely on config-driven behavior.
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", InsecureRequestWarning)
-                    response = requests.post(endpoint, **request_kwargs)
+                return requests.post(endpoint, **request_kwargs)
 
-            response_text = " ".join((response.text or "").split())
+            # The target is explicitly configured to skip certificate validation.
+            # Suppress urllib3's noisy warning and rely on config-driven behavior.
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", InsecureRequestWarning)
+                return requests.post(endpoint, **request_kwargs)
 
-            if response.status_code in [200, 201, 202, 204]:
-                self.logger.info(
-                    "Target '%s' responded: %d - %s",
-                    target.name, response.status_code, response_text[:200]
+        total_attempts = target.request_retries + 1
+        last_failure_summary = "unknown error"
+
+        for attempt in range(1, total_attempts + 1):
+            try:
+                response = _post_request()
+                response_text = " ".join((response.text or "").split())
+
+                if response.status_code in [200, 201, 202, 204]:
+                    if attempt > 1:
+                        self.logger.info(
+                            "Target '%s' request succeeded on attempt %d/%d",
+                            target.name, attempt, total_attempts
+                        )
+                    self.logger.info(
+                        "Target '%s' responded: %d - %s",
+                        target.name, response.status_code, response_text[:200]
+                    )
+                    self.stats["requests_success"] += 1
+                    self.stats["by_target"][target.name]["success"] += 1
+                    return True
+
+                last_failure_summary = f"{response.status_code} - {response_text[:200]}"
+                if attempt < total_attempts:
+                    self.logger.warning(
+                        "Target '%s' attempt %d/%d returned error: %s; retrying",
+                        target.name, attempt, total_attempts, last_failure_summary
+                    )
+                    continue
+            except requests.exceptions.Timeout:
+                last_failure_summary = (
+                    f"request timed out after {target.request_timeout_seconds:.1f}s"
                 )
-                self.stats["requests_success"] += 1
-                self.stats["by_target"][target.name]["success"] += 1
-                return True
-            else:
-                self.logger.warning(
-                    "Target '%s' returned error: %d - %s",
-                    target.name, response.status_code, response_text[:200]
-                )
-                self.stats["requests_failed"] += 1
-                self.stats["by_target"][target.name]["failed"] += 1
-                return False
+                if attempt < total_attempts:
+                    self.logger.warning(
+                        "Target '%s' attempt %d/%d %s; retrying",
+                        target.name, attempt, total_attempts, last_failure_summary
+                    )
+                    continue
+            except requests.exceptions.RequestException as e:
+                last_failure_summary = str(e)
+                if attempt < total_attempts:
+                    self.logger.warning(
+                        "Target '%s' attempt %d/%d request failed: %s; retrying",
+                        target.name, attempt, total_attempts, last_failure_summary
+                    )
+                    continue
+            except Exception as e:
+                last_failure_summary = str(e)
+                if attempt < total_attempts:
+                    self.logger.warning(
+                        "Target '%s' attempt %d/%d request failed: %s; retrying",
+                        target.name, attempt, total_attempts, last_failure_summary
+                    )
+                    continue
 
-        except requests.exceptions.Timeout:
-            self.logger.error("Target '%s' request timed out after %.1fs", target.name, target.timeout)
-            self.stats["requests_failed"] += 1
-            self.stats["by_target"][target.name]["failed"] += 1
-            return False
-        except requests.exceptions.ConnectionError as e:
-            self.logger.error("Target '%s' connection error: %s", target.name, str(e))
-            self.stats["requests_failed"] += 1
-            self.stats["by_target"][target.name]["failed"] += 1
-            return False
-        except Exception as e:
-            self.logger.error("Target '%s' request failed: %s", target.name, str(e))
-            self.stats["requests_failed"] += 1
-            self.stats["by_target"][target.name]["failed"] += 1
-            return False
+            break
+
+        self.logger.error(
+            "Target '%s' request failed after %d attempts (%d retries): %s",
+            target.name,
+            total_attempts,
+            target.request_retries,
+            last_failure_summary,
+        )
+        self.stats["requests_failed"] += 1
+        self.stats["by_target"][target.name]["failed"] += 1
+        return False
 
     def get_statistics(self) -> dict:
         """Get forwarding statistics."""
@@ -1630,8 +1735,25 @@ Examples:
             with open(config_path, 'r') as f:
                 targets_config = json.load(f)
 
+            default_request_timeout_seconds = _coerce_request_timeout_seconds(
+                targets_config.get("request_timeout_seconds")
+                if targets_config.get("request_timeout_seconds") is not None
+                else targets_config.get("default_timeout"),
+                DEFAULT_REQUEST_TIMEOUT_SECONDS,
+            )
+            default_request_retries = _coerce_request_retries(
+                targets_config.get("request_retries")
+                if targets_config.get("request_retries") is not None
+                else targets_config.get("max_retries"),
+                DEFAULT_REQUEST_RETRIES,
+            )
+
             for target_data in targets_config.get("targets", []):
-                target_config = TargetConfig.from_dict(target_data)
+                target_config = TargetConfig.from_dict(
+                    target_data,
+                    default_request_timeout_seconds=default_request_timeout_seconds,
+                    default_request_retries=default_request_retries,
+                )
                 reference_api = target_config.reference_api
                 if reference_api:
                     api_config = conns_config.get(reference_api)

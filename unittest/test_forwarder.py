@@ -13,12 +13,15 @@ import logging
 import sys
 import os
 import unittest
+import requests
 from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
 
 from forwarder import (
+    DEFAULT_REQUEST_RETRIES,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS,
     TargetConfig,
     TargetHandler,
     CommandHandler,
@@ -243,6 +246,41 @@ class TestTargetConfig(unittest.TestCase):
     def test_disabled(self):
         t = self._make_target(enabled=False)
         assert t.matches("heat_pump", "ECM97.1") is False
+
+    def test_default_request_timeout_and_retries(self):
+        t = self._make_target()
+        assert t.request_timeout_seconds == DEFAULT_REQUEST_TIMEOUT_SECONDS
+        assert t.timeout == DEFAULT_REQUEST_TIMEOUT_SECONDS
+        assert t.request_retries == DEFAULT_REQUEST_RETRIES
+
+    def test_request_timeout_seconds_overrides_legacy_timeout(self):
+        t = self._make_target(timeout=5.0, request_timeout_seconds=12.5, request_retries=4)
+        assert t.request_timeout_seconds == 12.5
+        assert t.timeout == 12.5
+        assert t.request_retries == 4
+
+    def test_invalid_request_settings_fall_back_to_passed_defaults(self):
+        t = TargetConfig.from_dict(
+            {
+                "name": "test-target",
+                "url": "https://aem.local:6000",
+                "request_timeout_seconds": "not-a-number",
+                "request_retries": "bad",
+            },
+            default_request_timeout_seconds=14.0,
+            default_request_retries=2,
+        )
+        assert t.request_timeout_seconds == 14.0
+        assert t.request_retries == 2
+
+    def test_api_request_timeout_applies_when_target_timeout_missing(self):
+        t = self._make_target(url="", timeout=None, request_timeout_seconds=None)
+        t.apply_api_config({
+            "controlUrl": "https://aem.local",
+            "requestTimeout": "7.5",
+        })
+        assert t.request_timeout_seconds == 7.5
+        assert t.timeout == 7.5
 
     def test_build_request_default_body(self):
         t = self._make_target()
@@ -607,11 +645,12 @@ class TestTargetConfig(unittest.TestCase):
 
 class TestTargetHandlerDryRun(unittest.TestCase):
 
-    def _make_handler(self, dry_run=True):
+    def _make_handler(self, dry_run=True, **target_kwargs):
         handler = TargetHandler(logger, dry_run=dry_run)
         target = TargetConfig(
             name="test",
             url="https://aem.local:6000",
+            **target_kwargs,
         )
         handler.add_target(target)
         return handler
@@ -718,6 +757,59 @@ class TestTargetHandlerDryRun(unittest.TestCase):
             result = handler.forward_command(msg)
             assert result is True
             mock_requests.post.assert_not_called()
+
+    def test_configured_timeout_is_passed_to_post(self):
+        handler = self._make_handler(dry_run=False, request_timeout_seconds=12.5)
+        msg = self._make_message(dry_run_flag=False)
+
+        with patch("forwarder.requests.post") as mock_post:
+            mock_response = MagicMock()
+            mock_response.status_code = 200
+            mock_response.text = '{"status": "ok"}'
+            mock_post.return_value = mock_response
+
+            result = handler.forward_command(msg)
+
+        assert result is True
+        assert mock_post.call_args.kwargs["timeout"] == 12.5
+
+    def test_failed_response_is_retried_up_to_configured_number(self):
+        handler = self._make_handler(dry_run=False, request_retries=2)
+        msg = self._make_message(dry_run_flag=False)
+
+        with patch("forwarder.requests.post") as mock_post:
+            mock_response = MagicMock()
+            mock_response.status_code = 500
+            mock_response.text = '{"status": "error"}'
+            mock_post.return_value = mock_response
+
+            with self.assertLogs("test_forwarder", level="WARNING") as logs:
+                result = handler.forward_command(msg)
+
+        assert result is False
+        assert mock_post.call_count == 3
+        output = "\n".join(logs.output)
+        assert "attempt 1/3 returned error" in output
+        assert "attempt 2/3 returned error" in output
+        assert "request failed after 3 attempts (2 retries)" in output
+
+    def test_timeout_exception_is_retried_and_logs_final_failure(self):
+        handler = self._make_handler(
+            dry_run=False,
+            request_timeout_seconds=2.0,
+            request_retries=1,
+        )
+        msg = self._make_message(dry_run_flag=False)
+
+        with patch("forwarder.requests.post", side_effect=requests.exceptions.Timeout) as mock_post:
+            with self.assertLogs("test_forwarder", level="WARNING") as logs:
+                result = handler.forward_command(msg)
+
+        assert result is False
+        assert mock_post.call_count == 2
+        output = "\n".join(logs.output)
+        assert "attempt 1/2 request timed out after 2.0s; retrying" in output
+        assert "request failed after 2 attempts (1 retries): request timed out after 2.0s" in output
 
 
 # =============================================================================
