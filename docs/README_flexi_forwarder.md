@@ -233,7 +233,7 @@ You can also add RabbitMQ configuration to your `conf/private/conns.json`:
 }
 ```
 
-The forwarder target configuration can also reference API entries in `conns.json`. For example, `conf/forwarder_targets_aem.json` uses `reference_api: "aemAPI"` and resolves the target base URL, credentials, and timeout from that connection entry.
+The forwarder target configuration can also reference API entries in `conns.json`. For example, `conf/forwarder_targets_aem.json` uses `reference_api: "aemAPI"` and resolves the target base URL, credentials, and request-timeout fallback from that connection entry.
 
 ### Target Configuration
 
@@ -243,7 +243,10 @@ Targets are loaded from `--config` / `FORWARDER_CONFIG` and describe where match
 |-------|-------------|
 | `name` | Logical target name used in logs |
 | `url` | Base target URL, unless resolved from `reference_api` |
-| `reference_api` | Key in `conns.json` containing `controlUrl`, credentials, and timeout |
+| `reference_api` | Key in `conns.json` containing `controlUrl`, credentials, and optional timeout fallback |
+| `request_timeout_seconds` | Per-target HTTP POST timeout in seconds; defaults to `10` |
+| `request_retries` | Per-target retry count after the initial attempt; defaults to `3` |
+| `timeout` | Legacy timeout field; still supported for backward compatibility |
 | `asset_types` / `asset_ids` | Optional filters for which assets this target handles |
 | `endpoint_template` | Template for building an endpoint from message payload/API fields |
 | `endpoint_overrides` | Asset-specific endpoint overrides |
@@ -251,6 +254,23 @@ Targets are loaded from `--config` / `FORWARDER_CONFIG` and describe where match
 | `body_template` | Template for default request bodies |
 
 Supported request body modes are `hp_control` (default/body template behavior) and `ev_power_timeseries` for EV charger time-series power requests.
+
+At the top level of the targets config file, you can also define default request settings:
+
+| Field | Description |
+|-------|-------------|
+| `request_timeout_seconds` | Default timeout applied when a target does not set its own value; default `10` |
+| `request_retries` | Default retry count applied when a target does not set its own value; default `3` |
+
+Legacy top-level `default_timeout` and `max_retries` are still accepted as compatibility fallbacks for existing configuration files.
+
+For every live outbound POST, the forwarder uses the resolved timeout and retries on:
+
+- network/client exceptions
+- request timeouts
+- non-success HTTP response status codes
+
+Each failed non-final attempt is logged, and the final exhausted failure is logged as an error.
 
 ---
 
@@ -645,7 +665,7 @@ The current implementation can forward live HTTP requests to configured targets.
 
 2. **Enhanced Reliability**
    - Dead letter queues for failed messages
-   - Retry logic with exponential backoff
+   - Retry backoff/jitter beyond the current fixed retry loop
    - Circuit breaker pattern for device communication
 
 3. **Monitoring & Alerting**
