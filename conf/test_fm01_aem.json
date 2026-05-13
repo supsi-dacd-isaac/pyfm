@@ -7,13 +7,17 @@
   },  
   "baseline": {
     "source": "db",
-    "shiftMinutes": 30,
+    "shiftMinutes": 90,
     "fileSettings": {
       "profileFile": "../data/baselines/example01.csv"
     },
     "dbSettings": {
+      "strategy": "slot_persistence",
       "upcomingHoursToQuery": 24,
-      "daysToGoBack": 7
+      "daysToGoBack": 7,
+      "uploadOnlyComputableHorizon": true,
+      "maxSlotsToUpload": 1,
+      "missingMeasurementPolicy": "zero_fill_asset"
     }
   },
   "fm": {
@@ -151,7 +155,11 @@
       "type": "ev_charger",
       "description": "EV Charger 1",
       "capacity_kw": 11.0,
-      "flexibility_factor": 0.70,
+      "nominal_power_w": 11000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 0.5,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "continuous",
       "min_power_kw": 0.0
     },
@@ -162,7 +170,11 @@
       "type": "ev_charger",
       "description": "EV Charger 2",  
       "capacity_kw": 11.0,
-      "flexibility_factor": 0.70,
+      "nominal_power_w": 11000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 0.5,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "continuous",
       "min_power_kw": 0.0
     },
@@ -173,7 +185,11 @@
       "type": "heat_pump",
       "description": "HP Small",
       "capacity_kw": 4.0,
+      "nominal_power_w": 7500,
       "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 4.0]
     },
@@ -184,7 +200,9 @@
       "type": "heat_pump",
       "description": "HP Cinema 1",
       "capacity_kw": 15.0,
+      "nominal_power_w": 15000,
       "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 15.0]
     },
@@ -195,7 +213,9 @@
       "type": "heat_pump",
       "description": "HP Cinema 2",
       "capacity_kw": 15.0,
+      "nominal_power_w": 15000,
       "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 15.0]
     },
@@ -206,7 +226,11 @@
       "type": "heat_pump",
       "description": "HP Cinema",
       "capacity_kw": 30.0,
+      "nominal_power_w": 30000,
       "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 30.0]
     }
@@ -222,12 +246,20 @@
     }
   },
   "flexibility": {
+    "method": "persistence",
     "peak_hours": {
       "morning": {"start": 7, "end": 10},
       "evening": {"start": 16, "end": 20}
     },
     "historical_days_back": 30,
     "default_flexibility_factor": 0.50,
+    "persistenceSettings": {
+      "persistenceGoBackMinutes": 90,
+      "activeThresholdW": 500,
+      "defaultSafetyFactor": 1.0,
+      "missingMeasurementPolicy": "skip_asset",
+      "maxCurrentMeasurementAgeMinutes": 30
+    },
     "ev_charger": {
       "occupancy_threshold_w": 100
     },
@@ -457,6 +489,34 @@
           "activation_cost": 3.0
         }
       ]
-	}
+	},
+    "strategy_8": {
+      "name": "Persistence HP Strategy",
+      "description": "Persistence-based HP bidding for ECM96.2 and ECM97.3",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM96.2", "ECM97.3"],
+      "flexibility_method": "persistence",
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_9": {
+      "name": "Persistence HP + EV Strategy",
+      "description": "Persistence-based bidding for ECM63.1, ECM63.2, ECM96.2, and ECM97.3",
+      "asset_types": ["heat_pump", "ev_charger"],
+      "assets_filter": ["ECM63.1", "ECM63.2", "ECM96.2", "ECM97.3"],
+      "flexibility_method": "persistence",
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    }
   }
 }

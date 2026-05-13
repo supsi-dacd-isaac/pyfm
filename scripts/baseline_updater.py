@@ -19,6 +19,11 @@ if __name__ == "__main__":
     arg_parser.add_argument(
         "--log_file", help="log file (optional, if empty log redirected on stdout)"
     )
+    arg_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Build and log baseline data without uploading to NODES or saving to InfluxDB",
+    )
     args = arg_parser.parse_args()
 
     # Load the main parameters
@@ -47,7 +52,10 @@ if __name__ == "__main__":
     # FSP identifier
     fsp_identifier = args.fsp
 
-    logger.info("Starting program")
+    if args.dry_run:
+        logger.info("Starting program (DRY-RUN MODE - no baseline upload or InfluxDB save)")
+    else:
+        logger.info("Starting program")
 
     # Main features
     fsp = FSP(cfg["fm"]["actors"]["fsps"][fsp_identifier], cfg, logger)
@@ -60,8 +68,11 @@ if __name__ == "__main__":
     fsp.print_player_info()
 
     # Update baselines
-    if fsp.update_baselines(cfg["baseline"]) is False:
+    if fsp.update_baselines(cfg["baseline"], dry_run=args.dry_run) is False:
         logger.error("Baseline update failed")
         sys.exit(2)
 
-    logger.info("Ending program")
+    if args.dry_run:
+        logger.info("Ending program (DRY-RUN)")
+    else:
+        logger.info("Ending program")

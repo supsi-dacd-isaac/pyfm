@@ -2,6 +2,11 @@
 
 This document explains how the system analyzes and calculates available flexibility from the asset portfolio.
 
+The repository now supports two forecasting modes:
+
+- `flexibility.method = "historical"`: the existing historical/time-pattern logic described in most of this document.
+- `flexibility.method = "persistence"`: the operational mode used for current bidding, based on recent measured power from `assets_data`.
+
 ## Overview
 
 Before placing bids on the flexibility market, the system performs a **Flexibility Analysis** to determine:
@@ -10,6 +15,81 @@ Before placing bids on the flexibility market, the system performs a **Flexibili
 3. For EV chargers: the probability that a car is actually connected
 
 This analysis uses **30 days of historical data** from InfluxDB to build consumption patterns.
+
+---
+
+## Operational Persistence Mode
+
+For the operational path, flexibility is computed directly from recent measured values rather than from long historical averages.
+
+### Target slot and source slot
+
+```text
+target_slot_utc = floor(current_time_utc, fm.granularity) + fm.ordersTimeShift
+flexibility_go_back_i =
+    asset_mapping.<asset>.flexibility_persistence_go_back_minutes
+    if present
+    else flexibility.persistenceSettings.persistenceGoBackMinutes
+
+baseline_source_time_i = target_slot_utc - flexibility_go_back_i
+```
+
+Example with the current config:
+
+```text
+current_time_utc         = 2026-05-12 08:20
+target_slot_utc          = 2026-05-12 09:45
+ECM96.2 source time    = 2026-05-12 08:15  (90 min)
+ECM97.3 source time    = 2026-05-12 08:15  (90 min)
+ECM63.1 source time    = 2026-05-12 07:45  (120 min)
+ECM63.2 source time    = 2026-05-12 07:45  (120 min)
+```
+
+### Baseline formula
+
+```text
+baseline_i(t) = measured_power_i(t - persistence_go_back_i)
+portfolio_baseline(t) = sum_i baseline_i(t)
+```
+
+For baseline upload, `persistence_go_back_i` comes from `asset_mapping.<asset>.baseline_persistence_go_back_minutes` when present, otherwise from `baseline.dbSettings.persistenceGoBackMinutes`. For flexibility, it comes from `asset_mapping.<asset>.flexibility_persistence_go_back_minutes` when present, otherwise from `flexibility.persistenceSettings.persistenceGoBackMinutes`.
+
+Per-asset overrides allow assets with slower telemetry, such as EV chargers `ECM63.1` and `ECM63.2`, to use a longer lag while staying in the same NODES portfolio as HP assets `ECM96.2` and `ECM97.3`. The portfolio baseline remains the sum of asset-level measured persistence values.
+
+This baseline logic is separate from flexibility. The current-state gate is never applied to the baseline.
+
+### Flexibility formula
+
+For each asset:
+
+```text
+current_measured_power_i = latest grouped measurement at or before current_time_utc
+
+if current_measured_power_i <= activeThresholdW:
+    flexibility_i(t) = 0
+else:
+    flexibility_i(t) = safety_factor_i * min(baseline_i(t), nominal_power_i)
+```
+
+Then:
+
+```text
+portfolio_flexibility(t) = sum_i flexibility_i(t)
+```
+
+Operational rules:
+
+- internal asset-level values stay in W,
+- `nominal_power_w` must be configured per asset for persistence mode,
+- `persistence_safety_factor` falls back to `defaultSafetyFactor`,
+- missing baseline source measurements do not get invented,
+- missing or stale current gate measurements do not imply that an asset is active.
+- per-asset go-back values must align with `fm.granularity`; invalid values fail instead of being rounded.
+
+The default policies are conservative:
+
+- baseline slot persistence: `missingMeasurementPolicy = "fail_portfolio"`
+- flexibility persistence: `missingMeasurementPolicy = "skip_asset"`
 
 ---
 
@@ -364,17 +444,25 @@ From `test_fm01_aem.json`:
 
 ```json
 "flexibility": {
+  "method": "persistence",
   "peak_hours": {
     "morning": {"start": 7, "end": 10},
     "evening": {"start": 16, "end": 20}
   },
   "historical_days_back": 30,
   "default_flexibility_factor": 0.50,
+  "persistenceSettings": {
+    "persistenceGoBackMinutes": 90,
+    "activeThresholdW": 500,
+    "defaultSafetyFactor": 1.0,
+    "missingMeasurementPolicy": "skip_asset",
+    "maxCurrentMeasurementAgeMinutes": 30
+  },
   "ev_charger": {
     "occupancy_threshold_w": 100
   },
   "temperature": {
-    "enabled": true,
+    "enabled": false,
     "source": {
       "site": "ECM",
       "device": "weather_station",
@@ -391,8 +479,14 @@ From `test_fm01_aem.json`:
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
+| `method` | `persistence` or `historical` | Select operational persistence or legacy historical analysis |
 | `historical_days_back` | 30 | Days of history to analyze |
 | `default_flexibility_factor` | 0.50 | Default if not specified per asset |
+| `persistenceGoBackMinutes` | 90 | Lag between target slot and persistence source slot |
+| `activeThresholdW` | 500 | Gate threshold for deciding whether an asset is currently active |
+| `defaultSafetyFactor` | 1.0 | Default persistence safety factor |
+| `missingMeasurementPolicy` | `skip_asset` | Flexibility persistence behavior when required data is missing |
+| `maxCurrentMeasurementAgeMinutes` | 30 | Maximum allowed age of the gate measurement |
 | `occupancy_threshold_w` | 100 | Power > 100W means car is connected |
 
 ### Temperature Configuration
@@ -437,7 +531,9 @@ From `asset_mapping`:
   "type": "heat_pump",
   "description": "HP Cinema 2",
   "capacity_kw": 15.0,
-  "flexibility_factor": 0.85
+  "nominal_power_w": 15000,
+  "flexibility_factor": 0.85,
+  "persistence_safety_factor": 1.0
 }
 ```
 
@@ -505,6 +601,9 @@ The flexibility analysis is implemented in:
 | `_load_historical_patterns()` | Load 30-day consumption patterns from InfluxDB |
 | `_load_ev_occupancy_patterns()` | Calculate EV occupancy probabilities |
 | `get_asset_flexibility_breakdown()` | Per-asset flexibility calculation |
+| `_get_asset_flexibility_breakdown_persistence()` | Per-asset persistence baseline + current-state gate calculation |
+| `_get_latest_grouped_measurement()` | Latest grouped asset measurement at or before current UTC time |
+| `get_achievable_flexibility()` | Discretization-aware achievable quantity using either historical or persistence inputs |
 | `_is_peak_hour()` | Peak hour detection |
 
 ### Temperature-Aware Methods
@@ -535,4 +634,3 @@ The flexibility analysis is implemented in:
 
 - [BIDDING_STRATEGIES.md](BIDDING_STRATEGIES.md) - How strategies use flexibility data
 - [README_strategy_evaluator.md](../scripts/README_strategy_evaluator.md) - Strategy evaluation tool
-

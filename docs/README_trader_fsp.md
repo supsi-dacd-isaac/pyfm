@@ -9,12 +9,87 @@ This script represents the **FSP trading agent** in the Opentunity-CH flexibilit
 3. Computes the target market timeslot (`slot_time`) from `fm.granularity` and `fm.ordersTimeShift`.
 4. Uses the DSO instance to query the market for current flexibility requests (`dso.get_flexibility_requests`).
 5. Downloads or refreshes baselines for the FSP (`fsp.download_baselines`).
-6. **Calculates available flexibility** using the `FlexibilityForecaster` with **discretization-aware** logic.
+6. **Calculates available flexibility** using the `FlexibilityForecaster` with the selected strategy's flexibility method. Strategies without `flexibility_method: "persistence"` use the historical/legacy path.
 7. Applies the selected **bidding strategy** to determine price and quantity.
 8. For each DSO request and each FSP portfolio, constructs and posts Sell orders.
 9. Records bid information in the database for auditing.
 
 There is also a helper function `create_dataframe_for_portfolio_baseline` that shows how to build a baseline DataFrame from a CSV file, although it is not used in the main flow.
+
+---
+
+## Operational Persistence Mode
+
+The trader now supports a portfolio-scoped persistence mode for operational bidding. In strategy mode this is selected per strategy, not globally for all strategies.
+
+```text
+target_slot_utc = floor(current_time_utc, fm.granularity) + fm.ordersTimeShift
+flexibility_go_back_i =
+    asset_mapping.<asset>.flexibility_persistence_go_back_minutes
+    if present
+    else flexibility.persistenceSettings.persistenceGoBackMinutes
+
+baseline_source_time_i = target_slot_utc - flexibility_go_back_i
+baseline_i(t) = measured_power_i(baseline_source_time_i)
+
+if current_measured_power_i <= activeThresholdW:
+    flexibility_i(t) = 0
+else:
+    flexibility_i(t) = safety_factor_i * min(baseline_i(t), nominal_power_i)
+```
+
+Important distinctions:
+
+- Baseline and flexibility remain separate.
+- The current-state gate is applied to flexibility only, never to the baseline.
+- Current measured power is the latest grouped measurement at or before `current_time_utc`, not the lagged source slot unless they happen to coincide.
+- Aggregation is asset first, then portfolio total. The trader does not compute one global persistence flexibility number and reuse it for every portfolio.
+
+Example with the current config:
+
+```text
+current_time_utc         = 2026-05-12 08:20
+target_slot_utc          = 2026-05-12 09:45
+ECM96.2 source time    = 2026-05-12 07:45  (120 min override)
+ECM97.3 source time    = 2026-05-12 07:45  (120 min override)
+ECM63.1 source time    = 2026-05-12 07:45  (120 min)
+ECM63.2 source time    = 2026-05-12 07:45  (120 min)
+```
+
+Persistence settings are read from the global `flexibility.persistenceSettings` block:
+
+```json
+"flexibility": {
+  "method": "persistence",
+  "persistenceSettings": {
+    "persistenceGoBackMinutes": 90,
+    "activeThresholdW": 500,
+    "defaultSafetyFactor": 1.0,
+    "missingMeasurementPolicy": "skip_asset",
+    "maxCurrentMeasurementAgeMinutes": 30
+  }
+}
+```
+
+The baseline uploader can independently use:
+
+```json
+"baseline": {
+  "source": "db",
+  "shiftMinutes": 90,
+  "dbSettings": {
+    "strategy": "slot_persistence",
+    "missingMeasurementPolicy": "zero_fill_asset"
+  }
+}
+```
+
+These two persistence concepts are independent:
+
+- `baseline.dbSettings.strategy = "slot_persistence"` affects baseline uploading.
+- `flexibility_method: "persistence"` inside a bidding strategy affects trader bidding flexibility.
+
+Existing strategies default to historical/legacy flexibility. In the current config, `strategy_8` and `strategy_9` explicitly request persistence; `strategy_4` remains historical/legacy.
 
 ---
 
@@ -33,8 +108,8 @@ The script implements **discretization-aware flexibility calculation** that corr
 
 1. **Enumerate discrete combinations**: For N discrete assets with ON/OFF control, calculate all 2^N achievable power levels.
    
-   Example with 3 HPs (4, 15, 15 kW):
-   - Achievable levels: {0, 4, 15, 19, 30, 34} kW
+   Example with two HP assets (4 and 30 kW):
+   - Achievable levels: {0, 4, 30, 34} kW
 
 2. **Calculate continuous range**: Sum of available flexibility from modulatable assets (EVs).
    
@@ -48,25 +123,24 @@ The script implements **discretization-aware flexibility calculation** that corr
 
 ### Example Allocation
 
-For a **20 kW target**:
+For a **15 kW target**:
 
 ```
 DISCRETIZATION-AWARE FLEXIBILITY ANALYSIS:
-  Target flexibility: 20.000 kW (0.020000 MW)
-  Discrete assets: ['ECM96.2', 'ECM97.1', 'ECM97.2']
+  Target flexibility: 15.000 kW (0.015000 MW)
+  Discrete assets: ['ECM96.2', 'ECM97.3']
   Continuous assets: ['ECM63.1', 'ECM63.2']
-  Achievable discrete levels (kW): [0.0, 4.0, 15.0, 19.0, 30.0, 34.0]
+  Achievable discrete levels (kW): [0.0, 4.0, 30.0, 34.0]
   Continuous range (kW): 0.00 - 15.40
   Total achievable range (kW): 0.00 - 49.40
 ----------------------------------------------------------------------
-RECOMMENDED BID: 20.000 kW (0.020000 MW) (exact match)
+RECOMMENDED BID (quantity used for bidding): 15.000 kW (0.015000 MW) (exact match)
   Discrete allocation (ON/OFF):
     - ECM96.2: 4.0 kW (ON)
-    - ECM97.1: 15.0 kW (ON)
-    - ECM97.2: 0.0 kW (OFF)
-  Continuous allocation (modulated): 1.00 kW total
-    - ECM63.1: 0.50 kW (setpoint: 4.5% of 11.0 kW capacity)
-    - ECM63.2: 0.50 kW (setpoint: 4.5% of 11.0 kW capacity)
+    - ECM97.3: 0.0 kW (OFF)
+  Continuous allocation (modulated): 11.00 kW total
+    - ECM63.1: 5.50 kW (setpoint: 50.0% of 11.0 kW capacity)
+    - ECM63.2: 5.50 kW (setpoint: 50.0% of 11.0 kW capacity)
 ```
 
 ### Benefits
@@ -125,7 +199,7 @@ These prices are then forwarded unchanged to the market ledger via `FMO.add_entr
 python scripts/trader_fsp.py \
   --config_file conf/test_fm01_aem.json \
   --fsp supsi01 \
-  --strategy strategy_4 \
+  --strategy strategy_8 \
   --dry-run \
   --log_file logs/trader_fsp.log
 ```
@@ -134,10 +208,24 @@ python scripts/trader_fsp.py \
 
 - `--config_file` (required): path to configuration JSON.
 - `--fsp` (required): FSP identifier (key under `fm.actors.fsps`, e.g. `supsi01`).
-- `--strategy` (optional): Bidding strategy to use (`strategy_1` through `strategy_5`). If not specified, uses FSP's configured strategy or falls back to simple mode.
+- `--strategy` (optional): Bidding strategy to use (`strategy_1` through `strategy_9`). If not specified, uses FSP's configured strategy or falls back to simple mode.
 - `--list-strategies`: List all available strategies and exit.
 - `--dry-run` (optional): Simulate bidding without placing actual orders. Useful for testing.
 - `--log_file` (optional): path to log file. If omitted, logs go to stdout.
+
+Run the HP-only persistence strategy from `scripts/`:
+
+```bash
+cd scripts
+python3.10 trader_fsp.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --strategy strategy_8 --dry-run
+```
+
+Run the HP + EV persistence strategy from `scripts/`:
+
+```bash
+cd scripts
+python3.10 trader_fsp.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --strategy strategy_9 --dry-run
+```
 
 ### Dry-Run Mode
 
@@ -151,10 +239,42 @@ python scripts/trader_fsp.py \
 ```
 
 This will:
-- Calculate available flexibility (discretization-aware)
+- Calculate available flexibility
 - Show recommended bid quantities and allocations
 - Log what orders **would** be placed
 - NOT actually submit orders to the market
+
+The current code may still create local bid/demand audit records when repository dependencies and database connectivity are available, because those records are created before order placement. `--dry-run` prevents market order submission.
+
+In persistence mode, dry-run still computes and logs:
+
+- `target_slot_utc`
+- `baseline_source_time_utc`
+- per-asset baseline power
+- per-asset current gate measurement time and power
+- active/inactive state
+- nominal cap and safety factor
+- portfolio-scoped flexibility totals
+
+### Strategy-Mode Log Interpretation
+
+Recent strategy-mode logs intentionally separate diagnostic portfolio totals from selected-strategy bidding quantities:
+
+```text
+PORTFOLIO AVAILABLE FLEXIBILITY (all assigned assets before strategy filter): ...
+STRATEGY AVAILABLE FLEXIBILITY (<strategy_id> allowed assets only): ...
+RECOMMENDED BID (quantity used for bidding): ...
+CAN MEET DSO DEMAND WITH STRATEGY <strategy_id> (<strategy_name>): ...
+```
+
+Interpretation:
+
+- **Portfolio available flexibility** is diagnostic only. It is the total across assigned portfolio assets before applying the selected strategy filter.
+- **Strategy available flexibility** is the relevant available flexibility after applying the selected strategy's allowed assets.
+- **Recommended bid** is the operational quantity used for bidding after strategy filtering and achievable-flexibility logic.
+- **DSO feasibility in strategy mode** uses strategy-filtered availability, not full portfolio availability.
+
+Before live bidding, validate the target slot, baseline source time, current-state gate, strategy asset filtering, recommended bid, DSO demand, and price check. For EV strategies, treat missing or delayed telemetry conservatively.
 
 ---
 
@@ -164,13 +284,19 @@ The script supports multiple bidding strategies that control which assets to use
 
 ### Available Strategies
 
-| Strategy | Name | Description |
-|----------|------|-------------|
-| `strategy_1` | HP Only | Heat pumps only, conservative full-day coverage |
-| `strategy_2` | Full Portfolio + Evening EV | All assets, focus on evening when EVs charge |
-| `strategy_3` | Morning Peak Focus | Aggressive bidding during morning peak (Cinema HPs) |
-| `strategy_4` | Hybrid (S3+S1) | Morning peak aggressive + full day HP coverage (**RECOMMENDED**) |
-| `strategy_5` | Hybrid2 (S3+S2) | Morning peak aggressive + evening EV focus |
+| Strategy | Name | Flexibility method | Description |
+|----------|------|--------------------|-------------|
+| `strategy_1` | HP Only | Historical/legacy | Heat pumps only, conservative full-day coverage |
+| `strategy_2` | Full Portfolio + Evening EV | Historical/legacy | All assets, focus on evening when EVs charge |
+| `strategy_3` | Morning Peak Focus | Historical/legacy | Aggressive morning peak focus, filtered to `ECM97.3` |
+| `strategy_4` | Hybrid (S3+S1) | Historical/legacy | Recommended HP hybrid using `ECM96.2` and `ECM97.3` |
+| `strategy_5` | Hybrid2 (S3+S2) | Historical/legacy | Morning aggressive + evening EV focus |
+| `strategy_6` | Smart Preheat | Historical/legacy | Preheat from 04:00-06:00, then morning peak HP flexibility |
+| `strategy_7` | Double Pre-heating | Historical/legacy | Dual preheat schedule for `ECM96.2` morning and evening peak flexibility |
+| `strategy_8` | Persistence HP Strategy | Persistence | HP-only persistence strategy for `ECM96.2` and `ECM97.3` |
+| `strategy_9` | Persistence HP + EV Strategy | Persistence | Persistence strategy for `ECM63.1`, `ECM63.2`, `ECM96.2`, and `ECM97.3` |
+
+`strategy_8` is the safer persistence option because it excludes EV chargers. `strategy_9` includes EV chargers and should be monitored carefully because EV telemetry has been observed to be more problematic than HP telemetry.
 
 ### Strategy Configuration
 
@@ -182,15 +308,27 @@ Strategies are defined in `bidding_strategies` section of the config:
     "name": "Hybrid (S3+S1)",
     "description": "Morning peak aggressive + full day HP coverage",
     "asset_types": ["heat_pump"],
+    "assets_filter": ["ECM96.2", "ECM97.3"],
     "time_slots": [
       {"name": "Morning Peak", "start": "06:30", "end": "09:00", 
-       "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+       "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
       {"name": "Evening Peak", "start": "16:00", "end": "19:00", 
-       "flexibility_mw": 0.020, "bid_price": 9.5, "activation_cost": 2.5},
+       "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
       {"name": "Off-peak", "start": "19:00", "end": "06:30", 
        "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
     ]
   }
+}
+```
+
+Persistence strategies opt in explicitly:
+
+```json
+"strategy_8": {
+  "name": "Persistence HP Strategy",
+  "asset_types": ["heat_pump"],
+  "assets_filter": ["ECM96.2", "ECM97.3"],
+  "flexibility_method": "persistence"
 }
 ```
 
@@ -256,7 +394,7 @@ Example for `supsi01`:
     "activationCost": 2.5
   },
   "strategy": "strategy_4",
-  "assets": ["ECM96.2", "ECM97.1", "ECM97.2", "ECM63.1", "ECM63.2"],
+  "assets": ["ECM96.2", "ECM97.3", "ECM63.1", "ECM63.2"],
   "forecast": {
     "source": "aem",
     "filename": "../data/forecast/example01.csv"
@@ -278,6 +416,15 @@ Key elements:
 - **`strategy`**: default bidding strategy to use (e.g., `"strategy_4"`).
 - **`assets`**: list of asset IDs that belong to this FSP's portfolio.
 - **`forecast`**: how the FSP obtains forecasts (e.g. from AEM CSV).
+
+For persistence-based operation, the baseline/flexibility mode is controlled outside the FSP block:
+
+- `baseline.source = "db"`
+- `baseline.shiftMinutes`
+- `baseline.dbSettings.strategy`
+- `baseline.dbSettings.missingMeasurementPolicy`
+- `flexibility.method`
+- `flexibility.persistenceSettings.*`
 
 The `FSP` class uses these parameters in methods such as `download_baselines` and `sell_flexibility`.
 
@@ -320,6 +467,12 @@ Key fields:
 | `modulation_type` | `"continuous"` (any value) or `"discrete"` (ON/OFF) |
 | `min_power_kw` | Minimum power for continuous assets (default: 0) |
 | `discrete_states_kw` | Valid power states for discrete assets (e.g., `[0.0, 15.0]`) |
+| `nominal_power_w` | Explicit nominal power used by persistence flexibility |
+| `persistence_safety_factor` | Optional per-asset safety factor for persistence flexibility |
+| `baseline_persistence_go_back_minutes` | Optional baseline lag override for `slot_persistence`; otherwise baseline code uses its configured default/fallback |
+| `flexibility_persistence_go_back_minutes` | Optional flexibility lag override for persistence mode; falls back to `flexibility.persistenceSettings.persistenceGoBackMinutes` |
+
+Per-asset persistence go-back overrides exist because all assets remain in the same NODES portfolio, but some telemetry can arrive later than other telemetry. The portfolio baseline and flexibility are still sums of asset-level predictions; no missing asset values are silently filled. Current operational settings set `ECM63.1`, `ECM63.2`, `ECM96.2`, and `ECM97.3` to 120 minutes for both baseline and flexibility persistence overrides.
 
 If `modulation_type` is not specified:
 - Heat pumps default to `"discrete"` with `[0.0, capacity_kw]`
@@ -356,6 +509,7 @@ If `modulation_type` is not specified:
      ```
 
    - `slot_time` is the reference timeslot for both demand and offers.
+   - With `fm.granularity = 15` and `fm.ordersTimeShift = 90`, `08:20 UTC` maps to the `09:45 UTC` delivery slot.
 
 7. **FSP setup**<br>
    - Initialize FSP:
@@ -385,11 +539,18 @@ If `modulation_type` is not specified:
 
 10. **Flexibility forecasting (discretization-aware)**<br>
     - Initializes `FlexibilityForecaster` for the asset portfolio.
-    - Calls `get_asset_flexibility_breakdown(slot_time)` to get per-asset details.
+    - In strategy mode, `trader_fsp.py` resolves the selected strategy's flexibility method. Strategies without `flexibility_method: "persistence"` use the historical/legacy path even if persistence settings exist elsewhere in the config.
+    - If the selected strategy uses persistence, the script:
+      - identifies the assets assigned to each portfolio,
+      - computes `baseline_i(t) = measured_power_i(t - persistenceGoBackMinutes)`,
+      - obtains the latest grouped current measurement at or before `current_time_utc`,
+      - applies the current-state gate, nominal cap, and safety factor per asset,
+      - aggregates asset flexibility at portfolio level,
+      - keeps strategy filtering as the intersection of portfolio assets and allowed strategy assets.
     - Uses `get_achievable_flexibility()` to calculate:
-      - Discrete asset combinations (ON/OFF states)
-      - Continuous asset ranges (modulation)
-      - Recommended bid quantity
+      - discrete asset combinations (ON/OFF states),
+      - continuous asset ranges (modulation),
+      - recommended bid quantity.
 
 11. **Strategy-based bid calculation**<br>
     If using strategy mode:
@@ -401,6 +562,7 @@ If `modulation_type` is not specified:
     ```
 
     This returns the **achievable** flexibility (not just a fractional sum) and the allocation plan.
+    In persistence mode this is computed per portfolio, not once globally.
 
 12. **FMO initialization**<br>
     - `fmo = FMO(fsp.cfg, logger, pgi)`.
@@ -427,6 +589,7 @@ If `modulation_type` is not specified:
     )
     ```
 
+    - In persistence simple mode, the baseline-based quantity is capped by the portfolio's persistence flexibility total before any order is posted.
     - In dry-run mode, logs what would be placed without actual submission.
     - In live mode, posts orders to the market ledger.
 
@@ -437,58 +600,41 @@ If `modulation_type` is not specified:
 
 ## Example Log Output
 
-When running in strategy mode with discretization-aware bidding:
+When running a persistence strategy such as `strategy_8`, the important lines look like:
 
 ```
 ======================================================================
 FSP: supsi01
 Mode: STRATEGY-BASED
-Strategy: strategy_4 - Hybrid (S3+S1)
-Description: Morning peak aggressive + full day HP coverage
-Allowed assets: ['ECM96.2', 'ECM97.1', 'ECM97.2']
+Strategy: strategy_8 - Persistence HP Strategy
+Allowed assets: ['ECM96.2', 'ECM97.3']
+Strategy flexibility method: persistence
 ======================================================================
-FLEXIBILITY ANALYSIS FOR SLOT: 2026-01-15 08:30
+FLEXIBILITY ANALYSIS FOR SLOT (UTC): 2026-05-13 11:15Z
 ======================================================================
 Peak hour: YES
 ----------------------------------------------------------------------
-Asset flexibility breakdown (strategy filter: strategy_4):
-  [✓] [D] ECM96.2 (HP Small): typical=3.50 kW, available_flex=2.80 kW
-  [✓] [D] ECM97.1 (HP Cinema 1): typical=14.20 kW, available_flex=12.07 kW
-  [✓] [D] ECM97.2 (HP Cinema 2): typical=13.80 kW, available_flex=11.73 kW
-  [✗] [C] ECM63.1 (EV Charger 1): typical=5.50 kW, occupancy=45%, available_flex=1.73 kW
-  [✗] [C] ECM63.2 (EV Charger 2): typical=4.20 kW, occupancy=38%, available_flex=1.12 kW
-----------------------------------------------------------------------
-TOTAL AVAILABLE (all assets, continuous sum): 29.45 kW (0.029450 MW)
-STRATEGY AVAILABLE (filtered, continuous sum): 26.60 kW (0.026600 MW)
-----------------------------------------------------------------------
-DISCRETIZATION-AWARE FLEXIBILITY ANALYSIS:
-  Target flexibility: 20.000 kW (0.020000 MW)
-  Discrete assets: ['ECM96.2', 'ECM97.1', 'ECM97.2']
-  Continuous assets: []
-  Achievable discrete levels (kW): [0.0, 4.0, 15.0, 19.0, 30.0, 34.0]
-  Continuous range (kW): 0.00 - 0.00
-  Total achievable range (kW): 0.00 - 34.00
-----------------------------------------------------------------------
-RECOMMENDED BID: 19.000 kW (0.019000 MW) (-1.00 kW / -5.0% under target)
-  Discrete allocation (ON/OFF):
-    - ECM96.2: 4.0 kW (ON)
-    - ECM97.1: 15.0 kW (ON)
-    - ECM97.2: 0.0 kW (OFF)
-----------------------------------------------------------------------
-RUNNING IN STRATEGY MODE: strategy_4 - Hybrid (S3+S1)
+PORTFOLIO AVAILABLE FLEXIBILITY (all assigned assets before strategy filter): 3.493 kW (0.003493 MW)
+DSO DEMANDS:
+  TOTAL DSO DEMAND: Up=0.000 MW, Down=0.000 MW
+Strategy-mode DSO feasibility will be checked after applying selected strategy asset filters.
+======================================================================
+RUNNING IN STRATEGY MODE: strategy_8 - Persistence HP Strategy
 ======================================================================
 Time slot: Morning Peak (Aggressive)
 Strategy bid price: 9.00 CHF/MW
-Strategy flexibility target: 0.0200 MW
+Strategy flexibility target: 0.0400 MW
 ----------------------------------------------------------------------
-[DRY-RUN] WOULD PLACE ORDER: Up regulation, quantity=0.019 MW, price=9.00 CHF/MW
+PORTFOLIO AVAILABLE FLEXIBILITY (all assigned assets before strategy filter): 3.493 kW (0.003493 MW)
+STRATEGY AVAILABLE FLEXIBILITY (strategy_8 allowed assets only): 3.121 kW (0.003121 MW)
+RECOMMENDED BID (quantity used for bidding): 3.121 kW (0.003121 MW)
+CAN MEET DSO DEMAND WITH STRATEGY strategy_8 (Persistence HP Strategy): YES (strategy_available=0.003121 MW, required=0.000000 MW, recommended_bid=0.003121 MW)
+----------------------------------------------------------------------
+Portfolio ECM_REAL_ASSETS summary: portfolio_available=3.493 kW (0.003493 MW), strategy_available=3.121 kW (0.003121 MW), recommended_bid=3.121 kW (0.003121 MW)
 ======================================================================
 DRY-RUN SUMMARY
 ======================================================================
-Mode: Strategy-based (strategy_4 - Hybrid (S3+S1))
-Total orders: 1
-Total quantity: 0.0190 MW
-Total potential revenue: 0.17 CHF
+Mode: Strategy-based (strategy_8 - Persistence HP Strategy)
 ```
 
 **Legend for asset markers:**
@@ -543,6 +689,10 @@ This structure can match what Nodes expects for baseline upload.
   - download current baselines,
   - compute available flexibility,
   - price Sell offers.
+- `baseline.dbSettings.strategy = "slot_persistence"` switches the baseline uploader to slot-level persistence without removing the legacy day-based path.
+- In strategy mode, `flexibility_method: "persistence"` inside the selected strategy switches that strategy to the operational persistence logic described above. Strategies without that field use the historical/legacy path.
+- The global `flexibility.persistenceSettings` block provides persistence parameters used by persistence strategies.
+- `asset_mapping.<asset>.nominal_power_w` and optional `asset_mapping.<asset>.persistence_safety_factor` control the asset-level flexibility cap.
 
 By changing the FSP-specific configuration, you can control how aggressively the FSP sells flexibility, the price levels, and the time coverage.
 
@@ -575,7 +725,7 @@ By changing the FSP-specific configuration, you can control how aggressively the
 
 If the log shows significant under-delivery:
 ```
-RECOMMENDED BID: 15.000 kW (-5.00 kW / -25.0% under target)
+RECOMMENDED BID (quantity used for bidding): 15.000 kW (-5.00 kW / -25.0% under target)
 ```
 
 This means the discrete asset combinations cannot reach the target. Consider:
@@ -587,7 +737,7 @@ This means the discrete asset combinations cannot reach the target. Consider:
 
 If the log shows over-delivery:
 ```
-RECOMMENDED BID: 19.000 kW (+4.00 kW / +26.7% over target)
+RECOMMENDED BID (quantity used for bidding): 19.000 kW (+4.00 kW / +26.7% over target)
 ```
 
 This is expected when the best discrete combination exceeds the target. The system prefers slight under-delivery by default. To change this behavior, adjust the `_calculate_best_bid()` logic in `FlexibilityForecaster`.

@@ -16,11 +16,19 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from classes.fsp import FSP
 from classes.player import Player
 from classes.fmo import FMO
-from classes.postgresql_interface import PostgreSQLInterface
 from classes.flexibility_forecaster import FlexibilityForecaster
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
-from classes.bid_record_repository import BidRecordRepository
-from classes.demand_record_repository import DemandRecordRepository
+
+POSTGRESQL_IMPORT_ERROR = None
+try:
+    from classes.postgresql_interface import PostgreSQLInterface
+    from classes.bid_record_repository import BidRecordRepository
+    from classes.demand_record_repository import DemandRecordRepository
+except ModuleNotFoundError as exc:
+    PostgreSQLInterface = None
+    BidRecordRepository = None
+    DemandRecordRepository = None
+    POSTGRESQL_IMPORT_ERROR = exc
 
 
 def create_dataframe_for_portfolio_baseline(p_id, data_file_path):
@@ -155,8 +163,12 @@ def get_strategy_flexibility_discrete(
         deviation_msg = f"({deviation_kw:.2f} kW / {deviation_pct:.1f}% under target)"
     
     logger.info("-" * 70)
-    logger.info("RECOMMENDED BID: %.3f kW (%.6f MW) %s", 
-                recommended_kw, recommended_mw, deviation_msg)
+    logger.info(
+        "RECOMMENDED BID (quantity used for bidding): %.3f kW (%.6f MW) %s",
+        recommended_kw,
+        recommended_mw,
+        deviation_msg,
+    )
     
     allocation = achievable.get("recommended_allocation", {})
     if allocation:
@@ -184,8 +196,18 @@ def get_strategy_flexibility_discrete(
     return recommended_mw, achievable
 
 
-def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, 
-                    bid_record_id=None, demand_record_id=None):
+def run_simple_mode(
+    fsp,
+    fmo,
+    dso_demands,
+    slot_time,
+    total_available_flex_mw,
+    dry_run,
+    logger,
+    bid_record_id=None,
+    demand_record_id=None,
+    portfolio_flexibility_mw_map=None,
+):
     """
     Run the original simple bidding mode (baseline-based).
     
@@ -208,12 +230,17 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
             baseline_value = fsp.baselines[p_k]["quantity"].loc[
                 slot_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             ] if slot_time.strftime("%Y-%m-%dT%H:%M:%SZ") in fsp.baselines[p_k]["quantity"].index else 0
-            
+            portfolio_flexibility_mw = None
+            if portfolio_flexibility_mw_map is not None:
+                portfolio_flexibility_mw = portfolio_flexibility_mw_map.get(p_k, 0.0)
+
             logger.info(
                 "Portfolio %s: baseline=%.6f MW, forecasted_flex=%.6f MW",
                 fsp.portfolios[p_k].metadata["name"],
                 baseline_value,
-                total_available_flex_mw
+                portfolio_flexibility_mw
+                if portfolio_flexibility_mw is not None
+                else total_available_flex_mw,
             )
             
             if dry_run:
@@ -222,6 +249,17 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                     quantity_to_sell = fsp.calculate_quantity_to_sell_basic(
                         slot_time, dso_demand[k_regulation_type], fsp.baselines[p_k]["quantity"]
                     )
+                    if portfolio_flexibility_mw is not None:
+                        capped_quantity = min(quantity_to_sell, portfolio_flexibility_mw)
+                        if capped_quantity < quantity_to_sell:
+                            logger.info(
+                                "Capping simple-mode portfolio %s %s quantity from %.3f MW to persistence flexibility %.3f MW",
+                                fsp.portfolios[p_k].metadata["name"],
+                                k_regulation_type,
+                                quantity_to_sell,
+                                portfolio_flexibility_mw,
+                            )
+                        quantity_to_sell = capped_quantity
                     # Convert to native Python float to avoid numpy issues in DB
                     quantity_to_sell = float(quantity_to_sell) if quantity_to_sell else 0.0
                     
@@ -251,7 +289,12 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
                             )
             else:
                 # Actually place orders
-                resp_selling = fsp.sell_flexibility(slot_time, p_k, dso_demand)
+                resp_selling = fsp.sell_flexibility(
+                    slot_time,
+                    p_k,
+                    dso_demand,
+                    max_quantity_mw=portfolio_flexibility_mw,
+                )
                 for k in resp_selling.keys():
                     if resp_selling[k] is not False:
                         order_info = {
@@ -284,7 +327,8 @@ def run_simple_mode(fsp, fmo, dso_demands, slot_time, total_available_flex_mw, d
 def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time, 
                       asset_breakdown, flex_forecaster, dry_run, logger, 
                       bid_record_id=None, demand_record_id=None,
-                      force_strategy_bid=False):
+                      force_strategy_bid=False,
+                      portfolio_strategy_contexts=None):
     """
     Run strategy-based bidding mode with discretization-aware flexibility calculation.
     
@@ -305,58 +349,153 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
     strategy_target_mw = bid_params["flexibility_mw"]
     if bid_params.get("ev_flexibility_mw", 0) > 0:
         strategy_target_mw += bid_params["ev_flexibility_mw"]
+    total_dso_demand_up = sum(dso_demand.get("Up", 0.0) for dso_demand in dso_demands)
     
-    # Filter assets based on strategy and calculate flexibility
-    total_available_flex_kw = 0
-    strategy_flex_kw = 0
-    logger.info("-" * 70)
-    logger.info("Asset flexibility breakdown (strategy filter: %s):", strategy_id)
-    
-    for asset_id, info in asset_breakdown.items():
-        is_allowed = strategy.is_asset_allowed(asset_id)
-        status = "✓" if is_allowed else "✗"
-        
-        # Get modulation type for display
-        mod_type = flex_forecaster._get_modulation_type(asset_id)
-        mod_label = "[D]" if mod_type == "discrete" else "[C]"
-        
-        occupancy = info.get("occupancy_probability")
-        if occupancy is not None:
-            logger.info(
-                "  [%s] %s %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW",
-                status, mod_label, asset_id, info["description"],
-                info["typical_load_kw"], occupancy * 100, info["available_flexibility_kw"],
-            )
-        else:
-            logger.info(
-                "  [%s] %s %s (%s): typical=%.2f kW, available_flex=%.2f kW",
-                status, mod_label, asset_id, info["description"],
-                info["typical_load_kw"], info["available_flexibility_kw"],
-            )
-        
-        total_available_flex_kw += info["available_flexibility_kw"]
-        if is_allowed:
-            strategy_flex_kw += info["available_flexibility_kw"]
-    
-    logger.info("-" * 70)
-    logger.info("TOTAL AVAILABLE (all assets, continuous sum): %.3f kW (%.6f MW)", 
-                total_available_flex_kw, total_available_flex_kw / 1000)
-    logger.info("STRATEGY AVAILABLE (filtered, continuous sum): %.3f kW (%.6f MW)", 
-                strategy_flex_kw, strategy_flex_kw / 1000)
-    
-    # Get the flexibility to bid using discretization-aware calculation
-    flexibility_to_bid_mw, achievable_details = get_strategy_flexibility_discrete(
-        strategy, slot_time, flex_forecaster, logger
-    )
+    flexibility_to_bid_mw = 0.0
+    if portfolio_strategy_contexts is None:
+        # Filter assets based on strategy and calculate flexibility
+        total_available_flex_kw = 0
+        strategy_flex_kw = 0
+        logger.info("-" * 70)
+        logger.info("Asset flexibility breakdown (strategy filter: %s):", strategy_id)
 
-    if force_strategy_bid:
+        for asset_id, info in asset_breakdown.items():
+            is_allowed = strategy.is_asset_allowed(asset_id)
+            status = "✓" if is_allowed else "✗"
+
+            # Get modulation type for display
+            mod_type = flex_forecaster._get_modulation_type(asset_id)
+            mod_label = "[D]" if mod_type == "discrete" else "[C]"
+
+            occupancy = info.get("occupancy_probability")
+            if occupancy is not None:
+                logger.info(
+                    "  [%s] %s %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW",
+                    status, mod_label, asset_id, info["description"],
+                    info["typical_load_kw"], occupancy * 100, info["available_flexibility_kw"],
+                )
+            else:
+                logger.info(
+                    "  [%s] %s %s (%s): typical=%.2f kW, available_flex=%.2f kW",
+                    status, mod_label, asset_id, info["description"],
+                    info["typical_load_kw"], info["available_flexibility_kw"],
+                )
+
+            total_available_flex_kw += info["available_flexibility_kw"]
+            if is_allowed:
+                strategy_flex_kw += info["available_flexibility_kw"]
+
+        logger.info("-" * 70)
         logger.info(
-            "FORCE STRATEGY BID: using configured strategy target %.6f MW instead of forecast/discrete recommendation %.6f MW",
-            strategy_target_mw,
+            "PORTFOLIO AVAILABLE FLEXIBILITY (all assigned assets before strategy filter): %.3f kW (%.6f MW)",
+            total_available_flex_kw,
+            total_available_flex_kw / 1000,
+        )
+        logger.info(
+            "STRATEGY AVAILABLE FLEXIBILITY (%s allowed assets only): %.3f kW (%.6f MW)",
+            strategy_id,
+            strategy_flex_kw,
+            strategy_flex_kw / 1000,
+        )
+
+        # Get the flexibility to bid using discretization-aware calculation
+        flexibility_to_bid_mw, achievable_details = get_strategy_flexibility_discrete(
+            strategy, slot_time, flex_forecaster, logger
+        )
+
+        if force_strategy_bid:
+            logger.info(
+                "FORCE STRATEGY BID: using configured strategy target %.6f MW instead of forecast/discrete recommendation %.6f MW",
+                strategy_target_mw,
+                flexibility_to_bid_mw,
+            )
+            flexibility_to_bid_mw = strategy_target_mw
+
+        strategy_available_mw = strategy_flex_kw / 1000
+        can_meet_strategy_demand = strategy_available_mw >= total_dso_demand_up
+        logger.info(
+            "CAN MEET DSO DEMAND WITH STRATEGY %s (%s): %s (strategy_available=%.6f MW, required=%.6f MW, recommended_bid=%.6f MW)",
+            strategy_id,
+            strategy.name,
+            "YES" if can_meet_strategy_demand else "NO",
+            strategy_available_mw,
+            total_dso_demand_up,
             flexibility_to_bid_mw,
         )
-        flexibility_to_bid_mw = strategy_target_mw
-    
+    else:
+        logger.info("-" * 70)
+        total_portfolio_available_kw = sum(
+            portfolio_context.get("portfolio_total_available_kw", 0.0)
+            for portfolio_context in portfolio_strategy_contexts.values()
+        )
+        total_strategy_available_kw = sum(
+            portfolio_context.get("strategy_available_kw", 0.0)
+            for portfolio_context in portfolio_strategy_contexts.values()
+        )
+        total_recommended_bid_kw = sum(
+            portfolio_context.get("recommended_bid_kw", 0.0)
+            for portfolio_context in portfolio_strategy_contexts.values()
+        )
+        logger.info(
+            "PORTFOLIO AVAILABLE FLEXIBILITY (all assigned assets before strategy filter): %.3f kW (%.6f MW)",
+            total_portfolio_available_kw,
+            total_portfolio_available_kw / 1000,
+        )
+        logger.info(
+            "STRATEGY AVAILABLE FLEXIBILITY (%s allowed assets only): %.3f kW (%.6f MW)",
+            strategy_id,
+            total_strategy_available_kw,
+            total_strategy_available_kw / 1000,
+        )
+        logger.info(
+            "RECOMMENDED BID (quantity used for bidding): %.3f kW (%.6f MW)",
+            total_recommended_bid_kw,
+            total_recommended_bid_kw / 1000,
+        )
+        total_strategy_available_mw = total_strategy_available_kw / 1000
+        total_recommended_bid_mw = total_recommended_bid_kw / 1000
+        can_meet_strategy_demand = total_strategy_available_mw >= total_dso_demand_up
+        logger.info(
+            "CAN MEET DSO DEMAND WITH STRATEGY %s (%s): %s (strategy_available=%.6f MW, required=%.6f MW, recommended_bid=%.6f MW)",
+            strategy_id,
+            strategy.name,
+            "YES" if can_meet_strategy_demand else "NO",
+            total_strategy_available_mw,
+            total_dso_demand_up,
+            total_recommended_bid_mw,
+        )
+        logger.info("-" * 70)
+        logger.info(
+            "Asset flexibility breakdown (strategy filter: %s, portfolio-scoped persistence mode):",
+            strategy_id,
+        )
+        for p_k, portfolio_context in portfolio_strategy_contexts.items():
+            portfolio_name = fsp.portfolios[p_k].metadata["name"]
+            logger.info(
+                "Portfolio %s summary: portfolio_available=%.3f kW (%.6f MW), strategy_available=%.3f kW (%.6f MW), recommended_bid=%.3f kW (%.6f MW)",
+                portfolio_name,
+                portfolio_context.get("portfolio_total_available_kw", 0.0),
+                portfolio_context.get("portfolio_total_available_kw", 0.0) / 1000,
+                portfolio_context.get("strategy_available_kw", 0.0),
+                portfolio_context.get("strategy_available_kw", 0.0) / 1000,
+                portfolio_context.get("recommended_bid_kw", 0.0),
+                portfolio_context.get("recommended_bid_mw", 0.0),
+            )
+            for asset_id, info in portfolio_context.get("asset_breakdown", {}).items():
+                mod_type = flex_forecaster._get_modulation_type(asset_id)
+                mod_label = "[D]" if mod_type == "discrete" else "[C]"
+                logger.info(
+                    "  %s %s (%s): baseline=%.2f kW, current=%.2f kW @ %s, active=%s, available_flex=%.2f kW",
+                    mod_label,
+                    asset_id,
+                    info["description"],
+                    info.get("baseline_power_w", 0.0) / 1000,
+                    info.get("current_measured_power_w", 0.0) / 1000,
+                    info.get("gate_measurement_time_utc", "N/A"),
+                    info.get("is_currently_active", False),
+                    info.get("available_flexibility_kw", 0.0),
+                )
+
     if dry_run:
         logger.info("-" * 70)
         logger.info("DRY-RUN: Simulating order placement (no actual orders will be placed)")
@@ -369,7 +508,7 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             "FORCE STRATEGY BID: no DSO demand found; posting unsolicited Up sell order at strategy price"
         )
         demands_to_process = [{
-            "Up": flexibility_to_bid_mw,
+            "Up": strategy_target_mw,
             "Down": 0.0,
             "unitPrice": bid_params["bid_price"],
             "_forced_strategy_bid": True,
@@ -389,23 +528,40 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             continue
         
         for p_k in fsp.portfolios.keys():
+            if portfolio_strategy_contexts is not None:
+                portfolio_context = portfolio_strategy_contexts.get(p_k, {})
+                portfolio_flexibility_to_bid_mw = portfolio_context.get(
+                    "recommended_bid_mw", 0.0
+                )
+                if force_strategy_bid:
+                    logger.info(
+                        "FORCE STRATEGY BID: portfolio %s uses configured strategy target %.6f MW instead of persistence recommendation %.6f MW",
+                        fsp.portfolios[p_k].metadata["name"],
+                        strategy_target_mw,
+                        portfolio_flexibility_to_bid_mw,
+                    )
+                    portfolio_flexibility_to_bid_mw = strategy_target_mw
+            else:
+                portfolio_context = None
+                portfolio_flexibility_to_bid_mw = flexibility_to_bid_mw
+
             baseline_value = fsp.baselines[p_k]["quantity"].loc[
                 slot_time.strftime("%Y-%m-%dT%H:%M:%SZ")
             ] if slot_time.strftime("%Y-%m-%dT%H:%M:%SZ") in fsp.baselines[p_k]["quantity"].index else 0
             
             logger.info(
-                "Portfolio %s: baseline=%.6f MW, strategy_flex=%.6f MW",
+                "Portfolio %s: baseline=%.6f MW, bid_quantity=%.6f MW",
                 fsp.portfolios[p_k].metadata["name"],
                 baseline_value,
-                flexibility_to_bid_mw
+                portfolio_flexibility_to_bid_mw
             )
             
             if dry_run:
                 for k_regulation_type in ["Up", "Down"]:
                     if k_regulation_type == "Up":
-                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Up", 0))
+                        quantity_to_sell = min(portfolio_flexibility_to_bid_mw, dso_demand.get("Up", 0))
                     else:
-                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
+                        quantity_to_sell = min(portfolio_flexibility_to_bid_mw, dso_demand.get("Down", 0))
                     
                     # Round to 3 decimal places (NODES API requirement) and convert to native float
                     quantity_to_sell = float(round(quantity_to_sell, 3))
@@ -434,9 +590,9 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             else:
                 for k_regulation_type in ["Up", "Down"]:
                     if k_regulation_type == "Up":
-                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Up", 0))
+                        quantity_to_sell = min(portfolio_flexibility_to_bid_mw, dso_demand.get("Up", 0))
                     else:
-                        quantity_to_sell = min(flexibility_to_bid_mw, dso_demand.get("Down", 0))
+                        quantity_to_sell = min(portfolio_flexibility_to_bid_mw, dso_demand.get("Down", 0))
                     
                     # Round to 3 decimal places (NODES API requirement) and convert to native float
                     quantity_to_sell = float(round(quantity_to_sell, 3))
@@ -492,6 +648,35 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
     return orders_summary, strategy_id
 
 
+def resolve_strategy_flexibility_method(strategy, logger):
+    """
+    Return the flexibility method selected by a bidding strategy.
+
+    Existing strategies default to the legacy historical method. Persistence must
+    be explicitly requested by the strategy config.
+    """
+    if strategy is None:
+        return None
+
+    raw_method = strategy.config.get("flexibility_method", "historical")
+    method = str(raw_method).strip().lower()
+    aliases = {
+        "legacy": "historical",
+        "time_based": "historical",
+    }
+    method = aliases.get(method, method)
+
+    if method not in {"historical", "persistence"}:
+        logger.warning(
+            "Unknown flexibility_method=%s for strategy %s; using historical",
+            raw_method,
+            strategy.strategy_id,
+        )
+        return "historical"
+
+    return method
+
+
 if __name__ == "__main__":
     # --------------------------------------------------------------------------- #
     # Configuration file
@@ -503,7 +688,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--fsp", help="FSP identifier", required=True)
     arg_parser.add_argument(
         "--strategy",
-        help="Bidding strategy to use. Options: strategy_1, strategy_2, strategy_3, strategy_4, strategy_5. "
+        help="Bidding strategy to use. Options include strategy_1 through strategy_8. "
              "If not specified and FSP has no strategy configured, uses simple baseline-based bidding."
     )
     arg_parser.add_argument(
@@ -619,6 +804,14 @@ if __name__ == "__main__":
         print("Pass --strategy or configure a strategy for the selected FSP.")
         sys.exit(1)
 
+    strategy_flexibility_method = None
+    forecaster_method_override = None
+    if use_strategy_mode and strategy:
+        strategy_flexibility_method = resolve_strategy_flexibility_method(
+            strategy, logger
+        )
+        forecaster_method_override = strategy_flexibility_method
+
     if dry_run:
         logger.info("Starting program (DRY-RUN MODE - no orders will be placed)")
     else:
@@ -633,6 +826,7 @@ if __name__ == "__main__":
         logger.info("Strategy: %s - %s", strategy_id, strategy.name)
         logger.info("Description: %s", strategy.description)
         logger.info("Allowed assets: %s", strategy.allowed_assets)
+        logger.info("Strategy flexibility method: %s", strategy_flexibility_method)
     else:
         logger.info("Mode: SIMPLE (baseline-based)")
         logger.info("Pricing: %s", fsp_config.get("pricing", {}).get("source", "constant"))
@@ -643,16 +837,22 @@ if __name__ == "__main__":
     pgi = None
     bid_repo = None
     demand_repo = None
-    try:
-        pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
-        # Initialize bid record repository for storing bid info
-        bid_repo = BidRecordRepository(pgi, logger)
-        logger.info("Bid record repository initialized")
-        # Initialize demand record repository for storing DSO demand info
-        demand_repo = DemandRecordRepository(pgi, logger)
-        logger.info("Demand record repository initialized")
-    except Exception as e:
-        logger.error("Unable to connect to PostgreSQL: %s" % str(e))
+    if PostgreSQLInterface is None:
+        logger.warning(
+            "PostgreSQL support is unavailable in this runtime: %s",
+            POSTGRESQL_IMPORT_ERROR,
+        )
+    else:
+        try:
+            pgi = PostgreSQLInterface(cfg["postgreSQL"], logger)
+            # Initialize bid record repository for storing bid info
+            bid_repo = BidRecordRepository(pgi, logger)
+            logger.info("Bid record repository initialized")
+            # Initialize demand record repository for storing DSO demand info
+            demand_repo = DemandRecordRepository(pgi, logger)
+            logger.info("Demand record repository initialized")
+        except Exception as e:
+            logger.error("Unable to connect to PostgreSQL: %s" % str(e))
 
     # InfluxDB connection for flexibility forecasting
     influx_client = InfluxDBClient(
@@ -728,14 +928,20 @@ if __name__ == "__main__":
     fsp.download_baselines(slot_time)
 
     # Initialize FlexibilityForecaster for the 5-asset portfolio
-    flex_forecaster = FlexibilityForecaster(cfg, influx_client, logger)
+    flex_forecaster = FlexibilityForecaster(
+        cfg, influx_client, logger, method_override=forecaster_method_override
+    )
     
     # FMO object
     fmo = FMO(fsp.cfg, logger, pgi)
+    current_time_utc = datetime.utcnow()
+    portfolio_flexibility_mw_map = None
+    portfolio_strategy_contexts = None
 
     # Get flexibility forecast for the current slot
     logger.info("=" * 70)
     logger.info("FLEXIBILITY ANALYSIS FOR SLOT (UTC): %sZ", slot_time.strftime("%Y-%m-%d %H:%M"))
+    logger.info("CURRENT TIME (UTC): %sZ", current_time_utc.strftime("%Y-%m-%d %H:%M:%S"))
     logger.info("=" * 70)
     
     # Check if this is a peak hour
@@ -743,56 +949,158 @@ if __name__ == "__main__":
     logger.info("Peak hour: %s", "YES" if is_peak else "NO")
     
     # Log temperature information if enabled
-    if flex_forecaster.temperature_enabled:
+    if flex_forecaster.method != "persistence" and flex_forecaster.temperature_enabled:
         forecast_temp = flex_forecaster.get_forecast_temperature(slot_time)
         if forecast_temp is not None:
             logger.info("Temperature forecast: %.1f°C", forecast_temp)
             logger.info("Temperature-aware HP analysis: ENABLED")
         else:
             logger.info("Temperature forecast: N/A (using time-based estimates)")
-    
-    # Get per-asset flexibility breakdown for this slot
-    asset_breakdown = flex_forecaster.get_asset_flexibility_breakdown(slot_time)
-    
-    total_available_flex_kw = 0
-    logger.info("-" * 70)
-    logger.info("Asset flexibility breakdown:")
-    for asset_id, info in asset_breakdown.items():
-        occupancy = info.get("occupancy_probability")
-        estimation_method = info.get("estimation_method", "time_based")
-        temp_adjusted_load = info.get("temperature_adjusted_load_kw")
-        forecast_temp = info.get("forecast_temperature_c")
-        
-        if occupancy is not None:
-            # EV charger with occupancy probability
+
+    asset_breakdown = {}
+    total_available_flex_kw = 0.0
+    use_persistence_flexibility = (
+        strategy_flexibility_method == "persistence"
+        if use_strategy_mode
+        else flex_forecaster.method == "persistence"
+    )
+    if use_persistence_flexibility:
+        logger.info(
+            "Persistence flexibility mode: target_slot_utc=%s, default persistenceGoBackMinutes=%s, activeThresholdW=%.1f, maxCurrentMeasurementAgeMinutes=%s",
+            slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            flex_forecaster.persistence_go_back_minutes,
+            flex_forecaster.persistence_active_threshold_w,
+            flex_forecaster.max_current_measurement_age_minutes,
+        )
+        portfolio_flexibility_mw_map = {}
+        if use_strategy_mode and strategy:
+            portfolio_strategy_contexts = {}
+
+        logger.info("-" * 70)
+        logger.info("Portfolio-scoped persistence flexibility breakdown:")
+        for p_k in fsp.portfolios.keys():
+            portfolio_name = fsp.portfolios[p_k].metadata["name"]
+            portfolio_asset_ids = fsp.get_portfolio_asset_names(p_k)
             logger.info(
-                "  %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW (factor=%.0f%%)",
-                asset_id, info["description"],
-                info["typical_load_kw"], occupancy * 100,
-                info["available_flexibility_kw"], info["flexibility_factor"] * 100
+                "Portfolio %s: assigned assets=%s",
+                portfolio_name,
+                portfolio_asset_ids,
             )
-        elif temp_adjusted_load is not None:
-            # Heat pump with temperature-adjusted estimate
+            portfolio_breakdown = flex_forecaster.get_asset_flexibility_breakdown(
+                slot_time,
+                use_temperature=False,
+                asset_ids=portfolio_asset_ids,
+                current_time_utc=current_time_utc,
+            )
+            portfolio_total_kw = 0.0
+            for asset_id, info in portfolio_breakdown.items():
+                logger.info(
+                    "  %s (%s): flexibility_go_back_minutes=%s baseline_source_time_utc=%s baseline=%.2f kW, gate_measurement_time_utc=%s current=%.2f kW, active=%s, nominal=%.2f kW, safety_factor=%.3f, available_flex=%.2f kW",
+                    asset_id,
+                    info["description"],
+                    info.get("flexibility_persistence_go_back_minutes", "N/A"),
+                    info.get("baseline_source_time_utc", "N/A"),
+                    info.get("baseline_power_w", 0.0) / 1000,
+                    info.get("gate_measurement_time_utc", "N/A"),
+                    info.get("current_measured_power_w", 0.0) / 1000,
+                    info.get("is_currently_active", False),
+                    info.get("nominal_power_w", 0.0) / 1000,
+                    info.get("safety_factor", 0.0),
+                    info.get("available_flexibility_kw", 0.0),
+                )
+                portfolio_total_kw += info.get("available_flexibility_kw", 0.0)
+                asset_breakdown[asset_id] = info
+
+            portfolio_flexibility_mw_map[p_k] = portfolio_total_kw / 1000
+            total_available_flex_kw += portfolio_total_kw
             logger.info(
-                "  %s (%s): time_based=%.2f kW, temp_adjusted=%.2f kW @ %.1f°C, available_flex=%.2f kW (method=%s)",
-                asset_id, info["description"],
-                info["typical_load_kw"], temp_adjusted_load, forecast_temp,
-                info["available_flexibility_kw"], estimation_method
+                "Portfolio %s available flexibility (%s): %.3f kW (%.6f MW)",
+                portfolio_name,
+                (
+                    "all assigned assets before strategy filter"
+                    if use_strategy_mode
+                    else "all assigned assets"
+                ),
+                portfolio_total_kw,
+                portfolio_total_kw / 1000,
             )
-        else:
-            # Standard time-based estimate
-            logger.info(
-                "  %s (%s): typical=%.2f kW, available_flex=%.2f kW (factor=%.0f%%, method=%s)",
-                asset_id, info["description"],
-                info["typical_load_kw"], info["available_flexibility_kw"],
-                info["flexibility_factor"] * 100, estimation_method
-            )
-        total_available_flex_kw += info["available_flexibility_kw"]
-    
+
+            if use_strategy_mode and strategy:
+                bid_params = strategy.get_bid_parameters(slot_time)
+                strategy_target_kw = bid_params["flexibility_mw"] * 1000
+                if bid_params.get("ev_flexibility_mw", 0) > 0:
+                    strategy_target_kw += bid_params["ev_flexibility_mw"] * 1000
+                achievable = flex_forecaster.get_achievable_flexibility(
+                    period_from=slot_time,
+                    target_kw=strategy_target_kw,
+                    allowed_assets=strategy.allowed_assets,
+                    use_temperature=False,
+                    asset_ids=portfolio_asset_ids,
+                    current_time_utc=current_time_utc,
+                )
+                strategy_available_kw = sum(
+                    info.get("available_flexibility_kw", 0.0)
+                    for info in achievable.get("asset_breakdown", {}).values()
+                )
+                portfolio_strategy_contexts[p_k] = {
+                    "asset_breakdown": achievable.get("asset_breakdown", {}),
+                    "portfolio_total_available_kw": portfolio_total_kw,
+                    "strategy_available_kw": strategy_available_kw,
+                    "recommended_bid_kw": achievable.get("recommended_bid_kw", 0.0),
+                    "recommended_bid_mw": achievable.get("recommended_bid_kw", 0.0)
+                    / 1000,
+                    "achievable_details": achievable,
+                }
+    else:
+        # Get per-asset flexibility breakdown for this slot
+        asset_breakdown = flex_forecaster.get_asset_flexibility_breakdown(slot_time)
+
+        logger.info("-" * 70)
+        logger.info("Asset flexibility breakdown:")
+        for asset_id, info in asset_breakdown.items():
+            occupancy = info.get("occupancy_probability")
+            estimation_method = info.get("estimation_method", "time_based")
+            temp_adjusted_load = info.get("temperature_adjusted_load_kw")
+            forecast_temp = info.get("forecast_temperature_c")
+
+            if occupancy is not None:
+                # EV charger with occupancy probability
+                logger.info(
+                    "  %s (%s): typical=%.2f kW, occupancy=%.0f%%, available_flex=%.2f kW (factor=%.0f%%)",
+                    asset_id, info["description"],
+                    info["typical_load_kw"], occupancy * 100,
+                    info["available_flexibility_kw"], info["flexibility_factor"] * 100
+                )
+            elif temp_adjusted_load is not None:
+                # Heat pump with temperature-adjusted estimate
+                logger.info(
+                    "  %s (%s): time_based=%.2f kW, temp_adjusted=%.2f kW @ %.1f°C, available_flex=%.2f kW (method=%s)",
+                    asset_id, info["description"],
+                    info["typical_load_kw"], temp_adjusted_load, forecast_temp,
+                    info["available_flexibility_kw"], estimation_method
+                )
+            else:
+                # Standard time-based estimate
+                logger.info(
+                    "  %s (%s): typical=%.2f kW, available_flex=%.2f kW (factor=%.0f%%, method=%s)",
+                    asset_id, info["description"],
+                    info["typical_load_kw"], info["available_flexibility_kw"],
+                    info["flexibility_factor"] * 100, estimation_method
+                )
+            total_available_flex_kw += info["available_flexibility_kw"]
+
     total_available_flex_mw = total_available_flex_kw / 1000
     logger.info("-" * 70)
-    logger.info("TOTAL AVAILABLE FLEXIBILITY: %.3f kW (%.6f MW)", 
-                total_available_flex_kw, total_available_flex_mw)
+    logger.info(
+        "PORTFOLIO AVAILABLE FLEXIBILITY (%s): %.3f kW (%.6f MW)",
+        (
+            "all assigned assets before strategy filter"
+            if use_strategy_mode
+            else "all assigned assets"
+        ),
+        total_available_flex_kw,
+        total_available_flex_mw,
+    )
     
     # Log DSO demands
     logger.info("-" * 70)
@@ -822,16 +1130,22 @@ if __name__ == "__main__":
         bid_params = strategy.get_bid_parameters(slot_time)
         fsp_min_price = bid_params.get("bid_price")
     
-    # Compare available flexibility vs DSO demand
-    logger.info("-" * 70)
-    can_meet_demand = total_available_flex_mw >= total_dso_demand_up
-    logger.info(
-        "CAN MEET DSO DEMAND (Up): %s (available=%.3f MW, required=%.3f MW)",
-        "YES" if can_meet_demand else "NO",
-        total_available_flex_mw,
-        total_dso_demand_up
-    )
-    logger.info("=" * 70)
+    if use_strategy_mode and strategy:
+        logger.info(
+            "Strategy-mode DSO feasibility will be checked after applying selected strategy asset filters."
+        )
+        logger.info("=" * 70)
+    else:
+        # Compare available flexibility vs DSO demand
+        logger.info("-" * 70)
+        can_meet_demand = total_available_flex_mw >= total_dso_demand_up
+        logger.info(
+            "CAN MEET DSO DEMAND (Up): %s (available=%.3f MW, required=%.3f MW)",
+            "YES" if can_meet_demand else "NO",
+            total_available_flex_mw,
+            total_dso_demand_up
+        )
+        logger.info("=" * 70)
 
     # Save demand record (DSO request) BEFORE placing orders
     demand_record_id = None
@@ -887,7 +1201,21 @@ if __name__ == "__main__":
             # Build assets_to_activate list
             # Convert numpy types to native Python types to avoid SQL issues
             assets_to_activate = []
-            if use_strategy_mode and strategy:
+            if use_strategy_mode and strategy and portfolio_strategy_contexts is not None:
+                added_assets = set()
+                for portfolio_context in portfolio_strategy_contexts.values():
+                    for asset_id, info in portfolio_context.get("asset_breakdown", {}).items():
+                        if asset_id in added_assets:
+                            continue
+                        added_assets.add(asset_id)
+                        assets_to_activate.append({
+                            "asset_id": asset_id,
+                            "description": info.get("description", asset_id),
+                            "asset_type": info.get("asset_type", "unknown"),
+                            "available_flexibility_kw": float(info.get("available_flexibility_kw", 0)),
+                            "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+                        })
+            elif use_strategy_mode and strategy:
                 for asset_id, info in asset_breakdown.items():
                     if strategy.is_asset_allowed(asset_id):
                         assets_to_activate.append({
@@ -931,12 +1259,14 @@ if __name__ == "__main__":
             strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             asset_breakdown, flex_forecaster, dry_run, logger, 
             bid_record_id=bid_record_id, demand_record_id=demand_record_id,
-            force_strategy_bid=force_strategy_bid
+            force_strategy_bid=force_strategy_bid,
+            portfolio_strategy_contexts=portfolio_strategy_contexts,
         )
     else:
         orders_summary = run_simple_mode(
             fsp, fmo, dso_demands, slot_time, total_available_flex_mw, dry_run, logger, 
-            bid_record_id=bid_record_id, demand_record_id=demand_record_id
+            bid_record_id=bid_record_id, demand_record_id=demand_record_id,
+            portfolio_flexibility_mw_map=portfolio_flexibility_mw_map,
         )
         used_strategy = None
 
