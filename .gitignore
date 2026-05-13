@@ -12,6 +12,7 @@ data/energy_signature/*
 data/pvgis/*
 data/*.json
 data/baseline*
+prompts/*
 outputs/*
 tkns/*
 .env

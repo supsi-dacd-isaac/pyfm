@@ -423,12 +423,23 @@ class Player:
             )
             return False
 
-    def sell_flexibility(self, dt, p_id, dso_demand):
+    def sell_flexibility(self, dt, p_id, dso_demand, max_quantity_mw=None):
         selling_result = {}
         for k_regulation_type in ["Up", "Down"]:
             quantity_to_sell = self.calculate_quantity_to_sell_basic(
                 dt, dso_demand[k_regulation_type], self.baselines[p_id]["quantity"]
             )
+            if max_quantity_mw is not None:
+                capped_quantity = min(quantity_to_sell, max_quantity_mw)
+                if capped_quantity < quantity_to_sell:
+                    self.logger.info(
+                        "Capping portfolio %s %s bid from %.3f MW to configured maximum %.3f MW",
+                        p_id,
+                        k_regulation_type,
+                        quantity_to_sell,
+                        max_quantity_mw,
+                    )
+                quantity_to_sell = capped_quantity
 
             self.logger.info(
                 "Portfolio: %s, Regulation: %s, Bidded flexibility: %s"

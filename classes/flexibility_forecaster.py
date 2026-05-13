@@ -24,13 +24,20 @@ class FlexibilityForecaster:
     - temperature: defines temperature data source and forecast settings
     """
 
-    def __init__(self, main_cfg: dict, influx_client, logger):
+    def __init__(
+        self,
+        main_cfg: dict,
+        influx_client,
+        logger,
+        method_override: Optional[str] = None,
+    ):
         """
         Initialize the FlexibilityForecaster.
         
         :param main_cfg: Main configuration dictionary
         :param influx_client: InfluxDB client for historical queries
         :param logger: Logger instance
+        :param method_override: Optional flexibility method for the current caller
         """
         self.main_cfg = main_cfg
         self.influx_client = influx_client
@@ -51,6 +58,26 @@ class FlexibilityForecaster:
         # Other flexibility settings
         self.historical_days_back = flex_cfg.get("historical_days_back", 30)
         self.default_flexibility_factor = flex_cfg.get("default_flexibility_factor", 0.50)
+        self.method = method_override or flex_cfg.get("method", "historical")
+        self.assets_measurement = main_cfg.get("influxDB", {}).get(
+            "assetsMeasurement", "assets_data"
+        )
+        persistence_cfg = flex_cfg.get("persistenceSettings", {})
+        self.persistence_go_back_minutes = int(
+            persistence_cfg.get("persistenceGoBackMinutes", 90)
+        )
+        self.persistence_active_threshold_w = float(
+            persistence_cfg.get("activeThresholdW", 500)
+        )
+        self.default_persistence_safety_factor = float(
+            persistence_cfg.get("defaultSafetyFactor", 1.0)
+        )
+        self.persistence_missing_measurement_policy = persistence_cfg.get(
+            "missingMeasurementPolicy", "skip_asset"
+        )
+        self.max_current_measurement_age_minutes = int(
+            persistence_cfg.get("maxCurrentMeasurementAgeMinutes", 30)
+        )
         
         # Temperature configuration
         temp_cfg = flex_cfg.get("temperature", {})
@@ -90,6 +117,16 @@ class FlexibilityForecaster:
             f"{self.morning_peak[0]:02d}:00", f"{self.morning_peak[1]:02d}:00",
             f"{self.evening_peak[0]:02d}:00", f"{self.evening_peak[1]:02d}:00"
         )
+        self.logger.info("Flexibility method: %s", self.method)
+        if self.method == "persistence":
+            self.logger.info(
+                "Persistence flexibility settings: go_back=%s min, activeThresholdW=%.1f, defaultSafetyFactor=%.3f, missingMeasurementPolicy=%s, maxCurrentMeasurementAgeMinutes=%s",
+                self.persistence_go_back_minutes,
+                self.persistence_active_threshold_w,
+                self.default_persistence_safety_factor,
+                self.persistence_missing_measurement_policy,
+                self.max_current_measurement_age_minutes,
+            )
         
         if self.temperature_enabled:
             self.logger.info("Temperature-aware HP analysis: ENABLED")
@@ -899,11 +936,329 @@ class FlexibilityForecaster:
         self.logger.info("-" * 70)
         self.logger.info("Confidence: %s", dict(confidence_counts))
         self.logger.info("=" * 70)
-    
+
+    def _validate_persistence_alignment(
+        self,
+        persistence_go_back_minutes: int,
+        config_key: str = "persistenceGoBackMinutes",
+    ) -> bool:
+        if persistence_go_back_minutes <= 0:
+            self.logger.error(
+                "Invalid %s=%s; value must be positive",
+                config_key,
+                persistence_go_back_minutes,
+            )
+            return False
+        if persistence_go_back_minutes % self.granularity != 0:
+            self.logger.error(
+                "Invalid %s=%s for fm.granularity=%s; values must align exactly",
+                config_key,
+                persistence_go_back_minutes,
+                self.granularity,
+            )
+            return False
+        return True
+
+    def _resolve_asset_flexibility_go_back_minutes(
+        self, asset_id: str, mapping: Dict
+    ) -> Optional[int]:
+        raw_value = mapping.get(
+            "flexibility_persistence_go_back_minutes",
+            self.persistence_go_back_minutes,
+        )
+        try:
+            go_back_minutes = int(raw_value)
+        except (TypeError, ValueError):
+            self.logger.error(
+                "Invalid asset_mapping.%s.flexibility_persistence_go_back_minutes=%s; value must be an integer",
+                asset_id,
+                raw_value,
+            )
+            return None
+        if self._validate_persistence_alignment(
+            go_back_minutes,
+            "asset_mapping.%s.flexibility_persistence_go_back_minutes" % asset_id,
+        ) is False:
+            return None
+        return go_back_minutes
+
+    def _resolve_asset_query_info(self, asset_id: str) -> Optional[Dict]:
+        mapping = self.asset_mapping.get(asset_id, {})
+        if not isinstance(mapping, dict):
+            self.logger.warning(
+                "Asset %s uses legacy asset_mapping format; persistence query skipped",
+                asset_id,
+            )
+            return None
+
+        device_name = mapping.get("device_name_tag")
+        if not device_name:
+            self.logger.warning(
+                "Asset %s missing asset_mapping.device_name_tag; persistence query skipped",
+                asset_id,
+            )
+            return None
+
+        field = mapping.get("field", "active_power")
+        site = mapping.get("pod", asset_id.split(".")[0])
+        return {
+            "site": site,
+            "device_name": device_name,
+            "field": field,
+        }
+
+    def _query_grouped_asset_series(
+        self,
+        asset_id: str,
+        start_time_utc: datetime,
+        end_time_utc: datetime,
+    ) -> Optional[pd.Series]:
+        query_info = self._resolve_asset_query_info(asset_id)
+        if query_info is None:
+            return pd.Series(dtype=float)
+
+        query = (
+            f"SELECT MEAN({query_info['field']}) as mean_power FROM {self.assets_measurement} "
+            f"WHERE time >= '{start_time_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+            f"AND time < '{end_time_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+            f"AND site='{query_info['site']}' AND device_name='{query_info['device_name']}' "
+            f"GROUP BY time({self.granularity}m) fill(none)"
+        )
+        self.logger.info("Persistence query for %s: %s", asset_id, query)
+
+        try:
+            result = self.influx_client.query(query)
+        except Exception as exc:
+            self.logger.error("Persistence query failed for %s: %s", asset_id, exc)
+            return None
+
+        rows = {}
+        for series in result.raw.get("series", []):
+            columns = series.get("columns", [])
+            values = series.get("values", [])
+            if "time" not in columns or "mean_power" not in columns:
+                continue
+
+            time_idx = columns.index("time")
+            value_idx = columns.index("mean_power")
+            for row in values:
+                timestamp_raw = row[time_idx]
+                value_raw = row[value_idx]
+                if timestamp_raw is None or value_raw is None:
+                    continue
+                timestamp = pd.to_datetime(timestamp_raw, utc=True, errors="coerce")
+                if pd.isna(timestamp):
+                    continue
+                rows[timestamp] = float(value_raw)
+
+        if not rows:
+            return pd.Series(dtype=float)
+
+        series = pd.Series(rows, dtype=float)
+        series.sort_index(inplace=True)
+        return series
+
+    def _get_latest_grouped_measurement(
+        self,
+        asset_id: str,
+        current_time_utc: datetime,
+        max_age_minutes: int,
+    ) -> Tuple[Optional[pd.Timestamp], Optional[float], Optional[float]]:
+        window_start_utc = current_time_utc - timedelta(minutes=max_age_minutes)
+        series = self._query_grouped_asset_series(
+            asset_id=asset_id,
+            start_time_utc=window_start_utc,
+            end_time_utc=current_time_utc,
+        )
+        if series is None or series.empty:
+            return None, None, None
+
+        measurement_time_utc = series.index[-1]
+        measurement_value_w = float(series.iloc[-1])
+        age_minutes = (
+            current_time_utc - measurement_time_utc.to_pydatetime().replace(tzinfo=None)
+        ).total_seconds() / 60.0
+        return measurement_time_utc, measurement_value_w, age_minutes
+
+    def _get_asset_flexibility_breakdown_persistence(
+        self,
+        period_from: datetime,
+        current_time_utc: Optional[datetime] = None,
+        asset_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Dict]:
+        if current_time_utc is None:
+            current_time_utc = datetime.utcnow()
+
+        if self._validate_persistence_alignment(self.persistence_go_back_minutes) is False:
+            return {}
+
+        selected_asset_ids = asset_ids or list(self.asset_capacities.keys())
+        breakdown = {}
+        target_slot_utc = pd.Timestamp(period_from, tz="UTC")
+
+        for asset_id in selected_asset_ids:
+            mapping = self.asset_mapping.get(asset_id, {})
+            if not isinstance(mapping, dict):
+                self.logger.warning(
+                    "Skipping persistence flexibility for %s: legacy asset_mapping entry is not supported",
+                    asset_id,
+                )
+                continue
+
+            nominal_power_w = mapping.get("nominal_power_w")
+            if nominal_power_w is None:
+                self.logger.warning(
+                    "Skipping persistence flexibility for %s: nominal_power_w is not configured",
+                    asset_id,
+                )
+                continue
+
+            safety_factor = float(
+                mapping.get(
+                    "persistence_safety_factor",
+                    self.default_persistence_safety_factor,
+                )
+            )
+            asset_go_back_minutes = self._resolve_asset_flexibility_go_back_minutes(
+                asset_id, mapping
+            )
+            if asset_go_back_minutes is None:
+                if self.persistence_missing_measurement_policy == "fail_portfolio":
+                    return {}
+                continue
+
+            baseline_source_time_utc = target_slot_utc - pd.Timedelta(
+                minutes=asset_go_back_minutes
+            )
+            baseline_source_end_utc = baseline_source_time_utc + pd.Timedelta(
+                minutes=self.granularity
+            )
+            asset_type = mapping.get("type", "unknown")
+            description = self.asset_descriptions.get(asset_id, asset_id)
+
+            self.logger.info(
+                "Persistence flexibility asset=%s target_slot_utc=%s flexibility_go_back_minutes=%s baseline_source_time_utc=%s",
+                asset_id,
+                target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                asset_go_back_minutes,
+                baseline_source_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+
+            baseline_series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=baseline_source_time_utc.to_pydatetime(),
+                end_time_utc=baseline_source_end_utc.to_pydatetime(),
+            )
+            if baseline_series is None:
+                continue
+
+            baseline_lookup = baseline_series.reindex(
+                pd.DatetimeIndex([baseline_source_time_utc])
+            )
+            baseline_power_w = baseline_lookup.iloc[0]
+            if pd.isna(baseline_power_w):
+                self.logger.warning(
+                    "Skipping persistence flexibility for asset=%s target_slot=%s baseline_source_time=%s flexibility_go_back_minutes=%s: source measurement is missing",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    baseline_source_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    asset_go_back_minutes,
+                )
+                if self.persistence_missing_measurement_policy == "fail_portfolio":
+                    return {}
+                continue
+
+            gate_measurement_time_utc, current_measured_power_w, current_measurement_age_minutes = (
+                self._get_latest_grouped_measurement(
+                    asset_id=asset_id,
+                    current_time_utc=current_time_utc,
+                    max_age_minutes=self.max_current_measurement_age_minutes,
+                )
+            )
+            if gate_measurement_time_utc is None or current_measured_power_w is None:
+                self.logger.warning(
+                    "Skipping persistence flexibility for asset=%s target_slot=%s: current gate measurement is missing",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                continue
+
+            if current_measurement_age_minutes is None or current_measurement_age_minutes > self.max_current_measurement_age_minutes:
+                self.logger.warning(
+                    "Skipping persistence flexibility for asset=%s target_slot=%s: current gate measurement is too old (timestamp=%s age=%.1f min, max=%s min)",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    gate_measurement_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    current_measurement_age_minutes or float("nan"),
+                    self.max_current_measurement_age_minutes,
+                )
+                continue
+
+            baseline_power_w = float(baseline_power_w)
+            current_measured_power_w = float(current_measured_power_w)
+            nominal_power_w = float(nominal_power_w)
+            is_currently_active = current_measured_power_w > self.persistence_active_threshold_w
+            if is_currently_active:
+                available_flexibility_w = safety_factor * min(
+                    baseline_power_w,
+                    nominal_power_w,
+                )
+            else:
+                available_flexibility_w = 0.0
+
+            self.logger.info(
+                "Persistence flexibility asset=%s target_slot_utc=%s flexibility_go_back_minutes=%s baseline_source_time_utc=%s gate_measurement_time_utc=%s baseline_power_w=%.2f current_measured_power_w=%.2f active=%s nominal_power_w=%.2f safety_factor=%.3f flexibility_w=%.2f",
+                asset_id,
+                target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                asset_go_back_minutes,
+                baseline_source_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                gate_measurement_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                baseline_power_w,
+                current_measured_power_w,
+                is_currently_active,
+                nominal_power_w,
+                safety_factor,
+                available_flexibility_w,
+            )
+
+            breakdown[asset_id] = {
+                "description": description,
+                "asset_type": asset_type,
+                "nominal_capacity_kw": nominal_power_w / 1000,
+                "typical_load_kw": baseline_power_w / 1000,
+                "baseline_power_w": baseline_power_w,
+                "baseline_source_time_utc": baseline_source_time_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "flexibility_persistence_go_back_minutes": asset_go_back_minutes,
+                "current_measured_power_w": current_measured_power_w,
+                "gate_measurement_time_utc": gate_measurement_time_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "current_measurement_age_minutes": current_measurement_age_minutes,
+                "active_threshold_w": self.persistence_active_threshold_w,
+                "is_currently_active": is_currently_active,
+                "safety_factor": safety_factor,
+                "flexibility_factor": safety_factor,
+                "nominal_power_w": nominal_power_w,
+                "occupancy_probability": None,
+                "available_flexibility_w": available_flexibility_w,
+                "available_flexibility_kw": available_flexibility_w / 1000,
+                "max_flexibility_kw": (safety_factor * nominal_power_w) / 1000,
+                "estimation_method": "persistence",
+                "is_available_for_flexibility": bool(
+                    is_currently_active and available_flexibility_w > 0
+                ),
+            }
+
+        return breakdown
+
     def get_asset_flexibility_breakdown(
         self, 
         period_from: datetime,
-        use_temperature: bool = True
+        use_temperature: bool = True,
+        asset_ids: Optional[List[str]] = None,
+        current_time_utc: Optional[datetime] = None,
     ) -> Dict[str, Dict]:
         """
         Get detailed flexibility breakdown per asset for a specific 15-minute slot.
@@ -918,6 +1273,13 @@ class FlexibilityForecaster:
         :param use_temperature: Whether to use temperature-based HP estimation
         :return: Dictionary with per-asset flexibility info
         """
+        if self.method == "persistence":
+            return self._get_asset_flexibility_breakdown_persistence(
+                period_from=period_from,
+                current_time_utc=current_time_utc,
+                asset_ids=asset_ids,
+            )
+
         slot_idx = period_from.hour * 4 + period_from.minute // 15
         is_weekend = period_from.weekday() >= 5
         day_type = "weekend" if is_weekend else "weekday"
@@ -938,7 +1300,9 @@ class FlexibilityForecaster:
         
         breakdown = {}
         
-        for asset_id in self.asset_capacities.keys():
+        selected_asset_ids = asset_ids or list(self.asset_capacities.keys())
+
+        for asset_id in selected_asset_ids:
             mapping = self.asset_mapping.get(asset_id, {})
             asset_type = mapping.get("type", "") if isinstance(mapping, dict) else ""
             
@@ -1121,7 +1485,9 @@ class FlexibilityForecaster:
         
         for asset_id, info in discrete_assets.items():
             # Get the discrete states for this asset
-            states = self._get_discrete_states(asset_id)
+            states = info.get("states_kw", self._get_discrete_states(asset_id))
+            if states is None:
+                states = self._get_discrete_states(asset_id)
             available = info.get("available", True)
             
             if not available:
@@ -1158,7 +1524,9 @@ class FlexibilityForecaster:
         period_from: datetime,
         target_kw: float = None,
         allowed_assets: List[str] = None,
-        use_temperature: bool = True
+        use_temperature: bool = True,
+        asset_ids: Optional[List[str]] = None,
+        current_time_utc: Optional[datetime] = None,
     ) -> Dict:
         """
         Calculate achievable flexibility considering discrete asset constraints.
@@ -1181,7 +1549,12 @@ class FlexibilityForecaster:
             - 'continuous_assets': List of continuous asset IDs
         """
         # Get base asset breakdown
-        breakdown = self.get_asset_flexibility_breakdown(period_from, use_temperature)
+        breakdown = self.get_asset_flexibility_breakdown(
+            period_from,
+            use_temperature,
+            asset_ids=asset_ids,
+            current_time_utc=current_time_utc,
+        )
         
         # Filter by allowed assets if specified
         if allowed_assets:
@@ -1199,13 +1572,23 @@ class FlexibilityForecaster:
             flex_factor = info.get("flexibility_factor", 0.5)
             nominal_kw = info.get("nominal_capacity_kw", 0)
             
-            # For discrete assets, availability is probabilistic
-            # We consider it "available" if flex_factor > threshold
-            is_available = flex_factor >= 0.5  # 50% threshold
+            if self.method == "persistence":
+                is_available = info.get(
+                    "is_available_for_flexibility", available_flex > 0
+                )
+            else:
+                # For discrete assets, availability is probabilistic
+                # We consider it "available" if flex_factor > threshold
+                is_available = flex_factor >= 0.5  # 50% threshold
             
             if mod_type == "discrete":
+                if self.method == "persistence":
+                    states_kw = [0.0, available_flex]
+                else:
+                    states_kw = None
                 discrete_assets[asset_id] = {
                     "capacity_kw": nominal_kw,
+                    "states_kw": states_kw,
                     "available": is_available,
                     "availability_prob": flex_factor,
                     "info": info
