@@ -62,6 +62,8 @@ class RabbitMQPublisher:
         virtual_host: str = "/",
         exchange: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
+        queue: Optional[str] = None,
+        routing_key: Optional[str] = None,
     ):
         if not RABBITMQ_AVAILABLE:
             raise RuntimeError("pika library not installed. Run: pip install pika")
@@ -72,6 +74,10 @@ class RabbitMQPublisher:
         self.password = password
         self.virtual_host = virtual_host
         self.exchange = exchange or self.DEFAULT_EXCHANGE
+        self.queue = queue or self.DEFAULT_QUEUE_COMMANDS
+        self.routing_key = routing_key
+        self.command_binding_key = routing_key or "commands.#"
+        self.batch_routing_key = routing_key or "commands.batch.header"
         self.logger = logger or logging.getLogger(__name__)
 
         self.connection = None
@@ -100,7 +106,7 @@ class RabbitMQPublisher:
                 durable=True,
             )
             self.channel.queue_declare(
-                queue=self.DEFAULT_QUEUE_COMMANDS,
+                queue=self.queue,
                 durable=True,
             )
             self.channel.queue_declare(
@@ -109,8 +115,8 @@ class RabbitMQPublisher:
             )
             self.channel.queue_bind(
                 exchange=self.exchange,
-                queue=self.DEFAULT_QUEUE_COMMANDS,
-                routing_key="commands.#",
+                queue=self.queue,
+                routing_key=self.command_binding_key,
             )
             self.channel.queue_bind(
                 exchange=self.exchange,
@@ -120,10 +126,12 @@ class RabbitMQPublisher:
 
             self._connected = True
             self.logger.info(
-                "Connected to RabbitMQ at %s:%d (exchange: %s)",
+                "Connected to RabbitMQ at %s:%d (exchange: %s, queue: %s, routing_key: %s)",
                 self.host,
                 self.port,
                 self.exchange,
+                self.queue,
+                self.command_binding_key,
             )
             return True
 
@@ -159,7 +167,7 @@ class RabbitMQPublisher:
             self.logger.warning("Not connected to RabbitMQ - cannot publish command")
             return False
 
-        routing_key = f"commands.{asset_type}.{asset_id}"
+        routing_key = self.routing_key or f"commands.{asset_type}.{asset_id}"
         message = {
             "message_type": "command",
             "asset_id": asset_id,
@@ -211,7 +219,7 @@ class RabbitMQPublisher:
             try:
                 self.channel.basic_publish(
                     exchange=self.exchange,
-                    routing_key="commands.batch.header",
+                    routing_key=self.batch_routing_key,
                     body=json.dumps(batch_header),
                     properties=pika.BasicProperties(
                         delivery_mode=2,
@@ -278,6 +286,28 @@ def _load_config(config_path: str, logger: logging.Logger) -> dict:
     except json.JSONDecodeError as exc:
         logger.error("Invalid JSON in configuration file: %s", str(exc))
         sys.exit(1)
+
+
+def _load_rabbitmq_config(config: dict, config_path: str, logger: logging.Logger) -> dict:
+    """Load RabbitMQ settings from the configured connections file, if present."""
+    conns_path = config.get("connectionsFile")
+    if not conns_path:
+        return {}
+
+    if not os.path.isabs(conns_path):
+        conns_path = os.path.normpath(os.path.join(os.path.dirname(config_path), conns_path))
+
+    try:
+        with open(conns_path, "r") as handle:
+            conns = json.load(handle)
+    except FileNotFoundError:
+        logger.warning("Connections file not found: %s", conns_path)
+        return {}
+    except json.JSONDecodeError as exc:
+        logger.warning("Invalid JSON in connections file: %s", str(exc))
+        return {}
+
+    return conns.get("rabbitMQ", {})
 
 
 def _collect_flexibilities(args) -> List[str]:
@@ -786,34 +816,46 @@ Examples:
     )
     parser.add_argument(
         "--rabbitmq-host",
-        default="localhost",
+        default=None,
         help="RabbitMQ server hostname (default: localhost)",
     )
     parser.add_argument(
         "--rabbitmq-port",
         type=int,
-        default=5672,
+        default=None,
         help="RabbitMQ server port (default: 5672)",
     )
     parser.add_argument(
         "--rabbitmq-user",
-        default="guest",
+        default=None,
         help="RabbitMQ username (default: guest)",
     )
     parser.add_argument(
         "--rabbitmq-pass",
-        default="guest",
+        default=None,
         help="RabbitMQ password (default: guest)",
     )
     parser.add_argument(
         "--rabbitmq-vhost",
-        default="/",
+        default=None,
         help="RabbitMQ virtual host (default: /)",
     )
     parser.add_argument(
         "--rabbitmq-exchange",
-        default=RabbitMQPublisher.DEFAULT_EXCHANGE,
+        default=None,
         help=f"RabbitMQ exchange name (default: {RabbitMQPublisher.DEFAULT_EXCHANGE})",
+    )
+    parser.add_argument(
+        "--rabbit-exchange",
+        help="Override RabbitMQ exchange name for this actuator command",
+    )
+    parser.add_argument(
+        "--rabbit-queue",
+        help="Override RabbitMQ queue name for this actuator command",
+    )
+    parser.add_argument(
+        "--rabbit-routing-key",
+        help="Override RabbitMQ routing key for publishing and command queue binding",
     )
 
     args = parser.parse_args()
@@ -829,6 +871,8 @@ Examples:
 
     config_path = _resolve_config_path(args.config_file)
     config = _load_config(config_path, logger)
+    rabbitmq_config = _load_rabbitmq_config(config, config_path, logger)
+    rabbitmq_command_config = rabbitmq_config.get("realAssetCommands", {})
 
     fsps = config.get("fm", {}).get("actors", {}).get("fsps", {})
     if args.fsp not in fsps:
@@ -890,6 +934,40 @@ Examples:
         logger=logger,
     )
 
+    rabbit_host = args.rabbitmq_host or rabbitmq_config.get("host") or "localhost"
+    rabbit_port = args.rabbitmq_port
+    if rabbit_port is None:
+        rabbit_port = int(rabbitmq_config.get("port", 5672) or 5672)
+    rabbit_user = args.rabbitmq_user or rabbitmq_config.get("username") or rabbitmq_config.get("user") or "guest"
+    rabbit_password = args.rabbitmq_pass or rabbitmq_config.get("password") or "guest"
+    rabbit_vhost = args.rabbitmq_vhost or rabbitmq_config.get("virtualHost") or rabbitmq_config.get("virtual_host") or "/"
+    rabbit_exchange = (
+        args.rabbit_exchange
+        or args.rabbitmq_exchange
+        or rabbitmq_command_config.get("exchange")
+        or rabbitmq_config.get("exchange")
+        or RabbitMQPublisher.DEFAULT_EXCHANGE
+    )
+    rabbit_queue = (
+        args.rabbit_queue
+        or rabbitmq_command_config.get("queue")
+        or rabbitmq_config.get("queue")
+        or RabbitMQPublisher.DEFAULT_QUEUE_COMMANDS
+    )
+    rabbit_routing_key = (
+        args.rabbit_routing_key
+        or rabbitmq_command_config.get("routingKey")
+        or rabbitmq_command_config.get("routing_key")
+        or rabbitmq_config.get("routingKey")
+        or rabbitmq_config.get("routing_key")
+    )
+    logger.info(
+        "RabbitMQ destination: exchange=%s, queue=%s, routing_key=%s",
+        rabbit_exchange,
+        rabbit_queue,
+        rabbit_routing_key or "commands.{asset_type}.{asset_id}",
+    )
+
     if args.dry_run:
         logger.info("[DRY-RUN] Final slot_info:\n%s", json.dumps(slot_info, indent=2))
         logger.info("[DRY-RUN] Final command envelopes:\n%s", json.dumps(commands, indent=2))
@@ -901,13 +979,15 @@ Examples:
         sys.exit(1)
 
     publisher = RabbitMQPublisher(
-        host=args.rabbitmq_host,
-        port=args.rabbitmq_port,
-        username=args.rabbitmq_user,
-        password=args.rabbitmq_pass,
-        virtual_host=args.rabbitmq_vhost,
-        exchange=args.rabbitmq_exchange,
+        host=rabbit_host,
+        port=rabbit_port,
+        username=rabbit_user,
+        password=rabbit_password,
+        virtual_host=rabbit_vhost,
+        exchange=rabbit_exchange,
         logger=logger,
+        queue=rabbit_queue,
+        routing_key=rabbit_routing_key,
     )
 
     try:
