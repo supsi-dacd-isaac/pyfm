@@ -43,7 +43,22 @@ Use `--dry-run` to validate the command envelope without publishing to RabbitMQ:
 python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --command force_off --dry-run
 ```
 
-Dry-run output includes the generated `slot_info`, command envelopes, and the RabbitMQ destination that would be used.
+Dry-run output logs the requested actuator payload, queued commands, RabbitMQ destination, and the fact that publishing was skipped.
+
+## Verbose RabbitMQ JSON
+
+Use `--verbose` to print the RabbitMQ JSON message body strings. In live mode, these are the bodies sent to RabbitMQ. In dry-run mode, these are the bodies that would be sent.
+
+```bash
+python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi02 --flexibilities ECM97.1 --command force_off --dry-run --verbose
+```
+
+Verbose output includes the batch header message and each command message:
+
+```text
+RabbitMQ batch header JSON (routing_key=real_asset.command): {...}
+RabbitMQ command JSON (routing_key=real_asset.command): {...}
+```
 
 ## RabbitMQ Configuration
 
@@ -125,6 +140,12 @@ Send to a custom exchange, queue, and routing key:
 
 ```bash
 python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --command force_off --rabbit-exchange flexi_sim_commands --rabbit-queue flexi_sim_commands_queue --rabbit-routing-key sim_asset.command
+```
+
+Print the RabbitMQ JSON without publishing:
+
+```bash
+python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi02 --flexibilities ECM97.1 --command force_off --dry-run --verbose
 ```
 
 Restore an asset:

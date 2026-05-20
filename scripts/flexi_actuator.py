@@ -43,6 +43,61 @@ MODULATION_DEFAULTS = {
 DEFAULT_EV_INTERVAL_MINUTES = 15
 
 
+def _build_rabbitmq_batch_header(slot_info: dict, command_count: int) -> dict:
+    """Build the RabbitMQ batch header message."""
+    return {
+        "message_type": "batch_start",
+        "slot_info": slot_info,
+        "command_count": command_count,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _build_rabbitmq_command_message(
+    asset_id: str,
+    asset_type: str,
+    command_type: str,
+    payload: dict,
+    priority: int,
+) -> dict:
+    """Build the RabbitMQ command message body."""
+    return {
+        "message_type": "command",
+        "asset_id": asset_id,
+        "asset_type": asset_type,
+        "command_type": command_type,
+        "payload": payload,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "priority": priority,
+    }
+
+
+def _log_rabbitmq_messages(
+    commands: List[dict],
+    slot_info: Optional[dict],
+    routing_key: Optional[str],
+    batch_routing_key: str,
+    logger: logging.Logger,
+) -> None:
+    """Log the RabbitMQ JSON body strings that will be published."""
+    if slot_info:
+        batch_body = json.dumps(_build_rabbitmq_batch_header(slot_info, len(commands)))
+        logger.info("RabbitMQ batch header JSON (routing_key=%s): %s", batch_routing_key, batch_body)
+
+    for command in commands:
+        command_routing_key = routing_key or f"commands.{command.get('asset_type')}.{command.get('asset_id')}"
+        command_body = json.dumps(
+            _build_rabbitmq_command_message(
+                asset_id=command.get("asset_id"),
+                asset_type=command.get("asset_type"),
+                command_type=command.get("command_type"),
+                payload=command.get("payload", {}),
+                priority=command.get("priority", 5),
+            )
+        )
+        logger.info("RabbitMQ command JSON (routing_key=%s): %s", command_routing_key, command_body)
+
+
 class RabbitMQPublisher:
     """
     Publishes control commands to RabbitMQ using the same exchange, queue,
@@ -161,6 +216,7 @@ class RabbitMQPublisher:
         command_type: str,
         payload: dict,
         priority: int = 5,
+        verbose: bool = False,
     ) -> bool:
         """Publish a control command to RabbitMQ."""
         if not self.is_connected():
@@ -168,21 +224,16 @@ class RabbitMQPublisher:
             return False
 
         routing_key = self.routing_key or f"commands.{asset_type}.{asset_id}"
-        message = {
-            "message_type": "command",
-            "asset_id": asset_id,
-            "asset_type": asset_type,
-            "command_type": command_type,
-            "payload": payload,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "priority": priority,
-        }
+        message = _build_rabbitmq_command_message(asset_id, asset_type, command_type, payload, priority)
+        body = json.dumps(message)
 
         try:
+            if verbose:
+                self.logger.info("RabbitMQ command JSON (routing_key=%s): %s", routing_key, body)
             self.channel.basic_publish(
                 exchange=self.exchange,
                 routing_key=routing_key,
-                body=json.dumps(message),
+                body=body,
                 properties=pika.BasicProperties(
                     delivery_mode=2,
                     content_type="application/json",
@@ -201,7 +252,12 @@ class RabbitMQPublisher:
             self.logger.error("Failed to publish command: %s", str(exc))
             return False
 
-    def publish_batch_commands(self, commands: List[dict], slot_info: Optional[dict] = None) -> int:
+    def publish_batch_commands(
+        self,
+        commands: List[dict],
+        slot_info: Optional[dict] = None,
+        verbose: bool = False,
+    ) -> int:
         """Publish multiple commands as a batch."""
         if not self.is_connected():
             self.logger.warning("Not connected to RabbitMQ - cannot publish batch")
@@ -210,17 +266,19 @@ class RabbitMQPublisher:
         success_count = 0
 
         if slot_info:
-            batch_header = {
-                "message_type": "batch_start",
-                "slot_info": slot_info,
-                "command_count": len(commands),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
+            batch_header = _build_rabbitmq_batch_header(slot_info, len(commands))
+            body = json.dumps(batch_header)
             try:
+                if verbose:
+                    self.logger.info(
+                        "RabbitMQ batch header JSON (routing_key=%s): %s",
+                        self.batch_routing_key,
+                        body,
+                    )
                 self.channel.basic_publish(
                     exchange=self.exchange,
                     routing_key=self.batch_routing_key,
-                    body=json.dumps(batch_header),
+                    body=body,
                     properties=pika.BasicProperties(
                         delivery_mode=2,
                         content_type="application/json",
@@ -236,6 +294,7 @@ class RabbitMQPublisher:
                 command_type=cmd.get("command_type"),
                 payload=cmd.get("payload", {}),
                 priority=cmd.get("priority", 5),
+                verbose=verbose,
             ):
                 success_count += 1
 
@@ -742,10 +801,11 @@ def _publish_commands(
     slot_info: dict,
     dry_run: bool,
     logger: logging.Logger,
+    verbose: bool = False,
 ) -> int:
     """Publish already-prepared commands to RabbitMQ."""
     logger.info("Publishing %d commands to RabbitMQ (dry_run=%s)...", len(commands), dry_run)
-    return publisher.publish_batch_commands(commands, slot_info=slot_info)
+    return publisher.publish_batch_commands(commands, slot_info=slot_info, verbose=verbose)
 
 
 def main():
@@ -803,6 +863,11 @@ Examples:
         "--dry-run",
         action="store_true",
         help="Print/log the generated payload without publishing to RabbitMQ",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print RabbitMQ JSON message bodies sent, or that would be sent in dry-run mode",
     )
     parser.add_argument(
         "--log-level",
@@ -969,8 +1034,14 @@ Examples:
     )
 
     if args.dry_run:
-        logger.info("[DRY-RUN] Final slot_info:\n%s", json.dumps(slot_info, indent=2))
-        logger.info("[DRY-RUN] Final command envelopes:\n%s", json.dumps(commands, indent=2))
+        if args.verbose:
+            _log_rabbitmq_messages(
+                commands=commands,
+                slot_info=slot_info,
+                routing_key=rabbit_routing_key,
+                batch_routing_key=rabbit_routing_key or "commands.batch.header",
+                logger=logger,
+            )
         logger.info("[DRY-RUN] Skipping RabbitMQ publish")
         sys.exit(0)
 
@@ -1002,6 +1073,7 @@ Examples:
             slot_info=slot_info,
             dry_run=False,
             logger=logger,
+            verbose=args.verbose,
         )
 
         if published_count != expected_count:
