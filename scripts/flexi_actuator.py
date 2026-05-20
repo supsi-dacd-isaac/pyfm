@@ -958,7 +958,7 @@ Examples:
         logger.error("EV interval must be a positive integer")
         sys.exit(1)
 
-    logger.info("Requested actuator payload: %s", json.dumps(command_map, indent=2))
+    logger.info("Requested actuator payload: %s", json.dumps(command_map))
 
     community = config.get("fm", {}).get("community")
     asset_mapping = config.get("asset_mapping", {})
