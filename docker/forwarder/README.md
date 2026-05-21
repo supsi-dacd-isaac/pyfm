@@ -60,7 +60,7 @@ grep ERROR logs/forwarder.log
 | `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
 | `FORWARDER_CONFIG` | `/app/conf/forwarder_targets.json` | Target configuration path |
 | `FORWARDER_CONNS` | `/app/conf/private/conns.json` | Connection file containing RabbitMQ sections |
-| `FORWARDER_RABBIT_SECTIONS` | all valid sections | Sections: `realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures` |
+| `FORWARDER_RABBIT_SECTIONS` | all valid sections | Sections: `realAssetCommands,simulatedAssetMeasures` |
 | `FORWARDER_QUEUES` | none | Legacy queue selector; ignored |
 | `RABBITMQ_HOST` | `rabbitMQ.host` or `localhost` | RabbitMQ hostname override |
 | `RABBITMQ_PORT` | `rabbitMQ.port` or `5672` | RabbitMQ port override |

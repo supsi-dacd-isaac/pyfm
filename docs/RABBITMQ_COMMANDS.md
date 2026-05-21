@@ -33,7 +33,7 @@ Example destinations:
 `FORWARDER_RABBIT_SECTIONS`:
 
 ```bash
-FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
+FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures
 ```
 
 The selected sections must exist in `conns.json` and each must contain

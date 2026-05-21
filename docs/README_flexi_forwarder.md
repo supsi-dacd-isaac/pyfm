@@ -218,7 +218,7 @@ export RABBITMQ_PORT=5672
 export RABBITMQ_USER=guest
 export RABBITMQ_PASS=guest
 export RABBITMQ_VHOST=/
-export FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
+export FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures
 export FORWARDER_CONFIG=../conf/forwarder_targets_aem.json
 export FORWARDER_CONNS=../conf/private/conns.json
 ```

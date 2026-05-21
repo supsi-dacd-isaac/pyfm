@@ -36,7 +36,7 @@
         FORWARDER_LOG_FILE: /app/logs/forwarder.log         # Log file inside container
         FORWARDER_CONFIG: /app/conf/forwarder_targets.json  # Config file path
         FORWARDER_CONNS: /app/conf/private/conns.json       # conns.json path
-        FORWARDER_RABBIT_SECTIONS: ${FORWARDER_RABBIT_SECTIONS:-realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures}
+        FORWARDER_RABBIT_SECTIONS: ${FORWARDER_RABBIT_SECTIONS:-realAssetCommands,simulatedAssetMeasures}
         # FORWARDER_ASSET_TYPES: heat_pump,ev_charger       # Filter by asset types
 
         # RabbitMQ connection
