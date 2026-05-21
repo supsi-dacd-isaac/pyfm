@@ -89,7 +89,7 @@ class NODESInterface:
                 self.headers = {
                     "Authorization": f'Bearer {self.token_data["access_token"]}'
                 }
-                self.logger.info("Access Token: %s" % self.token_data["access_token"])
+                self.logger.info("Access token acquired successfully")
 
                 # Save token data locally
                 with open(tkn_file_name, "w") as json_file:
