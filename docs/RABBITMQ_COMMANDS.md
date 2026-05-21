@@ -4,15 +4,39 @@ This note summarizes the RabbitMQ messages produced by `scripts/flexi_manager.py
 and the direct actuator script `scripts/flexi_actuator.py`. The requested
 `scripts/flexi_activation.py` file is not present in this repository.
 
-## Topology
+## Topology and Destination Resolution
 
-Both scripts publish to the durable topic exchange `flexi_commands`.
+`flexi_manager.py` reads RabbitMQ connection and destination settings from the
+main config file's `connectionsFile`, under the top-level `rabbitMQ` object.
+Each asset command is routed through the asset's explicit
+`asset_mapping.<asset_id>.rabbitCommandSection`.
 
-| Routing key | Queue | Purpose |
+Allowed command sections:
+
+| `rabbitCommandSection` | Destination source | Purpose |
 | --- | --- | --- |
-| `commands.{asset_type}.{asset_id}` | `asset_commands` | Asset control commands |
-| `commands.batch.header` | `asset_commands` | Optional batch metadata sent before commands |
-| `measurements.{asset_type}.{asset_id}` | `asset_measurements` | Asset measurement messages; publisher helper exists in `flexi_manager.py` |
+| `realAssetCommands` | `rabbitMQ.realAssetCommands.exchange`, `.queue`, `.routingKey` | Commands for real assets |
+| `simulatedAssetCommands` | `rabbitMQ.simulatedAssetCommands.exchange`, `.queue`, `.routingKey` | Commands for simulated assets |
+
+Example destinations:
+
+| Section | Exchange | Queue | Routing key |
+| --- | --- | --- | --- |
+| `realAssetCommands` | `flexi_commands` | `flexi_commands_queue` | `real_asset.command` |
+| `simulatedAssetCommands` | `flexi_sim_commands` | `flexi_sim_commands_queue` | `sim_asset.command` |
+
+If an asset does not define `rabbitCommandSection`, `flexi_manager.py` logs a
+warning and skips that command. It does not fall back to the legacy
+`commands.{asset_type}.{asset_id}` route. Invalid command sections, including
+`simulatedAssetMeasures`, are also skipped. If the selected `rabbitMQ` section
+is missing or lacks `exchange`, `queue`, or `routingKey`, the command is
+skipped.
+
+For each resolved destination, the publisher declares the topic exchange,
+declares the queue, and binds the queue to the configured routing key before
+publishing. Optional batch metadata is sent to the same resolved destination.
+The measurement helper in `flexi_manager.py` still uses the legacy
+`measurements.{asset_type}.{asset_id}` routing pattern.
 
 Command messages are JSON with persistent delivery (`delivery_mode=2`),
 `content_type=application/json`, and a RabbitMQ priority matching the message
@@ -41,8 +65,9 @@ keyed by UTC timestamps, with one power value per 15-minute interval.
 
 ## Batch Header
 
-When commands are published as a batch, a header can be sent first on
-`commands.batch.header`:
+When `flexi_manager.py` publishes commands as a batch, it sends a header to
+each resolved command destination using that destination's routing key. Legacy
+publisher calls may still use `commands.batch.header`:
 
 ```json
 {

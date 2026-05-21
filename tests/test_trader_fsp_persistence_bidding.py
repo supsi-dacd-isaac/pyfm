@@ -2,26 +2,70 @@ import logging
 import sys
 import types
 from datetime import datetime
+from importlib.machinery import ModuleSpec
 from importlib.util import find_spec
 
 import pytest
 
 
-if find_spec("influxdb") is None:
+try:
+    influxdb_missing = find_spec("influxdb") is None
+except ValueError:
+    influxdb_missing = True
+if influxdb_missing:
     influxdb_stub = types.ModuleType("influxdb")
+    influxdb_stub.__spec__ = ModuleSpec("influxdb", loader=None)
 
     class InfluxDBClient:
         pass
 
+    class DataFrameClient:
+        pass
+
     influxdb_stub.InfluxDBClient = InfluxDBClient
+    influxdb_stub.DataFrameClient = DataFrameClient
     sys.modules["influxdb"] = influxdb_stub
 
-if find_spec("psycopg2") is None:
+try:
+    pandas_missing = find_spec("pandas") is None
+except ValueError:
+    pandas_missing = True
+if pandas_missing:
+    pandas_module = types.ModuleType("pandas")
+    pandas_module.__spec__ = ModuleSpec("pandas", loader=None)
+    sys.modules["pandas"] = pandas_module
+else:
+    pandas_module = sys.modules.get("pandas")
+if pandas_module is not None:
+    for attr in ("DataFrame", "Series", "Timestamp", "Timedelta", "DatetimeIndex"):
+        if not hasattr(pandas_module, attr):
+            setattr(pandas_module, attr, type(attr, (), {}))
+
+try:
+    psycopg2_missing = find_spec("psycopg2") is None
+except ValueError:
+    psycopg2_missing = True
+if psycopg2_missing:
     psycopg2_stub = types.ModuleType("psycopg2")
     psycopg2_extras_stub = types.ModuleType("psycopg2.extras")
+    psycopg2_stub.__spec__ = ModuleSpec("psycopg2", loader=None)
+    psycopg2_extras_stub.__spec__ = ModuleSpec("psycopg2.extras", loader=None)
     psycopg2_stub.extras = psycopg2_extras_stub
     sys.modules["psycopg2"] = psycopg2_stub
     sys.modules["psycopg2.extras"] = psycopg2_extras_stub
+
+try:
+    numpy_missing = find_spec("numpy") is None
+except ValueError:
+    numpy_missing = True
+if numpy_missing:
+    numpy_stub = types.ModuleType("numpy")
+    numpy_stub.__spec__ = ModuleSpec("numpy", loader=None)
+    numpy_stub.mean = lambda values: sum(values) / len(values) if values else 0.0
+    numpy_stub.isscalar = lambda value: isinstance(
+        value, (int, float, complex, bool, str, bytes)
+    )
+    sys.modules["numpy"] = numpy_stub
 
 
 from classes.flexibility_forecaster import FlexibilityForecaster  # noqa: E402
