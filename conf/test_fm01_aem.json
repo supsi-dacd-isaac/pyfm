@@ -233,6 +233,21 @@
       "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 30.0]
+    },
+	"ECM68.3": {
+      "device_name_tag": "ECM68.3",
+      "pod": "ECM68",
+      "field": "active_power",
+      "type": "heat_pump",
+      "description": "HP ECM68.3 simulated",
+      "capacity_kw": 8.4,
+      "nominal_power_w": 8400,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 8.4]
     }
   },
   "assets_grouping": {
