@@ -525,7 +525,8 @@ class AssetController:
         asset_id: str, 
         curtailment_kw: float, 
         duration_minutes: int = 15,
-        dry_run: bool = True
+        dry_run: bool = True,
+        force_discrete_off: bool = False
     ) -> Dict:
         """
         Send curtailment command to an asset.
@@ -537,6 +538,7 @@ class AssetController:
         :param curtailment_kw: Amount of power to reduce (kW)
         :param duration_minutes: Duration of curtailment
         :param dry_run: If True, only log what would be done
+        :param force_discrete_off: If True, positive discrete curtailment forces OFF
         :return: Result dictionary with status and details
         """
         asset_config = self.asset_mapping.get(asset_id, {})
@@ -550,7 +552,12 @@ class AssetController:
         
         # For discrete assets, determine the actual state to set
         if modulation_type == "discrete":
-            state_name, target_power_kw = self._determine_discrete_state(asset_config, curtailment_kw)
+            if force_discrete_off and curtailment_kw > 0:
+                discrete_states = asset_config.get("discrete_states_kw", [0.0, capacity_kw])
+                target_power_kw = min(discrete_states)
+                state_name = "OFF"
+            else:
+                state_name, target_power_kw = self._determine_discrete_state(asset_config, curtailment_kw)
             actual_curtailment_kw = capacity_kw - target_power_kw
         else:
             state_name = None
@@ -644,7 +651,13 @@ class AssetController:
             # Actual control logic
             try:
                 if asset_type == "heat_pump":
-                    self._control_heat_pump(asset_id, asset_config, curtailment_kw, duration_minutes)
+                    self._control_heat_pump(
+                        asset_id,
+                        asset_config,
+                        curtailment_kw,
+                        duration_minutes,
+                        force_discrete_off=force_discrete_off
+                    )
                 elif asset_type == "ev_charger":
                     self._control_ev_charger(asset_id, asset_config, curtailment_kw, duration_minutes)
                 else:
@@ -678,7 +691,8 @@ class AssetController:
         asset_id: str, 
         config: dict, 
         curtailment_kw: float,
-        duration_minutes: int
+        duration_minutes: int,
+        force_discrete_off: bool = False
     ):
         """
         Send control command to a heat pump.
@@ -698,7 +712,12 @@ class AssetController:
         
         # Determine command based on modulation type
         if modulation_type == "discrete":
-            state_name, target_power_kw = self._determine_discrete_state(config, curtailment_kw)
+            if force_discrete_off and curtailment_kw > 0:
+                discrete_states = config.get("discrete_states_kw", [0.0, capacity_kw])
+                target_power_kw = min(discrete_states)
+                state_name = "OFF"
+            else:
+                state_name, target_power_kw = self._determine_discrete_state(config, curtailment_kw)
             command_payload = {
                 "command": "set_state",
                 "state": state_name,
@@ -991,6 +1010,145 @@ class MarketResultsHandler:
     def __init__(self, nodes_interface: NodesInterface, logger: logging.Logger):
         self.nodes = nodes_interface
         self.logger = logger
+
+    @staticmethod
+    def _extract_response_items(response) -> List[Dict]:
+        """Return list-like payloads from common NODES response envelopes."""
+        if isinstance(response, list):
+            return response
+        if isinstance(response, dict):
+            for key in ("items", "data", "results", "value"):
+                value = response.get(key)
+                if isinstance(value, list):
+                    return value
+            return [response]
+        return []
+
+    @staticmethod
+    def _parse_nodes_datetime(value) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            dt = value
+        elif isinstance(value, str) and value:
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+        else:
+            return None
+
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt.replace(second=0, microsecond=0)
+
+    @staticmethod
+    def _to_float(value) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _get_first_value(data: Dict, keys: Tuple[str, ...]):
+        for key in keys:
+            if key in data and data.get(key) not in (None, ""):
+                return data.get(key)
+        return None
+
+    def _trade_matches_slot(self, trade: Dict, slot_start: datetime, slot_end: datetime) -> bool:
+        start_value = self._get_first_value(
+            trade,
+            ("periodFrom", "period_from", "startTime", "start", "deliveryStart", "validFrom"),
+        )
+        end_value = self._get_first_value(
+            trade,
+            ("periodTo", "period_to", "endTime", "end", "deliveryEnd", "validTo"),
+        )
+        trade_start = self._parse_nodes_datetime(start_value)
+        trade_end = self._parse_nodes_datetime(end_value)
+
+        expected_start = self._parse_nodes_datetime(slot_start)
+        expected_end = self._parse_nodes_datetime(slot_end)
+        if trade_start is not None and expected_start is not None and trade_start != expected_start:
+            return False
+        if trade_end is not None and expected_end is not None and trade_end != expected_end:
+            return False
+        return True
+
+    def _trade_matches_organization(self, trade: Dict, organization_id: str) -> bool:
+        organization_candidates = set()
+        for key in (
+            "organizationId",
+            "ownerOrganizationId",
+            "sellerOrganizationId",
+            "fspOrganizationId",
+            "participantOrganizationId",
+        ):
+            value = trade.get(key)
+            if value not in (None, ""):
+                organization_candidates.add(str(value))
+
+        for key in ("organization", "ownerOrganization", "sellerOrganization", "seller"):
+            value = trade.get(key)
+            if isinstance(value, dict):
+                nested_id = self._get_first_value(value, ("id", "organizationId"))
+                if nested_id not in (None, ""):
+                    organization_candidates.add(str(nested_id))
+
+        if not organization_candidates:
+            return True
+        return str(organization_id) in organization_candidates
+
+    def _trade_is_accepted(self, trade: Dict) -> bool:
+        status_value = self._get_first_value(
+            trade,
+            ("status", "tradeStatus", "state", "completionType"),
+        )
+        if status_value in (None, ""):
+            return True
+
+        normalized = str(status_value).replace("_", "").replace(" ", "").lower()
+        accepted_values = {
+            "accepted",
+            "cleared",
+            "completed",
+            "executed",
+            "filled",
+            "partiallyfilled",
+            "settled",
+        }
+        return normalized in accepted_values
+
+    def _normalise_trade_for_activation(self, trade: Dict) -> Optional[Dict]:
+        quantity_value = self._get_first_value(
+            trade,
+            (
+                "quantity",
+                "quantityMw",
+                "quantityMW",
+                "quantityCompleted",
+                "filledQuantity",
+                "matchedQuantity",
+                "volume",
+            ),
+        )
+        quantity = self._to_float(quantity_value)
+        if quantity is None or quantity <= 0:
+            return None
+
+        normalised = dict(trade)
+        normalised["quantity"] = quantity
+
+        if normalised.get("price") in (None, ""):
+            price = self._get_first_value(
+                normalised,
+                ("unitPrice", "clearingPrice", "matchedPrice", "averagePrice"),
+            )
+            if price not in (None, ""):
+                normalised["price"] = price
+
+        return normalised
     
     def get_accepted_trades_for_slot(
         self, 
@@ -1012,42 +1170,87 @@ class MarketResultsHandler:
             slot_end.strftime("%H:%M")
         )
         
-        # Query trades from NODES
+        # Query trades from NODES. The trades endpoint follows the same
+        # filter syntax used by market_results_fetcher.py; acceptance and
+        # ownership are applied locally because server-side status and
+        # organization filters have returned HTTP 400 for this endpoint.
         try:
             # Format times for API
             period_from = slot_start.strftime("%Y-%m-%dT%H:%M:%SZ")
             period_to = slot_end.strftime("%Y-%m-%dT%H:%M:%SZ")
             
-            # Build endpoint with query params
+            filter_params = [
+                f"periodFrom.GreaterThanOrEqual={period_from}",
+                f"periodTo.LessThanOrEqual={period_to}",
+            ]
+            filter_str = "&".join(filter_params)
+
             endpoint = (
                 f"{self.nodes.cfg['mainEndpoint']}trades"
-                f"?organizationId={organization_id}"
-                f"&periodFrom={period_from}"
-                f"&periodTo={period_to}"
-                f"&status=Accepted"
+                f"?{filter_str}"
             )
+
+            self.logger.info("Fetching NODES trades from %s to %s", period_from, period_to)
             
             response = self.nodes.get_request(endpoint)
-            
-            # Handle paginated response (dict with 'items' key)
-            if response:
-                if isinstance(response, dict):
-                    trades = response.get("items", [])
-                elif isinstance(response, list):
-                    trades = response
-                else:
-                    trades = []
-                
-                # Filter for sell trades (FSP sells flexibility)
-                sell_trades = [
-                    t for t in trades 
-                    if t.get("side") == "Sell"
-                ]
-                self.logger.info("Found %d accepted sell trades for this slot", len(sell_trades))
-                return sell_trades
-            else:
+            trades = self._extract_response_items(response) if response else []
+            self.logger.info("NODES trades returned %d raw rows for this slot", len(trades))
+
+            accepted_sell_trades = []
+            for trade in trades:
+                if not isinstance(trade, dict):
+                    self.logger.debug("Skipping non-dict trade row: %r", trade)
+                    continue
+
+                side = str(trade.get("side", "")).lower()
+                if side != "sell":
+                    self.logger.debug(
+                        "Skipping trade %s: side is %r",
+                        trade.get("id", trade.get("tradeId", "unknown")),
+                        trade.get("side"),
+                    )
+                    continue
+
+                if not self._trade_matches_organization(trade, organization_id):
+                    self.logger.debug(
+                        "Skipping trade %s: does not match organization %s",
+                        trade.get("id", trade.get("tradeId", "unknown")),
+                        organization_id,
+                    )
+                    continue
+
+                if not self._trade_matches_slot(trade, slot_start, slot_end):
+                    self.logger.debug(
+                        "Skipping trade %s: outside requested slot",
+                        trade.get("id", trade.get("tradeId", "unknown")),
+                    )
+                    continue
+
+                if not self._trade_is_accepted(trade):
+                    self.logger.debug(
+                        "Skipping trade %s: status/completion is not accepted",
+                        trade.get("id", trade.get("tradeId", "unknown")),
+                    )
+                    continue
+
+                normalised_trade = self._normalise_trade_for_activation(trade)
+                if normalised_trade is None:
+                    self.logger.info(
+                        "Skipping trade %s: missing or non-positive quantity",
+                        trade.get("id", trade.get("tradeId", "unknown")),
+                    )
+                    continue
+
+                accepted_sell_trades.append(normalised_trade)
+
+            self.logger.info(
+                "Kept %d accepted sell trades for organization %s and requested slot",
+                len(accepted_sell_trades),
+                organization_id,
+            )
+            if not accepted_sell_trades:
                 self.logger.info("No trades found for this slot")
-                return []
+            return accepted_sell_trades
                 
         except Exception as e:
             self.logger.error("Error querying trades: %s", str(e))
@@ -1627,6 +1830,32 @@ class BidRecordHandler:
         
         assets_to_activate = bid_record.get("assets_to_activate", [])
         return [a["asset_id"] for a in assets_to_activate]
+
+    def get_bid_asset_flexibilities(self, bid_record: Dict) -> Dict[str, float]:
+        """
+        Get positive per-asset bid-time flexibility quantities from bid assets.
+
+        :param bid_record: Bid record dictionary
+        :return: Mapping of asset_id to available flexibility in kW
+        """
+        if not bid_record:
+            return {}
+
+        planned_flexibilities = {}
+        for asset in bid_record.get("assets_to_activate", []):
+            asset_id = asset.get("asset_id")
+            if not asset_id:
+                continue
+
+            try:
+                available_kw = float(asset.get("available_flexibility_kw") or 0.0)
+            except (TypeError, ValueError):
+                available_kw = 0.0
+
+            if available_kw > 0:
+                planned_flexibilities[asset_id] = available_kw
+
+        return planned_flexibilities
     
     def get_strategy_info(self, bid_record: Dict) -> Optional[Dict]:
         """
@@ -2549,12 +2778,166 @@ class FlexibilityManager:
 
         return result
 
+    def _get_activation_modulation_type(self, asset_id: str) -> str:
+        asset_config = self.asset_mapping.get(asset_id, {})
+        mod_type = asset_config.get("modulation_type", "")
+        if mod_type:
+            return mod_type
+
+        asset_type = asset_config.get("type", "")
+        return "discrete" if asset_type == "heat_pump" else "continuous"
+
+    def _build_persistence_activation_allocations(
+        self,
+        planned_asset_flex_kw: Dict[str, float],
+        accepted_kw: float,
+    ) -> Tuple[Dict[str, float], Dict]:
+        """
+        Build a conservative persistence activation plan.
+
+        Discrete assets are selected as whole assets; continuous assets fill the
+        remaining accepted quantity without exceeding their stored bid-time plan.
+        """
+        tolerance = 1e-9
+        planned_kw = sum(planned_asset_flex_kw.values())
+        discrete_assets = []
+        continuous_assets = []
+        asset_details = {}
+
+        for asset_id, planned_asset_kw in planned_asset_flex_kw.items():
+            mod_type = self._get_activation_modulation_type(asset_id)
+            asset_config = self.asset_mapping.get(asset_id, {})
+            asset_type = asset_config.get("type", "unknown")
+            detail = {
+                "asset_id": asset_id,
+                "asset_type": asset_type,
+                "modulation_type": mod_type,
+                "stored_kw": planned_asset_kw,
+                "selected": False,
+                "activation_kw": 0.0,
+                "reason": "not selected",
+            }
+            asset_details[asset_id] = detail
+
+            if mod_type == "discrete":
+                discrete_assets.append((asset_id, planned_asset_kw))
+            else:
+                continuous_assets.append((asset_id, planned_asset_kw))
+
+        discrete_planned_total = sum(kw for _, kw in discrete_assets)
+        continuous_planned_total = sum(kw for _, kw in continuous_assets)
+
+        if accepted_kw + tolerance >= planned_kw:
+            allocations = dict(planned_asset_flex_kw)
+            for asset_id, activation_kw in allocations.items():
+                detail = asset_details[asset_id]
+                detail["selected"] = True
+                detail["activation_kw"] = activation_kw
+                detail["reason"] = "accepted quantity covers full stored plan"
+
+            return allocations, {
+                "planned_kw": planned_kw,
+                "accepted_kw": accepted_kw,
+                "discrete_planned_total": discrete_planned_total,
+                "continuous_planned_total": continuous_planned_total,
+                "selected_discrete_total": discrete_planned_total,
+                "continuous_activation_total": continuous_planned_total,
+                "expected_delivered_kw": planned_kw,
+                "under_delivery_kw": max(0.0, accepted_kw - planned_kw),
+                "asset_details": list(asset_details.values()),
+            }
+
+        best_subset = []
+        best_total = 0.0
+        for mask in range(1 << len(discrete_assets)):
+            subset = []
+            subset_total = 0.0
+            for index, item in enumerate(discrete_assets):
+                if mask & (1 << index):
+                    subset.append(item)
+                    subset_total += item[1]
+
+            if subset_total > accepted_kw + tolerance:
+                continue
+
+            if (
+                subset_total > best_total + tolerance
+                or (
+                    abs(subset_total - best_total) <= tolerance
+                    and len(subset) < len(best_subset)
+                )
+            ):
+                best_subset = subset
+                best_total = subset_total
+
+        allocations = {}
+        selected_discrete_ids = {asset_id for asset_id, _ in best_subset}
+        for asset_id, selected_kw in best_subset:
+            allocations[asset_id] = selected_kw
+            detail = asset_details[asset_id]
+            detail["selected"] = True
+            detail["activation_kw"] = selected_kw
+            detail["reason"] = "selected discrete subset"
+
+        for asset_id, planned_asset_kw in discrete_assets:
+            if asset_id in selected_discrete_ids:
+                continue
+            detail = asset_details[asset_id]
+            if planned_asset_kw > accepted_kw + tolerance:
+                detail["reason"] = "not selected because it would exceed accepted_kw"
+            else:
+                detail["reason"] = "not selected by best discrete subset"
+
+        remaining_kw = max(0.0, accepted_kw - best_total)
+        continuous_activation_total = 0.0
+        if continuous_assets and remaining_kw > tolerance:
+            if continuous_planned_total <= remaining_kw + tolerance:
+                continuous_scale = 1.0
+            else:
+                continuous_scale = remaining_kw / continuous_planned_total
+
+            for asset_id, planned_asset_kw in continuous_assets:
+                activation_kw = planned_asset_kw * continuous_scale
+                if activation_kw <= tolerance:
+                    asset_details[asset_id]["reason"] = "no remaining accepted quantity"
+                    continue
+
+                allocations[asset_id] = activation_kw
+                continuous_activation_total += activation_kw
+                detail = asset_details[asset_id]
+                detail["selected"] = True
+                detail["activation_kw"] = activation_kw
+                detail["reason"] = (
+                    "continuous fill scaled"
+                    if continuous_scale < 1.0 - tolerance
+                    else "continuous fill full stored plan"
+                )
+        else:
+            for asset_id, _ in continuous_assets:
+                asset_details[asset_id]["reason"] = "no remaining accepted quantity"
+
+        expected_delivered_kw = sum(allocations.values())
+
+        return allocations, {
+            "planned_kw": planned_kw,
+            "accepted_kw": accepted_kw,
+            "discrete_planned_total": discrete_planned_total,
+            "continuous_planned_total": continuous_planned_total,
+            "selected_discrete_total": best_total,
+            "continuous_activation_total": continuous_activation_total,
+            "expected_delivered_kw": expected_delivered_kw,
+            "under_delivery_kw": max(0.0, accepted_kw - expected_delivered_kw),
+            "asset_details": list(asset_details.values()),
+        }
+
     def run(
         self,
         slot_override: str = None,
         dry_run: bool = True,
         allocation_strategy: str = "modulation_aware",
-        fallback_strategy: str = None
+        fallback_strategy: str = None,
+        simulate_sold_mw: Optional[float] = None,
+        allow_market_ledger_fallback: bool = False
     ) -> Dict:
         """
         Run the flexibility activation process.
@@ -2569,8 +2952,13 @@ class FlexibilityManager:
         :param slot_override: Optional slot start time
         :param dry_run: If True, simulate only
         :param allocation_strategy: How to distribute flexibility across assets
+        :param simulate_sold_mw: Dry-run-only simulated accepted quantity in MW
+        :param allow_market_ledger_fallback: If True, use local market_ledger only when NODES has no accepted trades
         :return: Summary of actions taken
         """
+        if simulate_sold_mw is not None and not dry_run:
+            raise ValueError("--simulate-sold-mw can only be used with --dry-run")
+
         slot_start, slot_end = self.get_target_slot(slot_override)
 
         # Load previously controlled assets so we can restore any that are
@@ -2595,6 +2983,9 @@ class FlexibilityManager:
             "slot_end": slot_end.isoformat(),
             "dry_run": dry_run,
             "allocation_strategy": allocation_strategy,
+            "simulate_sold_mw": simulate_sold_mw,
+            "allow_market_ledger_fallback": allow_market_ledger_fallback,
+            "market_result_source": "none",
             "bid_record": None,
             "strategy_used": None,
             "allowed_assets": [],
@@ -2605,6 +2996,12 @@ class FlexibilityManager:
             "control_results": {},
             "status": "success"
         }
+
+        strategy_info = None
+        strategy_obj = None
+        flexibility_method = None
+        is_persistence_strategy = False
+        planned_bid_asset_flex_kw = {}
         
         # Step 0: Check for bid record from trader_fsp.py
         self.logger.info("Step 0: Checking for bid record...")
@@ -2617,14 +3014,119 @@ class FlexibilityManager:
             bid_quantity_mw = self.bid_handler.get_total_quantity(bid_record)
             
             if strategy_info and strategy_info.get("id"):
+                strategy_obj = self.strategy_manager.get_strategy(strategy_info.get("id"))
+                if strategy_obj:
+                    flexibility_method = strategy_obj.config.get("flexibility_method")
+                    is_persistence_strategy = flexibility_method == "persistence"
+                    summary["flexibility_method"] = flexibility_method
+
                 self.logger.info("  Strategy: %s (%s)", 
                                strategy_info.get("id"), 
                                strategy_info.get("name", "N/A"))
+                if flexibility_method:
+                    self.logger.info("  Flexibility method: %s", flexibility_method)
                 summary["strategy_used"] = strategy_info.get("id")
             else:
                 self.logger.info("  Strategy: None (simple mode)")
             
-            if allowed_assets:
+            if is_persistence_strategy:
+                planned_bid_asset_flex_kw = self.bid_handler.get_bid_asset_flexibilities(bid_record)
+                allowed_assets = list(planned_bid_asset_flex_kw.keys())
+                summary["allowed_assets"] = allowed_assets
+                summary["allocation_source"] = "bid_record_assets.available_flexibility_kw"
+
+                if allowed_assets:
+                    self.logger.info(
+                        "  Persistence assets with positive bid-time flexibility: %s",
+                        allowed_assets
+                    )
+                    for _pid, _pkw in planned_bid_asset_flex_kw.items():
+                        self.logger.info(
+                            "    %s: %.3f kW", _pid, _pkw
+                        )
+
+                    # Validate that every persistence bid asset exists in
+                    # asset_mapping so modulation type detection is reliable.
+                    missing_assets = [
+                        a for a in allowed_assets if a not in self.asset_mapping
+                    ]
+                    if missing_assets:
+                        self.logger.error(
+                            "  Persistence strategy %s references assets not in "
+                            "asset_mapping: %s; failing closed to avoid mis-classification",
+                            strategy_info.get("id"),
+                            missing_assets,
+                        )
+                        self.logger.info("=" * 70)
+                        self.logger.info("NO ACTIVATION - ASSET MAPPING INCOMPLETE")
+                        self.logger.info("=" * 70)
+                        self.logger.info("No assets will be activated.")
+
+                        summary["status"] = "persistence_asset_mapping_incomplete"
+                        summary["message"] = (
+                            f"Persistence bid assets {missing_assets} not found in "
+                            "asset_mapping - activation aborted for safety"
+                        )
+                        summary["missing_assets"] = missing_assets
+                        summary["total_flexibility_sold_mw"] = 0
+                        summary["total_flexibility_sold_kw"] = 0
+                        summary["allocation"] = {}
+                        summary["allocations"] = {}
+                        summary["activation_results"] = []
+
+                        if previous_state:
+                            self._queue_restores_for_previous_state(
+                                previous_state, current_curtailed=set(), dry_run=dry_run,
+                            )
+                            if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+                                restore_slot_info = {
+                                    "fsp_id": self.fsp_id,
+                                    "slot_start": _format_aem_utc(slot_start),
+                                    "slot_end": _format_aem_utc(slot_end),
+                                    "dry_run": dry_run,
+                                }
+                                self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
+                            self._save_controlled_state({})
+
+                        return summary
+                else:
+                    self.logger.error(
+                        "  Persistence strategy %s has no positive "
+                        "bid_record_assets.available_flexibility_kw rows; failing closed",
+                        strategy_info.get("id")
+                    )
+                    self.logger.info("=" * 70)
+                    self.logger.info("NO ACTIVATION REQUIRED")
+                    self.logger.info("=" * 70)
+                    self.logger.info("No assets will be activated.")
+
+                    summary["status"] = "persistence_no_positive_bid_assets"
+                    summary["message"] = (
+                        "Persistence strategy has no positive bid_record_assets."
+                        "available_flexibility_kw rows - no activation performed"
+                    )
+                    summary["total_flexibility_sold_mw"] = 0
+                    summary["total_flexibility_sold_kw"] = 0
+                    summary["allocation"] = {}
+                    summary["allocations"] = {}
+                    summary["activation_results"] = []
+
+                    if previous_state:
+                        self._queue_restores_for_previous_state(
+                            previous_state, current_curtailed=set(), dry_run=dry_run,
+                        )
+                        if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+                            restore_slot_info = {
+                                "fsp_id": self.fsp_id,
+                                "slot_start": _format_aem_utc(slot_start),
+                                "slot_end": _format_aem_utc(slot_end),
+                                "dry_run": dry_run,
+                            }
+                            self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
+                        self._save_controlled_state({})
+
+                    return summary
+            elif allowed_assets:
                 self.logger.info("  Allowed assets from bid record: %s", allowed_assets)
                 summary["allowed_assets"] = allowed_assets
             else:
@@ -2633,7 +3135,6 @@ class FlexibilityManager:
                 
                 if strategy_info and strategy_info.get("id"):
                     # Derive assets from strategy definition
-                    strategy_obj = self.strategy_manager.get_strategy(strategy_info.get("id"))
                     if strategy_obj and strategy_obj.allowed_assets:
                         allowed_assets = strategy_obj.allowed_assets
                         self.logger.info("  Derived assets from strategy %s: %s", 
@@ -2702,24 +3203,84 @@ class FlexibilityManager:
         
         trades = []
         settlements = []
-        
-        # Try local market_ledger FIRST (faster and more reliable)
-        player_name = self.fsp_config.get("name", self.fsp_id)
-        local_trades = self.bid_handler.get_trades_from_ledger(player_name, slot_start)
-        if local_trades:
-            self.logger.info("Found trades in local market_ledger")
-            trades = local_trades
-        elif self.organization_id:
-            # Fall back to NODES API only if no local data
-            self.logger.info("No local trades, querying NODES API...")
-            trades = self.market_handler.get_accepted_trades_for_slot(
-                self.organization_id, slot_start, slot_end
+
+        if simulate_sold_mw is not None:
+            simulated_sold_kw = simulate_sold_mw * 1000
+            summary["market_result_source"] = "simulate_sold_mw"
+            self.logger.warning(
+                "DRY-RUN SIMULATION: using simulated sold quantity %.6f MW (%.3f kW) "
+                "for activation-path testing",
+                simulate_sold_mw,
+                simulated_sold_kw
             )
-            settlements = self.market_handler.get_settlements_for_slot(
-                self.organization_id, slot_start, slot_end
+            self.logger.warning(
+                "DRY-RUN SIMULATION: target slot %s - %s",
+                slot_start.strftime("%Y-%m-%d %H:%M"),
+                slot_end.strftime("%H:%M")
             )
+            if strategy_info and strategy_info.get("id"):
+                self.logger.warning(
+                    "DRY-RUN SIMULATION: strategy %s (%s)",
+                    strategy_info.get("id"),
+                    strategy_info.get("name", "N/A")
+                )
+            self.logger.warning(
+                "DRY-RUN SIMULATION: bypassing local market_ledger and NODES accepted-trade lookup"
+            )
+            trades = [{
+                "id": "dry-run-simulated",
+                "timeslot": slot_start,
+                "player_id": self.fsp_config.get("name", self.fsp_id),
+                "side": "Sell",
+                "regulation": "simulated",
+                "quantity": simulate_sold_mw,
+                "price": None,
+                "bid_record_id": str(bid_record.get("id")) if bid_record else None,
+                "simulated": True,
+            }]
         else:
-            self.logger.warning("No local trades and no NODES organization ID")
+            if self.organization_id:
+                self.logger.info("Querying NODES accepted trades before any local ledger fallback...")
+                trades = self.market_handler.get_accepted_trades_for_slot(
+                    self.organization_id, slot_start, slot_end
+                )
+                if trades:
+                    self.logger.info("MARKET RESULT SOURCE: NODES accepted trades")
+                    summary["market_result_source"] = "nodes_accepted_trades"
+                    settlements = self.market_handler.get_settlements_for_slot(
+                        self.organization_id, slot_start, slot_end
+                    )
+                else:
+                    self.logger.warning(
+                        "No NODES accepted trades found for slot %s - %s",
+                        slot_start.strftime("%Y-%m-%d %H:%M"),
+                        slot_end.strftime("%H:%M")
+                    )
+            else:
+                self.logger.warning("No NODES organization ID available; cannot query accepted trades")
+
+            if not trades:
+                if allow_market_ledger_fallback:
+                    self.logger.warning("WARNING: MARKET RESULT SOURCE: local public.market_ledger fallback")
+                    self.logger.warning(
+                        "WARNING: market_ledger rows may represent posted orders, not accepted/cleared trades."
+                    )
+                    self.logger.warning(
+                        "WARNING: Use this fallback only for controlled testing or when operations guarantee ledger rows are confirmed market results."
+                    )
+                    player_name = self.fsp_config.get("name", self.fsp_id)
+                    local_trades = self.bid_handler.get_trades_from_ledger(player_name, slot_start)
+                    if local_trades:
+                        trades = local_trades
+                        summary["market_result_source"] = "market_ledger_fallback"
+                    else:
+                        self.logger.info("No local market_ledger fallback rows found for this slot")
+                        summary["market_result_source"] = "none"
+                else:
+                    self.logger.warning(
+                        "market_ledger fallback is disabled; no activation will be performed."
+                    )
+                    summary["market_result_source"] = "none"
         
         # Calculate total sold flexibility from ACTUAL trades only
         total_sold_mw = sum(t.get("quantity", 0) for t in trades)
@@ -2785,14 +3346,120 @@ class FlexibilityManager:
         
         # Step 2: Allocate flexibility across allowed assets
         self.logger.info("-" * 70)
-        self.logger.info("Step 2: Allocating flexibility across ALLOWED assets...")
-        self.logger.info("  Allowed assets: %s", allowed_assets)
-        
-        allocations = self.allocator.allocate_flexibility(
-            total_sold_kw,
-            allowed_assets=allowed_assets,  # Use assets from bid record
-            strategy=allocation_strategy
-        )
+        if is_persistence_strategy:
+            self.logger.info("Step 2: Building persistence activation plan from bid record assets...")
+            planned_kw = sum(planned_bid_asset_flex_kw.values())
+
+            if planned_kw <= 0:
+                self.logger.error(
+                    "Persistence strategy %s planned %.3f kW; failing closed",
+                    strategy_info.get("id") if strategy_info else "unknown",
+                    planned_kw
+                )
+                summary["status"] = "persistence_no_positive_bid_assets"
+                summary["message"] = (
+                    "Persistence strategy has no positive bid_record_assets."
+                    "available_flexibility_kw rows - no activation performed"
+                )
+                summary["allocation"] = {}
+                summary["allocations"] = {}
+
+                if previous_state:
+                    self._queue_restores_for_previous_state(
+                        previous_state, current_curtailed=set(), dry_run=dry_run,
+                    )
+                    if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+                        restore_slot_info = {
+                            "fsp_id": self.fsp_id,
+                            "slot_start": _format_aem_utc(slot_start),
+                            "slot_end": _format_aem_utc(slot_end),
+                            "dry_run": dry_run,
+                        }
+                        self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
+                    self._save_controlled_state({})
+
+                return summary
+
+            allocations, persistence_selection = self._build_persistence_activation_allocations(
+                planned_bid_asset_flex_kw,
+                total_sold_kw,
+            )
+
+            summary["allocation_source"] = "bid_record_assets.available_flexibility_kw"
+            summary["persistence_planned_kw"] = persistence_selection["planned_kw"]
+            summary["persistence_discrete_planned_total_kw"] = persistence_selection["discrete_planned_total"]
+            summary["persistence_continuous_planned_total_kw"] = persistence_selection["continuous_planned_total"]
+            summary["persistence_selected_discrete_total_kw"] = persistence_selection["selected_discrete_total"]
+            summary["persistence_continuous_activation_total_kw"] = persistence_selection["continuous_activation_total"]
+            summary["persistence_expected_delivered_kw"] = persistence_selection["expected_delivered_kw"]
+            summary["persistence_under_delivery_kw"] = persistence_selection["under_delivery_kw"]
+
+            self.logger.info("PERSISTENCE ACTIVATION PLAN FROM BID RECORD ASSETS")
+            self.logger.info(
+                "  Strategy: %s (%s)",
+                strategy_info.get("id") if strategy_info else "unknown",
+                strategy_info.get("name", "N/A") if strategy_info else "N/A",
+            )
+            self.logger.info("  allocation_source = bid_record_assets.available_flexibility_kw")
+            self.logger.info("PERSISTENCE DISCRETE-AWARE ACTIVATION SELECTION")
+            self.logger.info("  accepted_kw: %.3f", persistence_selection["accepted_kw"])
+            self.logger.info("  planned_kw: %.3f", persistence_selection["planned_kw"])
+            self.logger.info(
+                "  discrete planned total: %.3f",
+                persistence_selection["discrete_planned_total"]
+            )
+            self.logger.info(
+                "  continuous planned total: %.3f",
+                persistence_selection["continuous_planned_total"]
+            )
+            self.logger.info(
+                "  selected discrete total: %.3f",
+                persistence_selection["selected_discrete_total"]
+            )
+            self.logger.info(
+                "  continuous activation total: %.3f",
+                persistence_selection["continuous_activation_total"]
+            )
+            self.logger.info(
+                "  expected delivered total: %.3f",
+                persistence_selection["expected_delivered_kw"]
+            )
+            self.logger.info(
+                "  under_delivery_kw: %.3f",
+                persistence_selection["under_delivery_kw"]
+            )
+            selected_discrete_assets = [
+                d["asset_id"]
+                for d in persistence_selection["asset_details"]
+                if d["selected"] and d["modulation_type"] == "discrete"
+            ]
+            self.logger.info(
+                "  discrete subset selected: %s",
+                selected_discrete_assets if selected_discrete_assets else []
+            )
+            for detail in persistence_selection["asset_details"]:
+                self.logger.info(
+                    "  %s: stored available_flexibility_kw=%.3f, type=%s, "
+                    "modulation=%s, selected=%s, final activation_kw=%.3f, reason=%s",
+                    detail["asset_id"],
+                    detail["stored_kw"],
+                    detail["asset_type"],
+                    detail["modulation_type"],
+                    "yes" if detail["selected"] else "no",
+                    detail["activation_kw"],
+                    detail["reason"],
+                )
+        else:
+            self.logger.info("Step 2: Allocating flexibility across ALLOWED assets...")
+            self.logger.info("  Allowed assets: %s", allowed_assets)
+            self.logger.info("  allocation_source = generic_allocator")
+
+            allocations = self.allocator.allocate_flexibility(
+                total_sold_kw,
+                allowed_assets=allowed_assets,  # Use assets from bid record
+                strategy=allocation_strategy
+            )
+            summary["allocation_source"] = "generic_allocator"
         
         summary["allocations"] = allocations
         
@@ -2810,16 +3477,13 @@ class FlexibilityManager:
             asset_desc = asset_config.get("description", asset_id)
             
             # Determine modulation type for display
-            mod_type = asset_config.get("modulation_type", "")
-            if not mod_type:
-                # Fallback to default by asset type
-                asset_type = asset_config.get("type", "")
-                mod_type = "discrete" if asset_type == "heat_pump" else "continuous"
+            mod_type = self._get_activation_modulation_type(asset_id)
             
             if mod_type == "discrete":
                 capacity = asset_config.get("capacity_kw", curtailment_kw)
                 # For discrete assets, curtailment = full capacity means switching OFF
-                state = "OFF" if curtailment_kw >= capacity * 0.5 else "ON"
+                force_discrete_off = is_persistence_strategy and curtailment_kw > 0
+                state = "OFF" if force_discrete_off or curtailment_kw >= capacity * 0.5 else "ON"
                 self.logger.info(
                     "  %s (%s): %.2f kW [discrete → %s]", 
                     asset_id, asset_desc, curtailment_kw, state
@@ -2852,11 +3516,18 @@ class FlexibilityManager:
         current_curtailed = set(allocations.keys())
 
         for asset_id, curtailment_kw in allocations.items():
+            mod_type = self._get_activation_modulation_type(asset_id)
+            force_discrete_off = (
+                is_persistence_strategy
+                and mod_type == "discrete"
+                and curtailment_kw > 0
+            )
             result = self.controller.curtail_asset(
                 asset_id,
                 curtailment_kw,
                 duration_minutes=15,
-                dry_run=dry_run
+                dry_run=dry_run,
+                force_discrete_off=force_discrete_off
             )
             summary["control_results"][asset_id] = result
 
@@ -3026,6 +3697,21 @@ Examples:
         help="Actually send control commands (CAUTION!)"
     )
     parser.add_argument(
+        "--simulate-sold-mw",
+        type=float,
+        default=None,
+        help="DRY-RUN ONLY: simulate accepted/sold quantity in MW for activation-path testing."
+    )
+    parser.add_argument(
+        "--allow-market-ledger-fallback",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow fallback to local public.market_ledger when no NODES accepted trades are found. "
+            "WARNING: ledger rows may represent posted orders, not accepted trades."
+        )
+    )
+    parser.add_argument(
         "--allocation", "-a",
         choices=["modulation_aware", "proportional", "priority", "cost_optimal"],
         default="modulation_aware",
@@ -3129,6 +3815,11 @@ Examples:
 
     # Determine dry-run mode
     dry_run = not args.live
+
+    if args.simulate_sold_mw is not None and not dry_run:
+        parser.error("--simulate-sold-mw can only be used with --dry-run")
+    if args.simulate_sold_mw is not None and args.simulate_sold_mw < 0:
+        parser.error("--simulate-sold-mw must be non-negative")
     
     # Load configuration
     config_path = args.config_file
@@ -3298,7 +3989,9 @@ Examples:
         slot_override=slot_override,
         dry_run=dry_run,
         allocation_strategy=args.allocation,
-        fallback_strategy=args.fallback_strategy
+        fallback_strategy=args.fallback_strategy,
+        simulate_sold_mw=args.simulate_sold_mw,
+        allow_market_ledger_fallback=args.allow_market_ledger_fallback
     )
     
     # Output summary

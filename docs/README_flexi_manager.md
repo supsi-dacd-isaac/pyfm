@@ -2,6 +2,8 @@
 
 This script manages the **activation** of flexibility for an FSP. After the FSP has bid and won trades on the flexibility market, this script controls the actual assets to deliver the promised flexibility.
 
+By default the manager now treats **NODES accepted trades** as the authoritative market result. The local `public.market_ledger` table can still be used, but only when explicitly enabled as a fallback for controlled testing.
+
 ## Overview
 
 ```
@@ -84,7 +86,7 @@ public.bid_record_assets (
     ...
 )
 
--- What actually happened in the market (existing table, updated with FK)
+-- Local market ledger (optional fallback; NODES accepted trades are authoritative)
 public.market_ledger (
     id UUID PRIMARY KEY,
     timeslot_market TIMESTAMP,
@@ -113,12 +115,12 @@ public.market_ledger (
 │      ▼           ▼                 ▼                                    │
 │   ┌─────────┐ ┌─────────────┐ ┌───────────────┐                        │
 │   │ orders  │ │   assets    │ │ market_ledger │                        │
-│   │ planned │ │ to activate │ │ (actual trade)│                        │
+│   │ planned │ │ to activate │ │ opt-in fallback│                       │
 │   └─────────┘ └─────────────┘ └───────────────┘                        │
 │                                    │                                    │
 │                                    │ FK: bid_record_id                  │
 │                                    ▼                                    │
-│                             What ACTUALLY happened                      │
+│                          Local fallback market rows                     │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -164,6 +166,24 @@ python flexi_manager.py --fsp supsi01 --slot "2026-01-09T12:00:00" --dry-run
 # Actually send control commands
 python flexi_manager.py --fsp supsi01 --live
 ```
+
+### Dry-Run Activation Simulation
+
+```bash
+# Exercise the activation path with a simulated accepted quantity
+python flexi_manager.py --fsp supsi01 --dry-run --simulate-sold-mw 0.015
+```
+
+`--simulate-sold-mw` is dry-run only. It bypasses both NODES and `market_ledger`, creates an in-memory simulated sell trade for the target slot, and is intended for allocation/control-path testing without depending on market results.
+
+### Market Ledger Fallback
+
+```bash
+# Prefer NODES accepted trades, but fall back to local market_ledger if none are found
+python flexi_manager.py --fsp supsi01 --dry-run --allow-market-ledger-fallback
+```
+
+Without `--allow-market-ledger-fallback`, a slot with no accepted NODES trades results in no activation. Use the fallback only when operations guarantee that local `market_ledger` rows represent confirmed market results, because they may otherwise be posted orders rather than accepted/cleared trades.
 
 ### Different Allocation Strategies
 
@@ -239,6 +259,8 @@ Autonomous mode can publish actual pre-activation commands when you run with `--
 | `--offset`      | `-t` | Time offset from now (e.g., `30m`, `2h`, `1h30m`) | - |
 | `--dry-run`     | `-d` | Simulate only | Yes |
 | `--live`        | `-l` | Send actual commands | No |
+| `--simulate-sold-mw` | - | Dry-run-only accepted quantity simulation in MW | - |
+| `--allow-market-ledger-fallback` | - | Allow local `public.market_ledger` fallback when NODES has no accepted trades | No |
 | `--allocation`  | `-a` | Allocation strategy | `modulation_aware` |
 | `--fallback-strategy` | - | Strategy to use when no bid record exists | - |
 | `--list-strategies` | - | List configured strategies and exit | No |
@@ -299,9 +321,11 @@ Related assets from `public.bid_record_assets`:
 
 ### Step 1: Query Market Results
 
-The script queries for actual trades:
-1. **Local market_ledger** (PostgreSQL) - checked first for speed
-2. **NODES API** - fallback if no local data
+The script queries for actual accepted trades in this order:
+
+1. **Dry-run simulation** if `--simulate-sold-mw` is provided
+2. **NODES API accepted sell trades** for the organization and slot
+3. **Local `public.market_ledger` fallback** only if `--allow-market-ledger-fallback` is set
 
 **Only actual trades trigger activation.** The bid record quantity (what we offered) is NOT used - only what was actually accepted matters.
 
@@ -313,6 +337,16 @@ total_sold_mw = sum(t.get("quantity", 0) for t in trades)
 if total_sold_mw == 0:
     return "no_trades"
 ```
+
+For NODES results, the manager queries the `trades` endpoint with the slot time range, then filters locally for:
+
+- `side == "Sell"`
+- matching organization when organization identifiers are present
+- matching slot boundaries when trade timestamps are present
+- accepted/cleared/executed/filled/settled status values
+- positive quantity
+
+The local filtering is intentional: server-side organization and status filters have returned HTTP 400 for this endpoint in practice.
 
 ### Step 2: Allocate Flexibility
 
@@ -363,6 +397,19 @@ Discrete assets (ON/OFF):
 Continuous assets (if needed for remaining):
   ECM63.1 (EV Charger 1): 0 kW   → No change needed
 ```
+
+#### Persistence Strategies
+
+If the bid strategy has `flexibility_method: "persistence"`, allocation does **not** use the generic allocator. Instead, the manager reconstructs the activation plan from `public.bid_record_assets.available_flexibility_kw`, using only assets with positive stored bid-time flexibility.
+
+Persistence activation is conservative:
+
+1. Discrete assets are selected as whole assets using the stored bid-time kW values, without exceeding the accepted quantity when possible.
+2. Continuous assets fill the remaining accepted quantity, capped by their stored bid-time plan.
+3. If the accepted quantity covers the full stored plan, all stored assets are activated.
+4. If no positive bid asset rows exist, the manager fails closed with `persistence_no_positive_bid_assets` and performs no new activation.
+
+For persistence strategies, any selected discrete asset with positive activation kW is forced **OFF**. This avoids the normal 50% capacity threshold from leaving a selected heat pump ON when the stored bid-time flexibility is smaller than its configured capacity.
 
 ### Step 3: Control Assets
 
@@ -598,7 +645,9 @@ When the target doesn't exactly match available discrete combinations, the syste
 2026-01-15 07:30:00::INFO::run::Allocation strategy: modulation_aware
 2026-01-15 07:30:00::INFO::run::----------------------------------------------------------------------
 2026-01-15 07:30:00::INFO::run::Step 1: Querying market results...
-2026-01-15 07:30:01::INFO::get_trades_from_ledger::Found 1 trades in market_ledger
+2026-01-15 07:30:01::INFO::run::Querying NODES accepted trades before any local ledger fallback...
+2026-01-15 07:30:01::INFO::get_accepted_trades_for_slot::Kept 1 accepted sell trades for organization <org_id> and requested slot
+2026-01-15 07:30:01::INFO::run::MARKET RESULT SOURCE: NODES accepted trades
 2026-01-15 07:30:01::INFO::run::----------------------------------------------------------------------
 2026-01-15 07:30:01::INFO::run::Total flexibility to deliver: 0.015 MW (15.00 kW)
 2026-01-15 07:30:01::INFO::run::----------------------------------------------------------------------
@@ -922,6 +971,14 @@ No assets will be activated.
 
 **This is correct behavior** - we only activate flexibility when there's an actual trade (DSO accepted our offer). The bid record quantity (what we offered) is NOT used for activation.
 
+By default, this check is based on NODES accepted trades. If you need the old local-ledger behavior for controlled testing, pass `--allow-market-ledger-fallback`; otherwise `market_ledger` rows are ignored because they may represent posted orders.
+
+### "persistence_no_positive_bid_assets"
+
+This means the selected bid strategy uses `flexibility_method: "persistence"`, but the bid record has no positive `public.bid_record_assets.available_flexibility_kw` rows. The manager fails closed, performs no new activation, and restores previously controlled assets if needed.
+
+Check that `trader_fsp.py` stored the per-asset bid plan and that the expected assets have positive `available_flexibility_kw`.
+
 ### "Could not allocate flexibility to any asset"
 
 - Check FSP's `assets` list in config
@@ -971,6 +1028,8 @@ Under-delivery: -6 kW (15%)
 The system uses a threshold (default 50% of capacity) to decide ON/OFF:
 - Curtailment ≥ 50% of capacity → Switch OFF
 - Curtailment < 50% of capacity → Keep ON
+
+Exception: persistence strategies force selected discrete assets OFF for any positive activation kW, because the stored bid-time flexibility is the strategy's activation plan.
 
 Configure per asset if needed:
 ```json
