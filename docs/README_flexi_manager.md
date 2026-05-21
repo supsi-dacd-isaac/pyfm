@@ -274,7 +274,7 @@ Autonomous mode can publish actual pre-activation commands when you run with `--
 | `--rabbitmq-user` | - | RabbitMQ username | `guest` |
 | `--rabbitmq-pass` | - | RabbitMQ password | `guest` |
 | `--rabbitmq-vhost` | - | RabbitMQ virtual host | `/` |
-| `--rabbitmq-exchange` | - | RabbitMQ exchange name | `flexi_commands` |
+| `--rabbitmq-exchange` | - | Legacy publisher exchange default. Asset commands use `rabbitMQ.<section>.exchange` | `rabbitMQ.exchange` or `flexi_commands` |
 | `--autonomous` | - | Enable autonomous analysis when no activation is required | From config |
 | `--no-autonomous` | - | Disable autonomous analysis, overriding config | From config |
 | `--autonomous-lookahead` | - | Hours to forecast for autonomous analysis | From config or `3` |
@@ -429,13 +429,16 @@ When RabbitMQ is enabled (`--rabbitmq`), the manager also queues **restore comma
 
 ### Step 4: Publish to RabbitMQ
 
-When `--rabbitmq` is active, all pending commands (curtailment + restore) are published as a batch to the `flexi_commands` exchange. Each command payload is enriched with:
+When `--rabbitmq` is active, all pending commands (curtailment + restore) are
+published through the RabbitMQ destination selected by each asset's
+`asset_mapping.<asset>.rabbitCommandSection`. Each command payload is enriched with:
 
 - **Clean `slot_start` / `slot_end`** timestamps (`YYYY-MM-DDTHH:MM:SS`, no timezone suffix, no microseconds)
 - **`dry_run`** flag
 - **EV `schedule`** dictionary (for EV charger commands only)
 
-The forwarder (`forwarder.py`) consumes these commands from the `asset_commands` queue and translates them into AEM-specific HTTP requests.
+The destination exchange, queue, and routing key are read from the `rabbitMQ`
+section in the configured `connectionsFile`.
 
 ---
 
@@ -445,21 +448,64 @@ The forwarder (`forwarder.py`) consumes these commands from the `asset_commands`
 
 ```
 flexi_manager.py
-    -> RabbitMQ exchange: flexi_commands
-    -> RabbitMQ queue: asset_commands
+    -> asset_mapping.<asset>.rabbitCommandSection
+    -> rabbitMQ.<section>.exchange / queue / routingKey
     -> forwarder.py
     -> AEM API
 ```
 
 The **manager** decides **what** should happen for the next market slot. The **forwarder** decides **how** to translate that into AEM-specific HTTP requests. AEM-specific endpoint paths, body modes, and URL quirks stay in the forwarder and its `forwarder_targets.json` configuration.
 
-### Routing Keys
+### Command Destinations
 
-```
-commands.{asset_type}.{asset_id}
+Asset commands require an explicit RabbitMQ command section in `asset_mapping`:
+
+```json
+{
+  "asset_mapping": {
+    "ECM96.2": {
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands"
+    },
+    "ECM68.3": {
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands"
+    }
+  }
+}
 ```
 
-Examples: `commands.heat_pump.ECM96.2`, `commands.ev_charger.ECM63.1`
+Allowed values are `realAssetCommands` and `simulatedAssetCommands`.
+`simulatedAssetMeasures` is not valid for commands.
+
+The section name selects a destination from `connectionsFile`:
+
+```json
+{
+  "rabbitMQ": {
+    "host": "localhost",
+    "port": 5672,
+    "username": "guest",
+    "password": "guest",
+    "virtualHost": "/",
+    "realAssetCommands": {
+      "exchange": "flexi_commands",
+      "queue": "flexi_commands_queue",
+      "routingKey": "real_asset.command"
+    },
+    "simulatedAssetCommands": {
+      "exchange": "flexi_sim_commands",
+      "queue": "flexi_sim_commands_queue",
+      "routingKey": "sim_asset.command"
+    }
+  }
+}
+```
+
+If `rabbitCommandSection` is missing, invalid, points to a missing `rabbitMQ`
+section, or selects a section missing `exchange`, `queue`, or `routingKey`, the
+manager logs a warning and skips that asset command. There is no implicit
+fallback to the old `commands.{asset_type}.{asset_id}` route.
 
 ### Timestamp Formatting
 
@@ -565,9 +611,9 @@ The restore power is chosen using this fallback chain:
 | Mode | RabbitMQ enabled | What happens |
 |------|------------------|--------------|
 | `--dry-run` | No | Commands logged locally, nothing sent |
-| `--dry-run` | Yes (`--rabbitmq`) | Commands published to RabbitMQ with `dry_run=true`; forwarder sees the flag and does not POST to AEM |
+| `--dry-run` | Yes (`--rabbitmq`) | Commands with a valid `rabbitCommandSection` are published to RabbitMQ with `dry_run=true`; forwarder sees the flag and does not POST to AEM |
 | `--live` | No | Direct local actuation (MQTT/HTTP/OCPP/simulation) |
-| `--live` | Yes (`--rabbitmq`) | Commands published to RabbitMQ with `dry_run=false`; forwarder sends real requests to AEM |
+| `--live` | Yes (`--rabbitmq`) | Commands with a valid `rabbitCommandSection` are published to RabbitMQ with `dry_run=false`; forwarder sends real requests to AEM |
 
 ### Slot Timing
 
@@ -721,6 +767,8 @@ When both discrete and continuous assets are available, continuous assets fill t
 To enable actual asset control, configure each asset in `asset_mapping` with:
 - **Modulation type**: `discrete` (ON/OFF) or `continuous` (linear)
 - **Control interface**: How to send commands to the device
+- **RabbitMQ command section**: `realAssetCommands` or `simulatedAssetCommands`
+  when commands should be published through `--rabbitmq`
 
 ```json
 {
@@ -731,6 +779,7 @@ To enable actual asset control, configure each asset in `asset_mapping` with:
       "description": "HP Cinema 1",
       "capacity_kw": 15.0,
       "flexibility_factor": 0.85,
+      "rabbitCommandSection": "realAssetCommands",
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 15.0],
       "control": {
@@ -745,6 +794,7 @@ To enable actual asset control, configure each asset in `asset_mapping` with:
       "description": "EV Charger 1",
       "capacity_kw": 11.0,
       "flexibility_factor": 0.70,
+      "rabbitCommandSection": "realAssetCommands",
       "modulation_type": "continuous",
       "min_power_kw": 0.0,
       "restore_power_kw": 6.0,
@@ -767,6 +817,7 @@ To enable actual asset control, configure each asset in `asset_mapping` with:
 | `min_power_kw` | number | Minimum power for continuous assets | `0.0` |
 | `restore_power_kw` | number | EV restore power (highest priority) | - |
 | `default_power_kw` | number | EV default charging power (second priority) | - |
+| `rabbitCommandSection` | string | RabbitMQ command destination section: `realAssetCommands` or `simulatedAssetCommands` | No command sent when omitted |
 
 *Default by type: `heat_pump` → `discrete`, `ev_charger` → `continuous`
 
