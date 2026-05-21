@@ -6,10 +6,10 @@ and the direct actuator script `scripts/flexi_actuator.py`. The requested
 
 ## Topology and Destination Resolution
 
-`flexi_manager.py` reads RabbitMQ connection and destination settings from the
-main config file's `connectionsFile`, under the top-level `rabbitMQ` object.
-Each asset command is routed through the asset's explicit
-`asset_mapping.<asset_id>.rabbitCommandSection`.
+`flexi_manager.py` and `flexi_actuator.py` read RabbitMQ connection and
+destination settings from the main config file's `connectionsFile`, under the
+top-level `rabbitMQ` object. Each asset command is routed through the asset's
+explicit `asset_mapping.<asset_id>.rabbitCommandSection`.
 
 Allowed command sections:
 
@@ -24,6 +24,7 @@ Example destinations:
 | --- | --- | --- | --- |
 | `realAssetCommands` | `flexi_commands` | `flexi_commands_queue` | `real_asset.command` |
 | `simulatedAssetCommands` | `flexi_sim_commands` | `flexi_sim_commands_queue` | `sim_asset.command` |
+| `simulatedAssetMeasures` | `flexi_sim_measures` | `flexi_sim_measures_queue` | `sim_asset.measure` |
 
 If an asset does not define `rabbitCommandSection`, `flexi_manager.py` logs a
 warning and skips that command. It does not fall back to the legacy
@@ -35,8 +36,7 @@ skipped.
 For each resolved destination, the publisher declares the topic exchange,
 declares the queue, and binds the queue to the configured routing key before
 publishing. Optional batch metadata is sent to the same resolved destination.
-The measurement helper in `flexi_manager.py` still uses the legacy
-`measurements.{asset_type}.{asset_id}` routing pattern.
+No message publisher uses the legacy top-level `rabbitMQ.exchange` value.
 
 Command messages are JSON with persistent delivery (`delivery_mode=2`),
 `content_type=application/json`, and a RabbitMQ priority matching the message
@@ -65,9 +65,8 @@ keyed by UTC timestamps, with one power value per 15-minute interval.
 
 ## Batch Header
 
-When `flexi_manager.py` publishes commands as a batch, it sends a header to
-each resolved command destination using that destination's routing key. Legacy
-publisher calls may still use `commands.batch.header`:
+When commands are published as a batch, a header is sent to each resolved
+command destination using that destination's routing key:
 
 ```json
 {
@@ -206,8 +205,8 @@ The outer envelope uses `command_type=preactivate`.
 ## Measurement Envelope
 
 `flexi_manager.py` also contains a generic measurement publisher, although the
-activation paths above publish commands. Measurement messages use
-`measurements.{asset_type}.{asset_id}`:
+activation paths above publish commands. Measurement publishing must receive an
+explicit destination from `rabbitMQ.simulatedAssetMeasures`:
 
 ```json
 {

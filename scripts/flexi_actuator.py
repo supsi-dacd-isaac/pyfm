@@ -41,6 +41,13 @@ MODULATION_DEFAULTS = {
 }
 
 DEFAULT_EV_INTERVAL_MINUTES = 15
+RABBIT_DESTINATION_SECTIONS = (
+    "realAssetCommands",
+    "simulatedAssetCommands",
+    "simulatedAssetMeasures",
+)
+RABBIT_COMMAND_SECTIONS = ("realAssetCommands", "simulatedAssetCommands")
+RABBIT_DESTINATION_FIELDS = ("exchange", "queue", "routingKey")
 
 
 def _build_rabbitmq_batch_header(slot_info: dict, command_count: int) -> dict:
@@ -75,17 +82,33 @@ def _build_rabbitmq_command_message(
 def _log_rabbitmq_messages(
     commands: List[dict],
     slot_info: Optional[dict],
-    routing_key: Optional[str],
-    batch_routing_key: str,
     logger: logging.Logger,
 ) -> None:
     """Log the RabbitMQ JSON body strings that will be published."""
+    destination_counts: Dict[tuple, int] = {}
+    for command in commands:
+        destination = command.get("rabbitmq_destination", {})
+        destination_key = (
+            destination.get("exchange"),
+            destination.get("queue"),
+            destination.get("routing_key"),
+        )
+        destination_counts[destination_key] = destination_counts.get(destination_key, 0) + 1
+
     if slot_info:
-        batch_body = json.dumps(_build_rabbitmq_batch_header(slot_info, len(commands)))
-        logger.info("RabbitMQ batch header JSON (routing_key=%s): %s", batch_routing_key, batch_body)
+        for (exchange, queue, routing_key), command_count in destination_counts.items():
+            batch_body = json.dumps(_build_rabbitmq_batch_header(slot_info, command_count))
+            logger.info(
+                "RabbitMQ batch header JSON (exchange=%s, queue=%s, routing_key=%s): %s",
+                exchange,
+                queue,
+                routing_key,
+                batch_body,
+            )
 
     for command in commands:
-        command_routing_key = routing_key or f"commands.{command.get('asset_type')}.{command.get('asset_id')}"
+        destination = command.get("rabbitmq_destination", {})
+        command_routing_key = destination.get("routing_key")
         command_body = json.dumps(
             _build_rabbitmq_command_message(
                 asset_id=command.get("asset_id"),
@@ -95,18 +118,19 @@ def _log_rabbitmq_messages(
                 priority=command.get("priority", 5),
             )
         )
-        logger.info("RabbitMQ command JSON (routing_key=%s): %s", command_routing_key, command_body)
+        logger.info(
+            "RabbitMQ command JSON (exchange=%s, queue=%s, routing_key=%s): %s",
+            destination.get("exchange"),
+            destination.get("queue"),
+            command_routing_key,
+            command_body,
+        )
 
 
 class RabbitMQPublisher:
     """
-    Publishes control commands to RabbitMQ using the same exchange, queue,
-    routing-key, and message serialization conventions as flexi_manager.py.
+    Publishes control commands to RabbitMQ using explicit destination sections.
     """
-
-    DEFAULT_EXCHANGE = "flexi_commands"
-    DEFAULT_QUEUE_COMMANDS = "asset_commands"
-    DEFAULT_QUEUE_MEASUREMENTS = "asset_measurements"
 
     def __init__(
         self,
@@ -115,10 +139,7 @@ class RabbitMQPublisher:
         username: str = "guest",
         password: str = "guest",
         virtual_host: str = "/",
-        exchange: Optional[str] = None,
         logger: Optional[logging.Logger] = None,
-        queue: Optional[str] = None,
-        routing_key: Optional[str] = None,
     ):
         if not RABBITMQ_AVAILABLE:
             raise RuntimeError("pika library not installed. Run: pip install pika")
@@ -128,16 +149,12 @@ class RabbitMQPublisher:
         self.username = username
         self.password = password
         self.virtual_host = virtual_host
-        self.exchange = exchange or self.DEFAULT_EXCHANGE
-        self.queue = queue or self.DEFAULT_QUEUE_COMMANDS
-        self.routing_key = routing_key
-        self.command_binding_key = routing_key or "commands.#"
-        self.batch_routing_key = routing_key or "commands.batch.header"
         self.logger = logger or logging.getLogger(__name__)
 
         self.connection = None
         self.channel = None
         self._connected = False
+        self._declared_destinations = set()
 
     def connect(self) -> bool:
         """Establish connection to RabbitMQ server."""
@@ -155,38 +172,12 @@ class RabbitMQPublisher:
             self.connection = pika.BlockingConnection(parameters)
             self.channel = self.connection.channel()
 
-            self.channel.exchange_declare(
-                exchange=self.exchange,
-                exchange_type="topic",
-                durable=True,
-            )
-            self.channel.queue_declare(
-                queue=self.queue,
-                durable=True,
-            )
-            self.channel.queue_declare(
-                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
-                durable=True,
-            )
-            self.channel.queue_bind(
-                exchange=self.exchange,
-                queue=self.queue,
-                routing_key=self.command_binding_key,
-            )
-            self.channel.queue_bind(
-                exchange=self.exchange,
-                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
-                routing_key="measurements.#",
-            )
-
             self._connected = True
             self.logger.info(
-                "Connected to RabbitMQ at %s:%d (exchange: %s, queue: %s, routing_key: %s)",
+                "Connected to RabbitMQ at %s:%d (vhost: %s)",
                 self.host,
                 self.port,
-                self.exchange,
-                self.queue,
-                self.command_binding_key,
+                self.virtual_host,
             )
             return True
 
@@ -209,6 +200,60 @@ class RabbitMQPublisher:
         """Check if connected to RabbitMQ."""
         return self._connected and self.connection and self.connection.is_open
 
+    def _declare_destination(self, exchange: str, queue: str, routing_key: str) -> None:
+        """Declare and bind a RabbitMQ destination once per connection."""
+        destination_key = (exchange, queue, routing_key)
+        if destination_key in self._declared_destinations:
+            return
+
+        self.channel.exchange_declare(
+            exchange=exchange,
+            exchange_type="topic",
+            durable=True,
+        )
+        self.channel.queue_declare(
+            queue=queue,
+            durable=True,
+        )
+        self.channel.queue_bind(
+            exchange=exchange,
+            queue=queue,
+            routing_key=routing_key,
+        )
+        self._declared_destinations.add(destination_key)
+
+    def _publish_batch_header(
+        self,
+        slot_info: dict,
+        command_count: int,
+        exchange: str,
+        queue: str,
+        routing_key: str,
+        verbose: bool,
+    ) -> None:
+        """Publish a batch header to a concrete destination."""
+        batch_header = _build_rabbitmq_batch_header(slot_info, command_count)
+        body = json.dumps(batch_header)
+
+        self._declare_destination(exchange, queue, routing_key)
+        if verbose:
+            self.logger.info(
+                "RabbitMQ batch header JSON (exchange=%s, queue=%s, routing_key=%s): %s",
+                exchange,
+                queue,
+                routing_key,
+                body,
+            )
+        self.channel.basic_publish(
+            exchange=exchange,
+            routing_key=routing_key,
+            body=body,
+            properties=pika.BasicProperties(
+                delivery_mode=2,
+                content_type="application/json",
+            ),
+        )
+
     def publish_command(
         self,
         asset_id: str,
@@ -217,21 +262,37 @@ class RabbitMQPublisher:
         payload: dict,
         priority: int = 5,
         verbose: bool = False,
+        exchange: Optional[str] = None,
+        queue: Optional[str] = None,
+        routing_key: Optional[str] = None,
     ) -> bool:
         """Publish a control command to RabbitMQ."""
         if not self.is_connected():
             self.logger.warning("Not connected to RabbitMQ - cannot publish command")
             return False
 
-        routing_key = self.routing_key or f"commands.{asset_type}.{asset_id}"
+        if not exchange or not queue or not routing_key:
+            self.logger.error(
+                "Missing RabbitMQ destination for command asset %s - cannot publish",
+                asset_id,
+            )
+            return False
+
         message = _build_rabbitmq_command_message(asset_id, asset_type, command_type, payload, priority)
         body = json.dumps(message)
 
         try:
+            self._declare_destination(exchange, queue, routing_key)
             if verbose:
-                self.logger.info("RabbitMQ command JSON (routing_key=%s): %s", routing_key, body)
+                self.logger.info(
+                    "RabbitMQ command JSON (exchange=%s, queue=%s, routing_key=%s): %s",
+                    exchange,
+                    queue,
+                    routing_key,
+                    body,
+                )
             self.channel.basic_publish(
-                exchange=self.exchange,
+                exchange=exchange,
                 routing_key=routing_key,
                 body=body,
                 properties=pika.BasicProperties(
@@ -241,7 +302,9 @@ class RabbitMQPublisher:
                 ),
             )
             self.logger.debug(
-                "Published command to %s: %s -> %s",
+                "Published command to exchange=%s queue=%s routing_key=%s: %s -> %s",
+                exchange,
+                queue,
                 routing_key,
                 command_type,
                 asset_id,
@@ -266,28 +329,37 @@ class RabbitMQPublisher:
         success_count = 0
 
         if slot_info:
-            batch_header = _build_rabbitmq_batch_header(slot_info, len(commands))
-            body = json.dumps(batch_header)
-            try:
-                if verbose:
-                    self.logger.info(
-                        "RabbitMQ batch header JSON (routing_key=%s): %s",
-                        self.batch_routing_key,
-                        body,
+            destination_counts: Dict[tuple, int] = {}
+            for command in commands:
+                destination = command.get("rabbitmq_destination", {})
+                if not destination.get("exchange") or not destination.get("queue") or not destination.get("routing_key"):
+                    self.logger.warning(
+                        "Skipping RabbitMQ batch header for command without destination: asset=%s",
+                        command.get("asset_id"),
                     )
-                self.channel.basic_publish(
-                    exchange=self.exchange,
-                    routing_key=self.batch_routing_key,
-                    body=body,
-                    properties=pika.BasicProperties(
-                        delivery_mode=2,
-                        content_type="application/json",
-                    ),
+                    continue
+                destination_key = (
+                    destination.get("exchange"),
+                    destination.get("queue"),
+                    destination.get("routing_key"),
                 )
+                destination_counts[destination_key] = destination_counts.get(destination_key, 0) + 1
+
+            try:
+                for (exchange, queue, routing_key), command_count in destination_counts.items():
+                    self._publish_batch_header(
+                        slot_info=slot_info,
+                        command_count=command_count,
+                        exchange=exchange,
+                        queue=queue,
+                        routing_key=routing_key,
+                        verbose=verbose,
+                    )
             except Exception as exc:
                 self.logger.warning("Failed to publish batch header: %s", str(exc))
 
         for cmd in commands:
+            destination = cmd.get("rabbitmq_destination", {})
             if self.publish_command(
                 asset_id=cmd.get("asset_id"),
                 asset_type=cmd.get("asset_type"),
@@ -295,6 +367,9 @@ class RabbitMQPublisher:
                 payload=cmd.get("payload", {}),
                 priority=cmd.get("priority", 5),
                 verbose=verbose,
+                exchange=destination.get("exchange"),
+                queue=destination.get("queue"),
+                routing_key=destination.get("routing_key"),
             ):
                 success_count += 1
 
@@ -367,6 +442,71 @@ def _load_rabbitmq_config(config: dict, config_path: str, logger: logging.Logger
         return {}
 
     return conns.get("rabbitMQ", {})
+
+
+def _available_rabbit_destination_sections(rabbitmq_config: dict) -> List[str]:
+    """Return configured RabbitMQ sections that may provide destinations."""
+    return [
+        section_name
+        for section_name in RABBIT_DESTINATION_SECTIONS
+        if isinstance(rabbitmq_config.get(section_name), dict)
+    ]
+
+
+def _resolve_rabbitmq_command_destination(
+    asset_id: str,
+    asset_config: dict,
+    rabbitmq_config: dict,
+    logger: logging.Logger,
+) -> Optional[dict]:
+    """Resolve the RabbitMQ command destination for one actuator command."""
+    section_name = asset_config.get("rabbitCommandSection")
+    if not section_name:
+        logger.error(
+            "Skipping RabbitMQ command for asset %s: missing asset_mapping.rabbitCommandSection",
+            asset_id,
+        )
+        return None
+
+    if section_name not in RABBIT_COMMAND_SECTIONS:
+        logger.error(
+            "Skipping RabbitMQ command for asset %s: invalid asset_mapping.rabbitCommandSection '%s' "
+            "(allowed: %s)",
+            asset_id,
+            section_name,
+            ", ".join(RABBIT_COMMAND_SECTIONS),
+        )
+        return None
+
+    section = rabbitmq_config.get(section_name)
+    if not isinstance(section, dict):
+        logger.error(
+            "Skipping RabbitMQ command for asset %s: rabbitMQ.%s section not found",
+            asset_id,
+            section_name,
+        )
+        return None
+
+    missing_fields = [
+        field_name
+        for field_name in RABBIT_DESTINATION_FIELDS
+        if not section.get(field_name)
+    ]
+    if missing_fields:
+        logger.error(
+            "Skipping RabbitMQ command for asset %s: rabbitMQ.%s missing required field(s): %s",
+            asset_id,
+            section_name,
+            ", ".join(missing_fields),
+        )
+        return None
+
+    return {
+        "section": section_name,
+        "exchange": section["exchange"],
+        "queue": section["queue"],
+        "routing_key": section["routingKey"],
+    }
 
 
 def _collect_flexibilities(args) -> List[str]:
@@ -908,19 +1048,19 @@ Examples:
     parser.add_argument(
         "--rabbitmq-exchange",
         default=None,
-        help=f"RabbitMQ exchange name (default: {RabbitMQPublisher.DEFAULT_EXCHANGE})",
+        help="Deprecated and ignored. RabbitMQ exchanges come from destination sections.",
     )
     parser.add_argument(
         "--rabbit-exchange",
-        help="Override RabbitMQ exchange name for this actuator command",
+        help="Deprecated and ignored. RabbitMQ exchanges come from destination sections.",
     )
     parser.add_argument(
         "--rabbit-queue",
-        help="Override RabbitMQ queue name for this actuator command",
+        help="Deprecated and ignored. RabbitMQ queues come from destination sections.",
     )
     parser.add_argument(
         "--rabbit-routing-key",
-        help="Override RabbitMQ routing key for publishing and command queue binding",
+        help="Deprecated and ignored. RabbitMQ routing keys come from destination sections.",
     )
 
     args = parser.parse_args()
@@ -937,7 +1077,15 @@ Examples:
     config_path = _resolve_config_path(args.config_file)
     config = _load_config(config_path, logger)
     rabbitmq_config = _load_rabbitmq_config(config, config_path, logger)
-    rabbitmq_command_config = rabbitmq_config.get("realAssetCommands", {})
+    logger.info(
+        "RabbitMQ destination sections available: %s",
+        ", ".join(_available_rabbit_destination_sections(rabbitmq_config)) or "none",
+    )
+    if args.rabbitmq_exchange or args.rabbit_exchange or args.rabbit_queue or args.rabbit_routing_key:
+        logger.warning(
+            "RabbitMQ destination override flags are ignored; destinations are resolved only from "
+            "rabbitMQ.realAssetCommands, rabbitMQ.simulatedAssetCommands, or rabbitMQ.simulatedAssetMeasures"
+        )
 
     fsps = config.get("fm", {}).get("actors", {}).get("fsps", {})
     if args.fsp not in fsps:
@@ -967,14 +1115,32 @@ Examples:
 
     for asset_id in labels:
         try:
+            asset_config = asset_mapping[asset_id]
             command, actual_curtailment_kw = _build_rabbitmq_command(
                 asset_id=asset_id,
-                asset_config=asset_mapping[asset_id],
+                asset_config=asset_config,
                 community=community,
                 normalized_command=normalized_command,
                 original_command=args.command.strip(),
                 duration_minutes=duration_minutes,
                 logger=logger,
+            )
+            destination = _resolve_rabbitmq_command_destination(
+                asset_id=asset_id,
+                asset_config=asset_config,
+                rabbitmq_config=rabbitmq_config,
+                logger=logger,
+            )
+            if destination is None:
+                sys.exit(1)
+            command["rabbitmq_destination"] = destination
+            logger.info(
+                "RabbitMQ destination for asset %s via section %s: exchange=%s, queue=%s, routing_key=%s",
+                asset_id,
+                destination["section"],
+                destination["exchange"],
+                destination["queue"],
+                destination["routing_key"],
             )
             commands.append(command)
             total_flexibility_kw += actual_curtailment_kw
@@ -1006,31 +1172,11 @@ Examples:
     rabbit_user = args.rabbitmq_user or rabbitmq_config.get("username") or rabbitmq_config.get("user") or "guest"
     rabbit_password = args.rabbitmq_pass or rabbitmq_config.get("password") or "guest"
     rabbit_vhost = args.rabbitmq_vhost or rabbitmq_config.get("virtualHost") or rabbitmq_config.get("virtual_host") or "/"
-    rabbit_exchange = (
-        args.rabbit_exchange
-        or args.rabbitmq_exchange
-        or rabbitmq_command_config.get("exchange")
-        or rabbitmq_config.get("exchange")
-        or RabbitMQPublisher.DEFAULT_EXCHANGE
-    )
-    rabbit_queue = (
-        args.rabbit_queue
-        or rabbitmq_command_config.get("queue")
-        or rabbitmq_config.get("queue")
-        or RabbitMQPublisher.DEFAULT_QUEUE_COMMANDS
-    )
-    rabbit_routing_key = (
-        args.rabbit_routing_key
-        or rabbitmq_command_config.get("routingKey")
-        or rabbitmq_command_config.get("routing_key")
-        or rabbitmq_config.get("routingKey")
-        or rabbitmq_config.get("routing_key")
-    )
     logger.info(
-        "RabbitMQ destination: exchange=%s, queue=%s, routing_key=%s",
-        rabbit_exchange,
-        rabbit_queue,
-        rabbit_routing_key or "commands.{asset_type}.{asset_id}",
+        "RabbitMQ connection: host=%s, port=%d, vhost=%s",
+        rabbit_host,
+        rabbit_port,
+        rabbit_vhost,
     )
 
     if args.dry_run:
@@ -1038,8 +1184,6 @@ Examples:
             _log_rabbitmq_messages(
                 commands=commands,
                 slot_info=slot_info,
-                routing_key=rabbit_routing_key,
-                batch_routing_key=rabbit_routing_key or "commands.batch.header",
                 logger=logger,
             )
         logger.info("[DRY-RUN] Skipping RabbitMQ publish")
@@ -1055,10 +1199,7 @@ Examples:
         username=rabbit_user,
         password=rabbit_password,
         virtual_host=rabbit_vhost,
-        exchange=rabbit_exchange,
         logger=logger,
-        queue=rabbit_queue,
-        routing_key=rabbit_routing_key,
     )
 
     try:

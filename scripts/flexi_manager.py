@@ -44,15 +44,20 @@ from classes.bidding_strategy import BiddingStrategy, StrategyManager
 import statistics
 
 
+ALLOWED_RABBIT_DESTINATION_SECTIONS = (
+    "realAssetCommands",
+    "simulatedAssetCommands",
+    "simulatedAssetMeasures",
+)
 ALLOWED_RABBIT_COMMAND_SECTIONS = ("realAssetCommands", "simulatedAssetCommands")
 RABBIT_COMMAND_DESTINATION_FIELDS = ("exchange", "queue", "routingKey")
 
 
-def _available_rabbit_command_sections(rabbitmq_cfg: dict) -> List[str]:
-    """Return configured RabbitMQ sections that are valid for asset commands."""
+def _available_rabbit_destination_sections(rabbitmq_cfg: dict) -> List[str]:
+    """Return configured RabbitMQ sections that may provide destinations."""
     return [
         section_name
-        for section_name in ALLOWED_RABBIT_COMMAND_SECTIONS
+        for section_name in ALLOWED_RABBIT_DESTINATION_SECTIONS
         if isinstance(rabbitmq_cfg.get(section_name), dict)
     ]
 
@@ -138,15 +143,11 @@ class RabbitMQPublisher:
     command actuation (forwarder), allowing for better scalability and
     reliable message delivery.
     
-    Asset commands may be published to a destination resolved per command
-    from the configured RabbitMQ command sections.  Legacy defaults remain
-    available for direct helper calls and measurement publishing.
+    Messages are published only to explicit destinations resolved from
+    RabbitMQ destination sections such as realAssetCommands,
+    simulatedAssetCommands, or simulatedAssetMeasures.
     """
-    
-    DEFAULT_EXCHANGE = "flexi_commands"
-    DEFAULT_QUEUE_COMMANDS = "asset_commands"
-    DEFAULT_QUEUE_MEASUREMENTS = "asset_measurements"
-    
+
     def __init__(
         self,
         host: str = "localhost",
@@ -154,7 +155,6 @@ class RabbitMQPublisher:
         username: str = "guest",
         password: str = "guest",
         virtual_host: str = "/",
-        exchange: str = None,
         logger: logging.Logger = None
     ):
         """
@@ -165,7 +165,6 @@ class RabbitMQPublisher:
         :param username: RabbitMQ username
         :param password: RabbitMQ password
         :param virtual_host: RabbitMQ virtual host
-        :param exchange: Exchange name (default: flexi_commands)
         :param logger: Logger instance
         """
         if not RABBITMQ_AVAILABLE:
@@ -176,7 +175,6 @@ class RabbitMQPublisher:
         self.username = username
         self.password = password
         self.virtual_host = virtual_host
-        self.exchange = exchange or self.DEFAULT_EXCHANGE
         self.logger = logger or logging.getLogger(__name__)
         
         self.connection = None
@@ -206,8 +204,8 @@ class RabbitMQPublisher:
             
             self._connected = True
             self.logger.info(
-                "Connected to RabbitMQ at %s:%d (vhost: %s, legacy exchange: %s)",
-                self.host, self.port, self.virtual_host, self.exchange
+                "Connected to RabbitMQ at %s:%d (vhost: %s)",
+                self.host, self.port, self.virtual_host
             )
             return True
             
@@ -302,19 +300,25 @@ class RabbitMQPublisher:
         :param command_type: Command type (curtail, restore, set_power, etc.)
         :param payload: Command payload dictionary
         :param priority: Message priority (0-9, higher = more urgent)
-        :param exchange: Destination exchange. Defaults to legacy exchange.
-        :param queue: Destination queue. Defaults to legacy commands queue.
-        :param routing_key: Destination routing key. Defaults to legacy asset route.
+        :param exchange: Destination exchange from a RabbitMQ destination section.
+        :param queue: Destination queue from a RabbitMQ destination section.
+        :param routing_key: Destination routing key from a RabbitMQ destination section.
         :return: True if published successfully
         """
         if not self.is_connected():
             self.logger.warning("Not connected to RabbitMQ - cannot publish command")
             return False
+
+        if not exchange or not queue or not routing_key:
+            self.logger.warning(
+                "Missing RabbitMQ destination for command asset %s - cannot publish",
+                asset_id,
+            )
+            return False
         
-        destination_exchange = exchange or self.exchange
-        destination_queue = queue or self.DEFAULT_QUEUE_COMMANDS
-        destination_routing_key = routing_key or f"commands.{asset_type}.{asset_id}"
-        binding_key = routing_key or "commands.#"
+        destination_exchange = exchange
+        destination_queue = queue
+        destination_routing_key = routing_key
         
         message = {
             "message_type": "command",
@@ -332,7 +336,7 @@ class RabbitMQPublisher:
             self._declare_destination(
                 destination_exchange,
                 destination_queue,
-                binding_key,
+                destination_routing_key,
             )
             self.channel.basic_publish(
                 exchange=destination_exchange,
@@ -363,7 +367,10 @@ class RabbitMQPublisher:
         asset_id: str,
         asset_type: str,
         measurement_type: str,
-        payload: dict
+        payload: dict,
+        exchange: str = None,
+        queue: str = None,
+        routing_key: str = None,
     ) -> bool:
         """
         Publish a measurement to RabbitMQ.
@@ -377,8 +384,13 @@ class RabbitMQPublisher:
         if not self.is_connected():
             self.logger.warning("Not connected to RabbitMQ - cannot publish measurement")
             return False
-        
-        routing_key = f"measurements.{asset_type}.{asset_id}"
+
+        if not exchange or not queue or not routing_key:
+            self.logger.warning(
+                "Missing RabbitMQ destination for measurement asset %s - cannot publish",
+                asset_id,
+            )
+            return False
         
         message = {
             "message_type": "measurement",
@@ -393,12 +405,12 @@ class RabbitMQPublisher:
 
         try:
             self._declare_destination(
-                self.exchange,
-                self.DEFAULT_QUEUE_MEASUREMENTS,
-                "measurements.#",
+                exchange,
+                queue,
+                routing_key,
             )
             self.channel.basic_publish(
-                exchange=self.exchange,
+                exchange=exchange,
                 routing_key=routing_key,
                 body=json.dumps(message),
                 properties=pika.BasicProperties(
@@ -434,12 +446,10 @@ class RabbitMQPublisher:
         
         success_count = 0
         
-        # Optionally publish a batch header. For asset-level command
-        # destinations, publish one header per resolved destination so each
+        # Optionally publish a batch header per resolved destination so each
         # queue receives metadata for the commands it will consume.
         if slot_info:
             destination_counts = {}
-            legacy_count = 0
             for cmd in commands:
                 destination = cmd.get("rabbitmq_destination") or {}
                 if destination:
@@ -450,17 +460,12 @@ class RabbitMQPublisher:
                     )
                     destination_counts[destination_key] = destination_counts.get(destination_key, 0) + 1
                 else:
-                    legacy_count += 1
+                    self.logger.warning(
+                        "Skipping RabbitMQ batch header for command without destination: asset=%s",
+                        cmd.get("asset_id"),
+                    )
 
             try:
-                if legacy_count:
-                    self._publish_batch_header(
-                        slot_info=slot_info,
-                        command_count=legacy_count,
-                        exchange=self.exchange,
-                        queue=self.DEFAULT_QUEUE_COMMANDS,
-                        routing_key="commands.batch.header",
-                    )
                 for (exchange, queue, routing_key), command_count in destination_counts.items():
                     self._publish_batch_header(
                         slot_info=slot_info,
@@ -3973,8 +3978,8 @@ Examples:
         "--rabbitmq-exchange",
         default=None,
         help=(
-            "Legacy RabbitMQ exchange default. Asset command destinations use "
-            "rabbitMQ.<rabbitCommandSection>.exchange from the connections file."
+            "Deprecated and ignored. RabbitMQ message exchanges are read only "
+            "from destination sections in the connections file."
         )
     )
     
@@ -4129,12 +4134,7 @@ Examples:
             rabbitmq_user = args.rabbitmq_user or rabbitmq_cfg.get("username", "guest")
             rabbitmq_password = args.rabbitmq_pass or rabbitmq_cfg.get("password", "guest")
             rabbitmq_vhost = args.rabbitmq_vhost or rabbitmq_cfg.get("virtualHost", "/")
-            legacy_exchange = (
-                args.rabbitmq_exchange
-                or rabbitmq_cfg.get("exchange")
-                or RabbitMQPublisher.DEFAULT_EXCHANGE
-            )
-            available_sections = _available_rabbit_command_sections(rabbitmq_cfg)
+            available_sections = _available_rabbit_destination_sections(rabbitmq_cfg)
 
             logger.info(
                 "RabbitMQ connection: host=%s, port=%d, vhost=%s",
@@ -4143,13 +4143,14 @@ Examples:
                 rabbitmq_vhost,
             )
             logger.info(
-                "RabbitMQ command sections available: %s",
+                "RabbitMQ destination sections available: %s",
                 ", ".join(available_sections) if available_sections else "none",
             )
             if args.rabbitmq_exchange:
-                logger.info(
-                    "--rabbitmq-exchange sets only the legacy publisher exchange; "
-                    "asset commands use rabbitMQ.<section>.exchange"
+                logger.warning(
+                    "--rabbitmq-exchange is ignored; RabbitMQ exchanges are resolved "
+                    "only from rabbitMQ.realAssetCommands, rabbitMQ.simulatedAssetCommands, "
+                    "or rabbitMQ.simulatedAssetMeasures"
                 )
 
             rabbitmq_publisher = RabbitMQPublisher(
@@ -4158,7 +4159,6 @@ Examples:
                 username=rabbitmq_user,
                 password=rabbitmq_password,
                 virtual_host=rabbitmq_vhost,
-                exchange=legacy_exchange,
                 logger=logger
             )
             if rabbitmq_publisher.connect():

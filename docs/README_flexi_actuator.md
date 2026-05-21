@@ -72,10 +72,23 @@ The main config points to the connections file:
 }
 ```
 
-The RabbitMQ destination is resolved from the `rabbitMQ.realAssetCommands` block when present:
+The RabbitMQ command destination is resolved from each asset's
+`asset_mapping.<asset>.rabbitCommandSection`. Allowed command values are
+`realAssetCommands` and `simulatedAssetCommands`; `simulatedAssetMeasures` is
+not valid for actuator commands.
 
 ```json
 {
+  "asset_mapping": {
+    "ECM96.2": {
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands"
+    },
+    "ECM68.3": {
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands"
+    }
+  },
   "rabbitMQ": {
     "host": "localhost",
     "port": 5672,
@@ -86,36 +99,34 @@ The RabbitMQ destination is resolved from the `rabbitMQ.realAssetCommands` block
       "exchange": "flexi_commands",
       "queue": "flexi_commands_queue",
       "routingKey": "real_asset.command"
+    },
+    "simulatedAssetCommands": {
+      "exchange": "flexi_sim_commands",
+      "queue": "flexi_sim_commands_queue",
+      "routingKey": "sim_asset.command"
     }
   }
 }
 ```
 
-If those destination fields are missing, the script falls back to the existing defaults:
-
-- Exchange: `flexi_commands`
-- Queue: `asset_commands`
-- Routing key: `commands.{asset_type}.{asset_id}` for command messages
-- Queue binding: `commands.#`
+If `rabbitCommandSection` is missing, invalid, points to a missing `rabbitMQ`
+section, or selects a section missing `exchange`, `queue`, or `routingKey`, the
+script exits without publishing. It does not fall back to `rabbitMQ.exchange`
+or `commands.{asset_type}.{asset_id}`.
 
 ## RabbitMQ Destination Overrides
 
-The actuator supports three optional CLI overrides:
+Destination override flags are deprecated and ignored:
 
-- `--rabbit-exchange`: exchange to declare and publish to
-- `--rabbit-queue`: command queue to declare and bind
-- `--rabbit-routing-key`: routing key for publishing and command queue binding
+- `--rabbitmq-exchange`
+- `--rabbit-exchange`
+- `--rabbit-queue`
+- `--rabbit-routing-key`
 
-Example using a custom simulated-asset destination:
-
-```bash
-python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --command force_off --rabbit-exchange flexi_sim_commands --rabbit-queue flexi_sim_commands_queue --rabbit-routing-key sim_asset.command
-```
-
-The script logs the resolved destination before publishing:
+The script logs the section-resolved destination before publishing:
 
 ```text
-RabbitMQ destination: exchange=flexi_sim_commands, queue=flexi_sim_commands_queue, routing_key=sim_asset.command
+RabbitMQ destination for asset ECM68.3 via section simulatedAssetCommands: exchange=flexi_sim_commands, queue=flexi_sim_commands_queue, routing_key=sim_asset.command
 ```
 
 ## Connection Overrides
@@ -126,7 +137,10 @@ The existing RabbitMQ connection options are still available:
 python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --command force_off --rabbitmq-host localhost --rabbitmq-port 5672 --rabbitmq-user guest --rabbitmq-pass guest --rabbitmq-vhost /
 ```
 
-`--rabbitmq-exchange` is also still accepted for backward compatibility. For destination-specific overrides, prefer `--rabbit-exchange`, `--rabbit-queue`, and `--rabbit-routing-key`.
+`--rabbitmq-exchange` is still accepted by the CLI for backward compatibility,
+but it is ignored. Message exchanges are read only from
+`rabbitMQ.realAssetCommands`, `rabbitMQ.simulatedAssetCommands`, or
+`rabbitMQ.simulatedAssetMeasures`.
 
 ## Common Examples
 
@@ -134,12 +148,6 @@ Current behavior without destination overrides:
 
 ```bash
 python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --command force_off
-```
-
-Send to a custom exchange, queue, and routing key:
-
-```bash
-python flexi_actuator.py --config_file ../conf/test_fm01_aem.json --fsp supsi01 --flexibility ECM96.2 --command force_off --rabbit-exchange flexi_sim_commands --rabbit-queue flexi_sim_commands_queue --rabbit-routing-key sim_asset.command
 ```
 
 Print the RabbitMQ JSON without publishing:

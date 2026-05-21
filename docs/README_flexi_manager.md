@@ -274,7 +274,7 @@ Autonomous mode can publish actual pre-activation commands when you run with `--
 | `--rabbitmq-user` | - | RabbitMQ username | `guest` |
 | `--rabbitmq-pass` | - | RabbitMQ password | `guest` |
 | `--rabbitmq-vhost` | - | RabbitMQ virtual host | `/` |
-| `--rabbitmq-exchange` | - | Legacy publisher exchange default. Asset commands use `rabbitMQ.<section>.exchange` | `rabbitMQ.exchange` or `flexi_commands` |
+| `--rabbitmq-exchange` | - | Deprecated and ignored; exchanges come only from RabbitMQ destination sections | - |
 | `--autonomous` | - | Enable autonomous analysis when no activation is required | From config |
 | `--no-autonomous` | - | Disable autonomous analysis, overriding config | From config |
 | `--autonomous-lookahead` | - | Hours to forecast for autonomous analysis | From config or `3` |
