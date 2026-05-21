@@ -1651,7 +1651,11 @@ class FlexibilityForecaster:
         # If target is provided, calculate the best bid
         if target_kw is not None:
             best_bid = self._calculate_best_bid(
-                target_kw, discrete_combos, continuous_available, continuous_assets
+                target_kw,
+                discrete_combos,
+                continuous_available,
+                continuous_assets,
+                allow_overdelivery=self.method != "persistence",
             )
             result["target_kw"] = target_kw
             result["recommended_bid_kw"] = best_bid["bid_kw"]
@@ -1669,7 +1673,8 @@ class FlexibilityForecaster:
         target_kw: float,
         discrete_combos: List[Tuple[float, Dict[str, float]]],
         continuous_max_kw: float,
-        continuous_assets: Dict[str, Dict] = None
+        continuous_assets: Dict[str, Dict] = None,
+        allow_overdelivery: bool = True,
     ) -> Dict:
         """
         Calculate the best achievable bid for a target flexibility.
@@ -1687,6 +1692,7 @@ class FlexibilityForecaster:
         :param discrete_combos: List of (total, allocation) from discrete assets
         :param continuous_max_kw: Maximum available from continuous assets
         :param continuous_assets: Dict of continuous asset details for per-asset allocation
+        :param allow_overdelivery: Whether candidates above target are allowed
         :return: Dict with 'bid_kw' and detailed allocation
         """
         continuous_assets = continuous_assets or {}
@@ -1709,6 +1715,7 @@ class FlexibilityForecaster:
         
         best_bid = None
         best_deviation = float('inf')
+        tolerance_kw = 1e-6
         
         for discrete_total, discrete_alloc in discrete_combos:
             # Can we reach target with this discrete combination + continuous?
@@ -1727,6 +1734,9 @@ class FlexibilityForecaster:
                 # Even with max continuous, we're under target
                 continuous_contrib = continuous_max_kw
                 total_bid = discrete_total + continuous_contrib
+
+            if not allow_overdelivery and total_bid > target_kw + tolerance_kw:
+                continue
             
             deviation = abs(total_bid - target_kw)
             
@@ -1739,11 +1749,18 @@ class FlexibilityForecaster:
                 best_deviation = deviation
                 # Calculate per-asset allocation for continuous assets
                 continuous_alloc = self._allocate_continuous(continuous_contrib, continuous_assets)
+                selected_discrete_alloc = discrete_alloc
+                if not allow_overdelivery:
+                    selected_discrete_alloc = {
+                        asset_id: power_kw
+                        for asset_id, power_kw in discrete_alloc.items()
+                        if power_kw > 0
+                    }
                 
                 best_bid = {
                     "bid_kw": round(total_bid, 3),
                     "allocation": {
-                        "discrete": discrete_alloc,
+                        "discrete": selected_discrete_alloc,
                         "continuous": continuous_alloc,
                         "continuous_total_kw": round(continuous_contrib, 3)
                     },
@@ -1752,6 +1769,19 @@ class FlexibilityForecaster:
                     "strategy": "discrete_first" if discrete_total > 0 else "continuous_only"
                 }
         
+        if best_bid is None:
+            return {
+                "bid_kw": 0.0,
+                "allocation": {
+                    "discrete": {},
+                    "continuous": {},
+                    "continuous_total_kw": 0.0
+                },
+                "discrete_kw": 0.0,
+                "continuous_kw": 0.0,
+                "strategy": "no_feasible_allocation"
+            }
+
         return best_bid
     
     def _allocate_continuous(
