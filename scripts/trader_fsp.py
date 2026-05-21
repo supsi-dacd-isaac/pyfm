@@ -196,6 +196,52 @@ def get_strategy_flexibility_discrete(
     return recommended_mw, achievable
 
 
+def build_persistence_assets_to_activate(portfolio_strategy_contexts):
+    """
+    Build bid_record_assets rows from the selected persistence allocation.
+
+    For persistence strategies, bid_record_assets.available_flexibility_kw is
+    the activation plan trusted by flexi_manager.py, not the full asset list.
+    """
+    assets_to_activate = []
+    added_assets = set()
+
+    for portfolio_context in portfolio_strategy_contexts.values():
+        asset_breakdown = portfolio_context.get("asset_breakdown", {})
+        allocation = portfolio_context.get("achievable_details", {}).get(
+            "recommended_allocation", {}
+        )
+
+        for asset_id, power_kw in allocation.get("discrete", {}).items():
+            if power_kw <= 0 or asset_id in added_assets:
+                continue
+            info = asset_breakdown.get(asset_id, {})
+            added_assets.add(asset_id)
+            assets_to_activate.append({
+                "asset_id": asset_id,
+                "description": info.get("description", asset_id),
+                "asset_type": info.get("asset_type", "unknown"),
+                "available_flexibility_kw": float(power_kw),
+                "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+            })
+
+        for asset_id, details in allocation.get("continuous", {}).items():
+            power_kw = details.get("power_kw", 0)
+            if power_kw <= 0 or asset_id in added_assets:
+                continue
+            info = asset_breakdown.get(asset_id, {})
+            added_assets.add(asset_id)
+            assets_to_activate.append({
+                "asset_id": asset_id,
+                "description": info.get("description", asset_id),
+                "asset_type": info.get("asset_type", "unknown"),
+                "available_flexibility_kw": float(power_kw),
+                "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+            })
+
+    return assets_to_activate
+
+
 def run_simple_mode(
     fsp,
     fmo,
@@ -1030,9 +1076,21 @@ if __name__ == "__main__":
                 strategy_target_kw = bid_params["flexibility_mw"] * 1000
                 if bid_params.get("ev_flexibility_mw", 0) > 0:
                     strategy_target_kw += bid_params["ev_flexibility_mw"] * 1000
+                total_dso_demand_up_kw = sum(
+                    dso_demand.get("Up", 0.0) for dso_demand in dso_demands
+                ) * 1000
+                effective_target_kw = strategy_target_kw
+                if total_dso_demand_up_kw > 0:
+                    effective_target_kw = min(strategy_target_kw, total_dso_demand_up_kw)
+                logger.info(
+                    "Persistence strategy effective bid target: %.3f kW (strategy_target=%.3f kW, dso_up_demand=%.3f kW)",
+                    effective_target_kw,
+                    strategy_target_kw,
+                    total_dso_demand_up_kw,
+                )
                 achievable = flex_forecaster.get_achievable_flexibility(
                     period_from=slot_time,
-                    target_kw=strategy_target_kw,
+                    target_kw=effective_target_kw,
                     allowed_assets=strategy.allowed_assets,
                     use_temperature=False,
                     asset_ids=portfolio_asset_ids,
@@ -1202,19 +1260,24 @@ if __name__ == "__main__":
             # Convert numpy types to native Python types to avoid SQL issues
             assets_to_activate = []
             if use_strategy_mode and strategy and portfolio_strategy_contexts is not None:
-                added_assets = set()
-                for portfolio_context in portfolio_strategy_contexts.values():
-                    for asset_id, info in portfolio_context.get("asset_breakdown", {}).items():
-                        if asset_id in added_assets:
-                            continue
-                        added_assets.add(asset_id)
-                        assets_to_activate.append({
-                            "asset_id": asset_id,
-                            "description": info.get("description", asset_id),
-                            "asset_type": info.get("asset_type", "unknown"),
-                            "available_flexibility_kw": float(info.get("available_flexibility_kw", 0)),
-                            "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
-                        })
+                if strategy_flexibility_method == "persistence":
+                    assets_to_activate = build_persistence_assets_to_activate(
+                        portfolio_strategy_contexts
+                    )
+                else:
+                    added_assets = set()
+                    for portfolio_context in portfolio_strategy_contexts.values():
+                        for asset_id, info in portfolio_context.get("asset_breakdown", {}).items():
+                            if asset_id in added_assets:
+                                continue
+                            added_assets.add(asset_id)
+                            assets_to_activate.append({
+                                "asset_id": asset_id,
+                                "description": info.get("description", asset_id),
+                                "asset_type": info.get("asset_type", "unknown"),
+                                "available_flexibility_kw": float(info.get("available_flexibility_kw", 0)),
+                                "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+                            })
             elif use_strategy_mode and strategy:
                 for asset_id, info in asset_breakdown.items():
                     if strategy.is_asset_allowed(asset_id):
