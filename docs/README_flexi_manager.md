@@ -447,14 +447,27 @@ section in the configured `connectionsFile`.
 ### Architecture
 
 ```
-flexi_manager.py
-    -> asset_mapping.<asset>.rabbitCommandSection
-    -> rabbitMQ.<section>.exchange / queue / routingKey
-    -> forwarder.py
-    -> AEM API
+Real asset command path:
+flexi_manager.py / flexi_actuator.py
+  -> rabbitMQ.realAssetCommands
+  -> forwarder.py
+  -> real API / AEM API
+
+Simulated asset path:
+flexi_manager.py / flexi_actuator.py
+  -> rabbitMQ.simulatedAssetCommands
+  -> external simulator application
+  -> rabbitMQ.simulatedAssetMeasures
+  -> forwarder.py
+  -> downstream API / measurement target
 ```
 
-The **manager** decides **what** should happen for the next market slot. The **forwarder** decides **how** to translate that into AEM-specific HTTP requests. AEM-specific endpoint paths, body modes, and URL quirks stay in the forwarder and its `forwarder_targets.json` configuration.
+The **manager** decides **what** should happen for the next market slot. For
+real assets, the **forwarder** decides **how** to translate that into
+AEM-specific HTTP requests. For simulated assets, commands go first to an
+external simulator application; that simulator is not implemented in `pyfm`.
+`pyfm` only publishes simulated asset commands and can consume simulated
+measures produced by the external simulator.
 
 ### Command Destinations
 
@@ -497,15 +510,35 @@ The section name selects a destination from `connectionsFile`:
       "exchange": "flexi_sim_commands",
       "queue": "flexi_sim_commands_queue",
       "routingKey": "sim_asset.command"
+    },
+    "simulatedAssetMeasures": {
+      "exchange": "flexi_sim_measures",
+      "queue": "flexi_sim_measures_queue",
+      "routingKey": "sim_asset.measure"
     }
   }
 }
 ```
 
+Section responsibilities:
+
+| Section | Producer | Consumer | Purpose |
+|---------|----------|----------|---------|
+| `rabbitMQ.realAssetCommands` | `flexi_manager.py` / `flexi_actuator.py` | `forwarder.py` | Real physical asset commands |
+| `rabbitMQ.simulatedAssetCommands` | `flexi_manager.py` / `flexi_actuator.py` | External simulator application | Commands for simulated assets |
+| `rabbitMQ.simulatedAssetMeasures` | External simulator application | `forwarder.py` | Simulated measurements/results |
+
+The standard forwarder deployment should use
+`FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures` and should
+not consume `simulatedAssetCommands`.
+
 If `rabbitCommandSection` is missing, invalid, points to a missing `rabbitMQ`
 section, or selects a section missing `exchange`, `queue`, or `routingKey`, the
 manager logs a warning and skips that asset command. There is no implicit
 fallback to the old `commands.{asset_type}.{asset_id}` route.
+
+`rabbitCommandSection` controls command publishing only. Simulated measurements
+are produced by the external simulator, not by `flexi_manager.py`.
 
 ### Timestamp Formatting
 
@@ -611,9 +644,9 @@ The restore power is chosen using this fallback chain:
 | Mode | RabbitMQ enabled | What happens |
 |------|------------------|--------------|
 | `--dry-run` | No | Commands logged locally, nothing sent |
-| `--dry-run` | Yes (`--rabbitmq`) | Commands with a valid `rabbitCommandSection` are published to RabbitMQ with `dry_run=true`; forwarder sees the flag and does not POST to AEM |
+| `--dry-run` | Yes (`--rabbitmq`) | Commands with a valid `rabbitCommandSection` are published to RabbitMQ with `dry_run=true`; real-asset commands are consumed by the forwarder, simulated-asset commands are consumed by the external simulator |
 | `--live` | No | Direct local actuation (MQTT/HTTP/OCPP/simulation) |
-| `--live` | Yes (`--rabbitmq`) | Commands with a valid `rabbitCommandSection` are published to RabbitMQ with `dry_run=false`; forwarder sends real requests to AEM |
+| `--live` | Yes (`--rabbitmq`) | Commands with a valid `rabbitCommandSection` are published to RabbitMQ with `dry_run=false`; real-asset commands can be forwarded to AEM, simulated-asset commands go to the external simulator |
 
 ### Slot Timing
 
@@ -942,7 +975,8 @@ The typical workflow is:
 0 * * * *  cd /path/to/pyfm && .venv/bin/python scripts/trader_fsp.py --config conf/test_fm01_aem.json --fsp supsi01
 
 # flexi_manager.py runs at minute 14, 29, 44, 59 to activate the upcoming slot.
-# With --rabbitmq, commands go through RabbitMQ -> forwarder -> AEM.
+# With --rabbitmq, real asset commands go through RabbitMQ -> forwarder -> AEM.
+# Simulated asset commands go through RabbitMQ -> external simulator.
 14,29,44,59 * * * * cd /path/to/pyfm && .venv/bin/python scripts/flexi_manager.py --fsp supsi01 --live --rabbitmq
 ```
 

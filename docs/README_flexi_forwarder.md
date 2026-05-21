@@ -28,16 +28,24 @@ The flexibility command forwarding system separates the **decision logic** (what
 ### Data Flow
 
 ```
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐     ┌─────────────┐
-│ flexi_manager   │────▶│   RabbitMQ   │────▶│    forwarder    │────▶│   Devices   │
-│ (Decision)      │     │   (Broker)   │     │   (Actuation)   │     │ (HP, EV...) │
-└─────────────────┘     └──────────────┘     └─────────────────┘     └─────────────┘
-        │                       │                     │
-        │                       │                     │
-   Calculates             Queues and            Receives and
-   flexibility            persists              forwards to
-   allocation             messages              actual devices
+Real asset command path:
+flexi_manager.py / flexi_actuator.py
+  -> rabbitMQ.realAssetCommands
+  -> forwarder.py
+  -> real API / AEM API
+
+Simulated asset path:
+flexi_manager.py / flexi_actuator.py
+  -> rabbitMQ.simulatedAssetCommands
+  -> external simulator application
+  -> rabbitMQ.simulatedAssetMeasures
+  -> forwarder.py
+  -> downstream API / measurement target
 ```
+
+`pyfm` does not implement the simulated asset application. `pyfm` only
+publishes simulated asset commands and can consume simulated measures produced
+by an external simulator.
 
 ---
 
@@ -48,31 +56,54 @@ The flexibility command forwarding system separates the **decision logic** (what
 | Component | Role | Script/Service |
 |-----------|------|----------------|
 | **flexi_manager** | Calculates flexibility allocation and publishes commands | `scripts/flexi_manager.py` |
+| **flexi_actuator** | Publishes manual asset commands | `scripts/flexi_actuator.py` |
 | **RabbitMQ** | Message broker for reliable command delivery | Docker container |
-| **forwarder** | Consumes commands and forwards to devices | `scripts/forwarder.py` |
+| **external simulator** | Consumes simulated commands and publishes simulated measurements | Outside this repository |
+| **forwarder** | Consumes real commands and simulated measurements from selected sections | `scripts/forwarder.py` |
 
 ### RabbitMQ Topology
 
-The forwarder consumes section-based RabbitMQ sources from the `rabbitMQ`
-object in `conns.json`. Each active section provides its own exchange, queue,
-and routing key.
+Each `rabbitMQ` section in `conns.json` provides its own exchange, queue, and
+routing key.
 
+| Section | Exchange | Queue | Routing key | Producer | Consumer | Purpose |
+|---------|----------|-------|-------------|----------|----------|---------|
+| `rabbitMQ.realAssetCommands` | `flexi_commands` | `flexi_commands_queue` | `real_asset.command` | `flexi_manager.py` / `flexi_actuator.py` | `forwarder.py` | Real physical asset commands forwarded to the real API / AEM API |
+| `rabbitMQ.simulatedAssetCommands` | `flexi_sim_commands` | `flexi_sim_commands_queue` | `sim_asset.command` | `flexi_manager.py` / `flexi_actuator.py` | External simulator application | Commands for simulated assets |
+| `rabbitMQ.simulatedAssetMeasures` | `flexi_sim_measures` | `flexi_sim_measures_queue` | `sim_asset.measure` | External simulator application | `forwarder.py` | Simulated measurements/results forwarded downstream |
+
+The standard forwarder deployment consumes:
+
+```bash
+FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures
 ```
-rabbitMQ.realAssetCommands
-    exchange: flexi_commands
-    queue: flexi_commands_queue
-    routingKey: real_asset.command
 
-rabbitMQ.simulatedAssetCommands
-    exchange: flexi_sim_commands
-    queue: flexi_sim_commands_queue
-    routingKey: sim_asset.command
+Do not include `simulatedAssetCommands` in the standard forwarder deployment.
+That section is consumed by the external simulator.
 
-rabbitMQ.simulatedAssetMeasures
-    exchange: flexi_sim_measures
-    queue: flexi_sim_measures_queue
-    routingKey: sim_asset.measure
+### Asset Command Destination Selection
+
+`flexi_manager.py` and `flexi_actuator.py` select the command destination from
+each asset's `asset_mapping.<asset_id>.rabbitCommandSection`.
+
+```json
+{
+  "asset_mapping": {
+    "ECM96.2": {
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands"
+    },
+    "ECM68.3": {
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands"
+    }
+  }
+}
 ```
+
+Assets without `rabbitCommandSection` are skipped by the command publishers.
+`rabbitCommandSection` controls command publishing only. Simulated measurements
+are produced by the external simulator, not by `flexi_manager.py`.
 
 ### Message Types
 
@@ -81,6 +112,20 @@ rabbitMQ.simulatedAssetMeasures
 | `command` | Control commands (curtail, restore) | Configured section `routingKey` |
 | `measurement` | Measurement data | Configured section `routingKey` |
 | `batch_start` | Batch header with slot info | Same command section as the batch commands |
+
+### External Simulator Contract
+
+The simulator is external to `pyfm`. It must:
+
+- Consume from `rabbitMQ.simulatedAssetCommands.exchange`, `.queue`, and
+  `.routingKey`.
+- Parse command envelopes with `message_type="command"`, `asset_id`,
+  `asset_type`, `command_type`, `payload`, `timestamp`, and `priority`.
+- Publish measurement envelopes to `rabbitMQ.simulatedAssetMeasures.exchange`,
+  `.queue`, and `.routingKey`.
+- Use measurement messages with `message_type="measurement"`, `asset_id`,
+  `asset_type`, `timestamp`, and `payload`. `measurement_type` is optional but
+  useful for logs and downstream routing.
 
 ---
 
@@ -110,9 +155,14 @@ The message broker provides:
 ### 3. forwarder.py
 
 The forwarder is responsible for:
-- Consuming commands from RabbitMQ
+- Consuming real asset commands from `rabbitMQ.realAssetCommands`
+- Consuming simulated measurements from `rabbitMQ.simulatedAssetMeasures`
 - Translating commands into configured HTTP target requests
 - Sending commands to matching targets in live mode, or logging them in dry-run mode
+
+In the standard topology it does not consume
+`rabbitMQ.simulatedAssetCommands`; that queue is consumed by the external
+simulator.
 
 **Key Classes:**
 - `RabbitMQConsumer`: Handles connection and message consumption
@@ -263,6 +313,10 @@ sections are selected explicitly, the forwarder consumes all valid section-like
 entries under `rabbitMQ`. The legacy `RABBITMQ_EXCHANGE` /
 `--rabbitmq-exchange` option is ignored for section-based sources.
 
+For normal deployments, set `FORWARDER_RABBIT_SECTIONS` explicitly to
+`realAssetCommands,simulatedAssetMeasures` so the forwarder does not consume
+simulated commands intended for the external simulator.
+
 The forwarder target configuration can also reference API entries in `conns.json`. For example, `conf/forwarder_targets_aem.json` uses `reference_api: "aemAPI"` and resolves the target base URL, credentials, and request-timeout fallback from that connection entry.
 
 ### Target Configuration
@@ -309,7 +363,7 @@ Each failed non-final attempt is logged, and the final exhausted failure is logg
 ### Basic Workflow
 
 1. **Start RabbitMQ** (if not already running)
-2. **Start the forwarder** to listen for commands
+2. **Start the forwarder** to listen for real commands and simulated measurements
 3. **Run flexi_manager** with RabbitMQ enabled to publish commands
 
 ### Step-by-Step Examples
@@ -375,7 +429,7 @@ python flexi_manager.py --fsp supsi01 --offset 30m --dry-run --rabbitmq
 | `--dry-run` / `-d` | enabled | Dry-run mode (log only) |
 | `--live` / `-l` | disabled | Allow live HTTP forwarding when message payload `dry_run=false` |
 | `--asset-types` | all | Comma-separated list of asset types to filter |
-| `--rabbit-sections` | all valid sections | Comma-separated `rabbitMQ` sections to consume |
+| `--rabbit-sections` | all valid sections | Comma-separated `rabbitMQ` sections to consume; standard deployment uses `realAssetCommands,simulatedAssetMeasures` |
 | `--queues` | none | Legacy queue selector; ignored for section-based sources |
 | `--rabbitmq-host` | `rabbitMQ.host` or `localhost` | RabbitMQ server hostname |
 | `--rabbitmq-port` | `rabbitMQ.port` or `5672` | RabbitMQ server port |
@@ -474,6 +528,27 @@ Published when flexibility activation period ends:
 
 For EV charger commands, `flexi_manager.py` enriches the payload with `power_kw` and a `schedule` dictionary containing one power value per 15-minute point in the slot window.
 
+### Measurement Message
+
+Published by the external simulator to `rabbitMQ.simulatedAssetMeasures`:
+
+```json
+{
+  "message_type": "measurement",
+  "asset_id": "ECM68.3",
+  "asset_type": "heat_pump",
+  "measurement_type": "power",
+  "payload": {
+    "power_kw": 3.8
+  },
+  "timestamp": "2026-01-16T10:00:00+00:00"
+}
+```
+
+`forwarder.py` dispatches `message_type="measurement"` to its measurement
+handler and reads `asset_id`, `asset_type`, `measurement_type`, `timestamp`,
+and `payload`.
+
 ### Dry-Run and Live Forwarding
 
 The forwarder has two levels of dry-run control:
@@ -531,6 +606,10 @@ docker exec pyfm_rabbitmq rabbitmqctl list_permissions -p /pyfm
 - Ensure both are using the same virtual host
 - Check queue bindings in management UI
 - Verify routing keys match
+- For real commands, check `rabbitMQ.realAssetCommands` and each real asset's
+  `rabbitCommandSection`
+- For simulated measurements, check `rabbitMQ.simulatedAssetMeasures` and
+  `FORWARDER_RABBIT_SECTIONS`
 
 ```bash
 # List queues and message counts
@@ -563,8 +642,30 @@ pip install -r requirements.txt
   `routingKey` values.
 
 ```bash
-export FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
+export FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures
 ```
+
+#### 6. Forwarder Receives Simulated Commands
+
+**Symptom**: forwarder logs `command` messages from simulated assets.
+
+**Solution**: remove `simulatedAssetCommands` from
+`FORWARDER_RABBIT_SECTIONS`. That queue is for the external simulator.
+
+#### 7. Simulator Does Not Receive Commands
+
+**Solutions**:
+- Check `rabbitMQ.simulatedAssetCommands.exchange`, `.queue`, and
+  `.routingKey`.
+- Check simulated assets have
+  `asset_mapping.<asset_id>.rabbitCommandSection = "simulatedAssetCommands"`.
+
+#### 8. Forwarder Does Not Receive Simulated Measurements
+
+**Solutions**:
+- Check `rabbitMQ.simulatedAssetMeasures.exchange`, `.queue`, and
+  `.routingKey`.
+- Check `FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures`.
 
 ### Monitoring Commands
 
@@ -634,7 +735,7 @@ Configure the forwarder via environment variables or `.env` file:
 | `FORWARDER_LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
 | `FORWARDER_LOG_FILE` | `/app/logs/forwarder.log` | Log file path (Docker mount: `./logs`) |
 | `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
-| `FORWARDER_RABBIT_SECTIONS` | all valid sections | RabbitMQ sections: `realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures` |
+| `FORWARDER_RABBIT_SECTIONS` | `realAssetCommands,simulatedAssetMeasures` in Docker examples; otherwise all valid sections when unset | RabbitMQ sections consumed by the forwarder; do not include `simulatedAssetCommands` in the standard deployment |
 | `FORWARDER_QUEUES` | none | Legacy queue selector; ignored |
 | `FORWARDER_CONFIG` | `../conf/forwarder_targets.json` | Target configuration path |
 | `FORWARDER_CONNS` | `../conf/private/conns.json` | Connection file for RabbitMQ sources and `reference_api` targets |

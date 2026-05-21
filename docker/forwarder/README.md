@@ -1,6 +1,28 @@
 # Forwarder Service
 
-Docker configuration for the PyFM Forwarder service, which receives commands from RabbitMQ and forwards them to actual devices.
+Docker configuration for the PyFM Forwarder service.
+
+Standard RabbitMQ flow:
+
+```text
+Real asset command path:
+flexi_manager.py / flexi_actuator.py
+  -> rabbitMQ.realAssetCommands
+  -> forwarder.py
+  -> real API / AEM API
+
+Simulated asset path:
+flexi_manager.py / flexi_actuator.py
+  -> rabbitMQ.simulatedAssetCommands
+  -> external simulator application
+  -> rabbitMQ.simulatedAssetMeasures
+  -> forwarder.py
+  -> downstream API / measurement target
+```
+
+`pyfm` does not implement the simulated asset application. The forwarder should
+normally consume `realAssetCommands,simulatedAssetMeasures`, not
+`simulatedAssetCommands`.
 
 ## Prerequisites
 
@@ -60,7 +82,7 @@ grep ERROR logs/forwarder.log
 | `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
 | `FORWARDER_CONFIG` | `/app/conf/forwarder_targets.json` | Target configuration path |
 | `FORWARDER_CONNS` | `/app/conf/private/conns.json` | Connection file containing RabbitMQ sections |
-| `FORWARDER_RABBIT_SECTIONS` | all valid sections | Sections: `realAssetCommands,simulatedAssetMeasures` |
+| `FORWARDER_RABBIT_SECTIONS` | `realAssetCommands,simulatedAssetMeasures` | Sections consumed by the forwarder; do not include `simulatedAssetCommands` in the standard deployment |
 | `FORWARDER_QUEUES` | none | Legacy queue selector; ignored |
 | `RABBITMQ_HOST` | `rabbitMQ.host` or `localhost` | RabbitMQ hostname override |
 | `RABBITMQ_PORT` | `rabbitMQ.port` or `5672` | RabbitMQ port override |
@@ -75,6 +97,14 @@ The RabbitMQ exchange, queue, and routing key topology is read from
 `FORWARDER_CONNS` under `rabbitMQ.<section>`. Docker compose selects section
 names with `FORWARDER_RABBIT_SECTIONS`; it does not define the topology.
 
+Section responsibilities:
+
+| Section | Producer | Consumer | Purpose |
+|---------|----------|----------|---------|
+| `rabbitMQ.realAssetCommands` | `flexi_manager.py` / `flexi_actuator.py` | `forwarder.py` | Real physical asset commands |
+| `rabbitMQ.simulatedAssetCommands` | `flexi_manager.py` / `flexi_actuator.py` | External simulator application | Commands for simulated assets |
+| `rabbitMQ.simulatedAssetMeasures` | External simulator application | `forwarder.py` | Simulated measurements/results |
+
 ### Using .env File
 
 Create a `.env` file to customize settings:
@@ -84,7 +114,7 @@ Create a `.env` file to customize settings:
 FORWARDER_MODE=dry-run
 FORWARDER_LOG_LEVEL=DEBUG
 FORWARDER_CONNS=/app/conf/private/conns.json
-FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
+FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures
 RABBITMQ_HOST=192.168.1.100
 ```
 
@@ -179,4 +209,19 @@ cd ../../scripts
 python flexi_manager.py --fsp supsi01 --rabbitmq --dry-run
 ```
 
-The forwarder will receive and process the commands, logging to both console and file.
+The forwarder receives real asset commands and simulated measurements, logging
+to both console and file. Simulated asset commands are received by the external
+simulator, which is outside this repository.
+
+## Troubleshooting
+
+- If the forwarder receives simulated asset commands, remove
+  `simulatedAssetCommands` from `FORWARDER_RABBIT_SECTIONS`.
+- If the simulator does not receive commands, check
+  `rabbitMQ.simulatedAssetCommands.exchange`, `.queue`, `.routingKey`, and each
+  simulated asset's `rabbitCommandSection`.
+- If the forwarder does not receive simulated measurements, check
+  `rabbitMQ.simulatedAssetMeasures.exchange`, `.queue`, `.routingKey`, and
+  `FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetMeasures`.
+- If real commands are not forwarded, check `rabbitMQ.realAssetCommands` and
+  each real asset's `rabbitCommandSection`.

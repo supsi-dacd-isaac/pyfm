@@ -1728,7 +1728,7 @@ Examples:
         default=get_env("FORWARDER_RABBIT_SECTIONS"),
         help=(
             "Comma-separated rabbitMQ sections to consume, e.g. "
-            "realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures "
+            "realAssetCommands,simulatedAssetMeasures "
             "(env: FORWARDER_RABBIT_SECTIONS)"
         )
     )
