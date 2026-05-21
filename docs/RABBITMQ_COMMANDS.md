@@ -26,6 +26,24 @@ Example destinations:
 | `simulatedAssetCommands` | `flexi_sim_commands` | `flexi_sim_commands_queue` | `sim_asset.command` |
 | `simulatedAssetMeasures` | `flexi_sim_measures` | `flexi_sim_measures_queue` | `sim_asset.measure` |
 
+## Forwarder Consumption
+
+`scripts/forwarder.py` consumes from section-based RabbitMQ sources in the same
+`rabbitMQ` object. Select sections with `--rabbit-sections` or
+`FORWARDER_RABBIT_SECTIONS`:
+
+```bash
+FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
+```
+
+The selected sections must exist in `conns.json` and each must contain
+`exchange`, `queue`, and `routingKey`. The forwarder declares each exchange and
+queue, binds each queue to its configured routing key, and registers all queues
+on one RabbitMQ connection/channel in the same process. If no sections are
+selected explicitly, it consumes all valid section-like `rabbitMQ` children.
+`conns.json` remains the source of truth for exchange/queue/routing key
+topology; Docker compose selects section names, not topology details.
+
 If an asset does not define `rabbitCommandSection`, `flexi_manager.py` logs a
 warning and skips that command. It does not fall back to the legacy
 `commands.{asset_type}.{asset_id}` route. Invalid command sections, including

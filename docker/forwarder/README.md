@@ -58,15 +58,22 @@ grep ERROR logs/forwarder.log
 | `FORWARDER_LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
 | `FORWARDER_LOG_FILE` | `/app/logs/forwarder.log` | Log file path (inside container) |
 | `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
-| `FORWARDER_QUEUES` | `commands` | Queues: `commands,measurements` |
-| `RABBITMQ_HOST` | `localhost` | RabbitMQ hostname |
-| `RABBITMQ_PORT` | `5672` | RabbitMQ port |
-| `RABBITMQ_USER` | `guest` | RabbitMQ username |
-| `RABBITMQ_PASS` | `guest` | RabbitMQ password |
-| `RABBITMQ_VHOST` | `/` | RabbitMQ virtual host |
-| `RABBITMQ_EXCHANGE` | `flexi_commands` | Exchange name |
+| `FORWARDER_CONFIG` | `/app/conf/forwarder_targets.json` | Target configuration path |
+| `FORWARDER_CONNS` | `/app/conf/private/conns.json` | Connection file containing RabbitMQ sections |
+| `FORWARDER_RABBIT_SECTIONS` | all valid sections | Sections: `realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures` |
+| `FORWARDER_QUEUES` | none | Legacy queue selector; ignored |
+| `RABBITMQ_HOST` | `rabbitMQ.host` or `localhost` | RabbitMQ hostname override |
+| `RABBITMQ_PORT` | `rabbitMQ.port` or `5672` | RabbitMQ port override |
+| `RABBITMQ_USER` | `rabbitMQ.username` or `guest` | RabbitMQ username override |
+| `RABBITMQ_PASS` | `rabbitMQ.password` or `guest` | RabbitMQ password override |
+| `RABBITMQ_VHOST` | `rabbitMQ.virtualHost` or `/` | RabbitMQ virtual host override |
+| `RABBITMQ_EXCHANGE` | none | Legacy exchange override; ignored |
 | `RABBITMQ_CONNECT_RETRIES` | `10` | Connection retry attempts |
 | `RABBITMQ_CONNECT_RETRY_DELAY` | `5` | Seconds between retries |
+
+The RabbitMQ exchange, queue, and routing key topology is read from
+`FORWARDER_CONNS` under `rabbitMQ.<section>`. Docker compose selects section
+names with `FORWARDER_RABBIT_SECTIONS`; it does not define the topology.
 
 ### Using .env File
 
@@ -76,6 +83,8 @@ Create a `.env` file to customize settings:
 # .env
 FORWARDER_MODE=dry-run
 FORWARDER_LOG_LEVEL=DEBUG
+FORWARDER_CONNS=/app/conf/private/conns.json
+FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
 RABBITMQ_HOST=192.168.1.100
 ```
 

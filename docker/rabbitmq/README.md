@@ -39,7 +39,7 @@ Or run forwarder manually for development:
 
 ```bash
 cd ../../scripts
-python forwarder.py --dry-run
+python forwarder.py --dry-run --conns ../conf/private/conns.json --rabbit-sections realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
 ```
 
 ## Usage with flexi_manager
@@ -64,7 +64,7 @@ docker exec pyfm_rabbitmq rabbitmqctl list_queues name messages consumers
 docker exec pyfm_rabbitmq rabbitmqctl list_connections
 
 # Purge a queue
-docker exec pyfm_rabbitmq rabbitmqctl purge_queue asset_commands
+docker exec pyfm_rabbitmq rabbitmqctl purge_queue flexi_commands_queue
 ```
 
 ## Network

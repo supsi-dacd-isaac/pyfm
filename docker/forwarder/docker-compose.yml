@@ -36,8 +36,8 @@
         FORWARDER_LOG_FILE: /app/logs/forwarder.log         # Log file inside container
         FORWARDER_CONFIG: /app/conf/forwarder_targets.json  # Config file path
         FORWARDER_CONNS: /app/conf/private/conns.json       # conns.json path
+        FORWARDER_RABBIT_SECTIONS: ${FORWARDER_RABBIT_SECTIONS:-realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures}
         # FORWARDER_ASSET_TYPES: heat_pump,ev_charger       # Filter by asset types
-        # FORWARDER_QUEUES: commands,measurements           # Queues to consume
 
         # RabbitMQ connection
         RABBITMQ_HOST: ${RABBITMQ_HOST:-host.docker.internal}
@@ -45,7 +45,6 @@
         RABBITMQ_USER: ${RABBITMQ_USER:-guest}
         RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
         RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
-        RABBITMQ_EXCHANGE: ${RABBITMQ_EXCHANGE:-flexi_commands}
 
         # Connection retry settings
         RABBITMQ_CONNECT_RETRIES: ${RABBITMQ_CONNECT_RETRIES:-10}

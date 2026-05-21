@@ -2,8 +2,8 @@
 """
 Forwarder (forwarder.py)
 
-This script receives control commands and measurements from RabbitMQ
-and forwards them to the actual asset control interfaces.
+This script receives control commands and measurements from section-based
+RabbitMQ sources and forwards them to the actual asset control interfaces.
 
 The forwarder acts as the actuation layer, decoupled from the decision
 logic in flexi_manager.py. This separation allows:
@@ -26,17 +26,18 @@ Environment variables (for Docker/containerized deployment):
     FORWARDER_MODE          - "dry-run" or "live" (default: dry-run)
     FORWARDER_LOG_LEVEL     - DEBUG, INFO, WARNING, ERROR (default: INFO)
     FORWARDER_ASSET_TYPES   - Comma-separated list of asset types to filter
-    FORWARDER_QUEUES        - Comma-separated list: commands,measurements
+    FORWARDER_RABBIT_SECTIONS
+                            - Comma-separated rabbitMQ sections to consume
     RABBITMQ_HOST           - RabbitMQ hostname (default: localhost)
     RABBITMQ_PORT           - RabbitMQ port (default: 5672)
     RABBITMQ_USER           - RabbitMQ username (default: guest)
     RABBITMQ_PASS           - RabbitMQ password (default: guest)
     RABBITMQ_VHOST          - RabbitMQ virtual host (default: /)
-    RABBITMQ_EXCHANGE       - RabbitMQ exchange (default: flexi_commands)
+    RABBITMQ_EXCHANGE       - Legacy option ignored for section-based sources
 
 Example flow:
-    1. flexi_manager.py publishes commands to RabbitMQ exchange 'flexi_commands'
-    2. forwarder.py consumes from queue 'asset_commands'
+    1. flexi_manager.py publishes commands to asset-specific RabbitMQ sections
+    2. forwarder.py consumes from the configured section queues
     3. forwarder.py translates and forwards to actual device protocols
 """
 
@@ -48,8 +49,9 @@ import logging
 import signal
 import time
 import warnings
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Callable, Any
+from typing import Dict, List, Optional, Callable, Any, Iterable, Union
 from urllib.parse import urlparse, urlunparse
 
 # HTTP requests for forwarding to targets
@@ -1283,13 +1285,120 @@ class CommandHandler:
 # RABBITMQ CONSUMER
 # =============================================================================
 
+@dataclass(frozen=True)
+class RabbitMQSource:
+    """A section-based RabbitMQ source configured under conns.json rabbitMQ."""
+
+    section: str
+    exchange: str
+    queue: str
+    routing_key: str
+
+
+_RABBITMQ_SOURCE_FIELDS = ("exchange", "queue", "routingKey")
+
+
+def _parse_rabbitmq_sections(
+    requested_sections: Optional[Union[str, Iterable[str]]]
+) -> Optional[List[str]]:
+    """Normalize requested RabbitMQ section names from CLI/env/test inputs."""
+    if requested_sections is None:
+        return None
+
+    if isinstance(requested_sections, str):
+        raw_sections = requested_sections.split(",")
+    else:
+        raw_sections = list(requested_sections)
+
+    return [str(section).strip() for section in raw_sections if str(section).strip()]
+
+
+def _rabbitmq_source_from_section(section: str, section_cfg: Any) -> RabbitMQSource:
+    """Build a RabbitMQSource or raise ValueError with a startup-safe message."""
+    if section_cfg is None:
+        raise ValueError(f"rabbitMQ.{section} section not found")
+    if not isinstance(section_cfg, dict):
+        raise ValueError(f"rabbitMQ.{section} must be an object")
+
+    missing_fields = [
+        field
+        for field in _RABBITMQ_SOURCE_FIELDS
+        if section_cfg.get(field) is None or not str(section_cfg.get(field)).strip()
+    ]
+    if missing_fields:
+        raise ValueError(
+            f"rabbitMQ.{section} missing required field(s): {', '.join(missing_fields)}"
+        )
+
+    return RabbitMQSource(
+        section=section,
+        exchange=str(section_cfg["exchange"]).strip(),
+        queue=str(section_cfg["queue"]).strip(),
+        routing_key=str(section_cfg["routingKey"]).strip(),
+    )
+
+
+def _is_section_like_rabbitmq_config(section_cfg: Any) -> bool:
+    """Return True when a rabbitMQ child looks like an exchange/queue section."""
+    return (
+        isinstance(section_cfg, dict)
+        and any(field in section_cfg for field in _RABBITMQ_SOURCE_FIELDS)
+    )
+
+
+def resolve_rabbitmq_sources(
+    rabbitmq_cfg: dict,
+    requested_sections: Optional[Union[str, Iterable[str]]] = None,
+    logger: Optional[logging.Logger] = None,
+) -> List[RabbitMQSource]:
+    """
+    Resolve RabbitMQ source sections from conns.json rabbitMQ configuration.
+
+    Explicitly requested sections are strict and fail startup when missing or
+    malformed. Without an explicit request, all valid section-like entries are
+    consumed and malformed optional entries are skipped with a warning.
+    """
+    logger = logger or logging.getLogger("forwarder")
+    if not isinstance(rabbitmq_cfg, dict):
+        raise ValueError("rabbitMQ configuration must be an object")
+
+    sections = _parse_rabbitmq_sections(requested_sections)
+
+    if sections is not None:
+        if not sections:
+            raise ValueError("No RabbitMQ sections requested")
+        return [
+            _rabbitmq_source_from_section(section, rabbitmq_cfg.get(section))
+            for section in sections
+        ]
+
+    sources: List[RabbitMQSource] = []
+    for section, section_cfg in rabbitmq_cfg.items():
+        if not isinstance(section_cfg, dict):
+            continue
+        if not _is_section_like_rabbitmq_config(section_cfg):
+            continue
+        try:
+            sources.append(_rabbitmq_source_from_section(section, section_cfg))
+        except ValueError as exc:
+            logger.warning("Skipping malformed RabbitMQ source section: %s", str(exc))
+
+    if not sources:
+        raise ValueError(
+            "No valid RabbitMQ sources configured under rabbitMQ; "
+            "add section objects with exchange, queue, and routingKey "
+            "or set FORWARDER_RABBIT_SECTIONS/--rabbit-sections"
+        )
+
+    return sources
+
+
 class RabbitMQConsumer:
     """
     Consumes messages from RabbitMQ and dispatches them to handlers.
     
-    Subscribes to:
-    - asset_commands queue: Control commands from flexi_manager
-    - asset_measurements queue: Measurement data
+    Subscribes to one or more section-based RabbitMQ sources configured under
+    conns.json rabbitMQ.
     """
     
     DEFAULT_EXCHANGE = "flexi_commands"
@@ -1298,6 +1407,7 @@ class RabbitMQConsumer:
     
     def __init__(
         self,
+        sources: List[RabbitMQSource],
         host: str = "localhost",
         port: int = 5672,
         username: str = "guest",
@@ -1312,17 +1422,22 @@ class RabbitMQConsumer:
         """
         Initialize RabbitMQ consumer.
         
+        :param sources: RabbitMQ source sections to consume
         :param host: RabbitMQ server hostname
         :param port: RabbitMQ server port
         :param username: RabbitMQ username
         :param password: RabbitMQ password
         :param virtual_host: RabbitMQ virtual host
-        :param exchange: Exchange name (default: flexi_commands)
+        :param exchange: Legacy exchange option, ignored when sources are provided
         :param logger: Logger instance
         :param command_handler: Callback function for command messages
         :param measurement_handler: Callback function for measurement messages
         :param asset_types_filter: List of asset types to process (None = all)
         """
+        if not sources:
+            raise ValueError("RabbitMQConsumer requires at least one RabbitMQSource")
+
+        self.sources = list(sources)
         self.host = host
         self.port = port
         self.username = username
@@ -1339,6 +1454,7 @@ class RabbitMQConsumer:
         self.channel = None
         self._running = False
         self._messages_processed = 0
+        self._consumer_tag_sources: Dict[str, RabbitMQSource] = {}
     
     def connect(self) -> bool:
         """
@@ -1360,41 +1476,28 @@ class RabbitMQConsumer:
             self.connection = pika.BlockingConnection(parameters)
             self.channel = self.connection.channel()
             
-            # Declare exchange (should already exist from publisher)
-            self.channel.exchange_declare(
-                exchange=self.exchange,
-                exchange_type='topic',
-                durable=True
-            )
-            
-            # Declare queues
-            self.channel.queue_declare(
-                queue=self.DEFAULT_QUEUE_COMMANDS,
-                durable=True
-            )
-            self.channel.queue_declare(
-                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
-                durable=True
-            )
-            
-            # Bind queues to exchange
-            self.channel.queue_bind(
-                exchange=self.exchange,
-                queue=self.DEFAULT_QUEUE_COMMANDS,
-                routing_key="commands.#"
-            )
-            self.channel.queue_bind(
-                exchange=self.exchange,
-                queue=self.DEFAULT_QUEUE_MEASUREMENTS,
-                routing_key="measurements.#"
-            )
+            for source in self.sources:
+                self.channel.exchange_declare(
+                    exchange=source.exchange,
+                    exchange_type='topic',
+                    durable=True
+                )
+                self.channel.queue_declare(
+                    queue=source.queue,
+                    durable=True
+                )
+                self.channel.queue_bind(
+                    exchange=source.exchange,
+                    queue=source.queue,
+                    routing_key=source.routing_key
+                )
             
             # Set QoS (prefetch count)
             self.channel.basic_qos(prefetch_count=1)
             
             self.logger.info(
-                "Connected to RabbitMQ at %s:%d (exchange: %s)",
-                self.host, self.port, self.exchange
+                "Connected to RabbitMQ at %s:%d with %d source(s)",
+                self.host, self.port, len(self.sources)
             )
             return True
             
@@ -1422,6 +1525,18 @@ class RabbitMQConsumer:
         :param body: Message body
         """
         try:
+            consumer_tag = getattr(method, "consumer_tag", None)
+            source = self._consumer_tag_sources.get(consumer_tag)
+            queue_name = source.queue if source else "unknown"
+            section = source.section if source else "unknown"
+            self.logger.debug(
+                "Received RabbitMQ message: queue=%s section=%s delivery_tag=%s routing_key=%s",
+                queue_name,
+                section,
+                getattr(method, "delivery_tag", None),
+                getattr(method, "routing_key", None),
+            )
+
             message = json.loads(body.decode('utf-8'))
             message_type = message.get("message_type", "unknown")
             asset_type = message.get("asset_type", "")
@@ -1483,24 +1598,25 @@ class RabbitMQConsumer:
             self.logger.error("Error processing message: %s", str(e))
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
     
-    def start_consuming(self, queues: List[str] = None):
+    def start_consuming(self):
         """
-        Start consuming messages from specified queues.
-        
-        :param queues: List of queue names to consume from (default: commands queue)
+        Start consuming messages from all configured source queues.
         """
-        if queues is None:
-            queues = [self.DEFAULT_QUEUE_COMMANDS]
-        
         self._running = True
         
-        for queue in queues:
-            self.channel.basic_consume(
-                queue=queue,
+        for source in self.sources:
+            consumer_tag = self.channel.basic_consume(
+                queue=source.queue,
                 on_message_callback=self._process_message,
                 auto_ack=False
             )
-            self.logger.info("Consuming from queue: %s", queue)
+            if consumer_tag:
+                self._consumer_tag_sources[consumer_tag] = source
+            self.logger.info(
+                "Consuming from RabbitMQ source %s: queue=%s",
+                source.section,
+                source.queue,
+            )
         
         self.logger.info("Waiting for messages... (Press Ctrl+C to stop)")
         
@@ -1604,41 +1720,49 @@ Examples:
     )
     parser.add_argument(
         "--queues",
-        default=get_env("FORWARDER_QUEUES", "commands"),
-        help="Comma-separated list of queues to consume (env: FORWARDER_QUEUES)"
+        default=get_env("FORWARDER_QUEUES"),
+        help="Legacy queue selector ignored for section-based sources (env: FORWARDER_QUEUES)"
+    )
+    parser.add_argument(
+        "--rabbit-sections",
+        default=get_env("FORWARDER_RABBIT_SECTIONS"),
+        help=(
+            "Comma-separated rabbitMQ sections to consume, e.g. "
+            "realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures "
+            "(env: FORWARDER_RABBIT_SECTIONS)"
+        )
     )
     
     # RabbitMQ arguments (with environment variable defaults for Docker)
     parser.add_argument(
         "--rabbitmq-host",
-        default=get_env("RABBITMQ_HOST", "localhost"),
-        help="RabbitMQ server hostname (env: RABBITMQ_HOST)"
+        default=get_env("RABBITMQ_HOST"),
+        help="RabbitMQ server hostname (env: RABBITMQ_HOST, default: rabbitMQ.host or localhost)"
     )
     parser.add_argument(
         "--rabbitmq-port",
-        type=int,
-        default=int(get_env("RABBITMQ_PORT", "5672")),
-        help="RabbitMQ server port (env: RABBITMQ_PORT)"
+        default=get_env("RABBITMQ_PORT"),
+        help="RabbitMQ server port (env: RABBITMQ_PORT, default: rabbitMQ.port or 5672)"
     )
     parser.add_argument(
         "--rabbitmq-user",
-        default=get_env("RABBITMQ_USER", "guest"),
-        help="RabbitMQ username (env: RABBITMQ_USER)"
+        default=get_env("RABBITMQ_USER"),
+        help="RabbitMQ username (env: RABBITMQ_USER, default: rabbitMQ.username or guest)"
     )
     parser.add_argument(
         "--rabbitmq-pass",
-        default=get_env("RABBITMQ_PASS", "guest"),
-        help="RabbitMQ password (env: RABBITMQ_PASS)"
+        default=get_env("RABBITMQ_PASS"),
+        help="RabbitMQ password (env: RABBITMQ_PASS, default: rabbitMQ.password or guest)"
     )
     parser.add_argument(
         "--rabbitmq-vhost",
-        default=get_env("RABBITMQ_VHOST", "/"),
-        help="RabbitMQ virtual host (env: RABBITMQ_VHOST)"
+        default=get_env("RABBITMQ_VHOST"),
+        help="RabbitMQ virtual host (env: RABBITMQ_VHOST, default: rabbitMQ.virtualHost or /)"
     )
     parser.add_argument(
         "--rabbitmq-exchange",
-        default=get_env("RABBITMQ_EXCHANGE", "flexi_commands"),
-        help="RabbitMQ exchange name (env: RABBITMQ_EXCHANGE)"
+        default=get_env("RABBITMQ_EXCHANGE"),
+        help="Legacy RabbitMQ exchange option ignored for section-based sources (env: RABBITMQ_EXCHANGE)"
     )
     
     # Logging arguments
@@ -1684,8 +1808,6 @@ Examples:
     else:
         logger.info("Mode: LIVE (actuation mode determined by each message)")
         logger.warning("WARNING: Live actuation is NOT YET IMPLEMENTED!")
-    logger.info("RabbitMQ: %s:%d", args.rabbitmq_host, args.rabbitmq_port)
-    logger.info("Exchange: %s", args.rabbitmq_exchange)
     logger.info("-" * 60)
     
     # Parse asset types filter
@@ -1694,24 +1816,10 @@ Examples:
         asset_types_filter = [t.strip() for t in args.asset_types.split(",")]
         logger.info("Asset type filter: %s", asset_types_filter)
     
-    # Parse queues
-    queue_map = {
-        "commands": RabbitMQConsumer.DEFAULT_QUEUE_COMMANDS,
-        "measurements": RabbitMQConsumer.DEFAULT_QUEUE_MEASUREMENTS
-    }
-    queues_to_consume = []
-    for q in args.queues.split(","):
-        q = q.strip().lower()
-        if q in queue_map:
-            queues_to_consume.append(queue_map[q])
-        else:
-            logger.warning("Unknown queue '%s', skipping", q)
-    
-    if not queues_to_consume:
-        logger.error("No valid queues specified")
-        sys.exit(1)
-    
-    logger.info("Queues: %s", queues_to_consume)
+    if args.queues:
+        logger.warning(
+            "FORWARDER_QUEUES / --queues is ignored for section-based RabbitMQ sources."
+        )
     
     # Create target handler for forwarding to external systems
     target_handler = TargetHandler(logger, dry_run=force_dry_run)
@@ -1728,6 +1836,62 @@ Examples:
     logger.info("Using conns.json path: %s", args.conns)
     conns_config = _load_conns_config(args.conns, logger, extra_base_dirs=[config_dir])
     target_handler.set_conns_lookup(args.conns, [config_dir], conns_config, [fallback_conns_path])
+    rabbitmq_cfg = conns_config.get("rabbitMQ", {})
+
+    try:
+        rabbitmq_sources = resolve_rabbitmq_sources(
+            rabbitmq_cfg,
+            requested_sections=args.rabbit_sections,
+            logger=logger,
+        )
+    except ValueError as exc:
+        logger.error("Invalid RabbitMQ source configuration: %s", str(exc))
+        sys.exit(1)
+
+    rabbitmq_host = (
+        args.rabbitmq_host
+        if args.rabbitmq_host is not None
+        else rabbitmq_cfg.get("host", "localhost")
+    )
+    rabbitmq_port_value = (
+        args.rabbitmq_port
+        if args.rabbitmq_port is not None
+        else rabbitmq_cfg.get("port", 5672)
+    )
+    try:
+        rabbitmq_port = int(rabbitmq_port_value or 5672)
+    except (TypeError, ValueError):
+        logger.error("Invalid RabbitMQ port value: %r", rabbitmq_port_value)
+        sys.exit(1)
+    rabbitmq_user = (
+        args.rabbitmq_user
+        if args.rabbitmq_user is not None
+        else rabbitmq_cfg.get("username", "guest")
+    )
+    rabbitmq_password = (
+        args.rabbitmq_pass
+        if args.rabbitmq_pass is not None
+        else rabbitmq_cfg.get("password", "guest")
+    )
+    rabbitmq_vhost = (
+        args.rabbitmq_vhost
+        if args.rabbitmq_vhost is not None
+        else rabbitmq_cfg.get("virtualHost", "/")
+    )
+
+    logger.info("RabbitMQ: %s:%d (vhost: %s)", rabbitmq_host, rabbitmq_port, rabbitmq_vhost)
+    if args.rabbitmq_exchange:
+        logger.warning(
+            "RABBITMQ_EXCHANGE / --rabbitmq-exchange is ignored for section-based RabbitMQ sources."
+        )
+    for source in rabbitmq_sources:
+        logger.info(
+            "Consuming RabbitMQ source %s: exchange=%s, queue=%s, routing_key=%s",
+            source.section,
+            source.exchange,
+            source.queue,
+            source.routing_key,
+        )
 
     # Load targets from config file
     if os.path.exists(config_path):
@@ -1803,12 +1967,12 @@ Examples:
 
     # Create consumer
     consumer = RabbitMQConsumer(
-        host=args.rabbitmq_host,
-        port=args.rabbitmq_port,
-        username=args.rabbitmq_user,
-        password=args.rabbitmq_pass,
-        virtual_host=args.rabbitmq_vhost,
-        exchange=args.rabbitmq_exchange,
+        sources=rabbitmq_sources,
+        host=rabbitmq_host,
+        port=rabbitmq_port,
+        username=rabbitmq_user,
+        password=rabbitmq_password,
+        virtual_host=rabbitmq_vhost,
         logger=logger,
         command_handler=handler.handle_command,
         measurement_handler=handler.handle_measurement,
@@ -1862,7 +2026,7 @@ Examples:
         sys.exit(1)
     
     try:
-        consumer.start_consuming(queues_to_consume)
+        consumer.start_consuming()
     except Exception as e:
         logger.error("Error during consumption: %s", str(e))
         sys.exit(1)
