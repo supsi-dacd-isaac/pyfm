@@ -458,6 +458,9 @@ def _resolve_rabbitmq_command_destination(
     asset_config: dict,
     rabbitmq_config: dict,
     logger: logging.Logger,
+    override_exchange: Optional[str] = None,
+    override_queue: Optional[str] = None,
+    override_routing_key: Optional[str] = None,
 ) -> Optional[dict]:
     """Resolve the RabbitMQ command destination for one actuator command."""
     section_name = asset_config.get("rabbitCommandSection")
@@ -501,11 +504,23 @@ def _resolve_rabbitmq_command_destination(
         )
         return None
 
+    exchange = (
+        override_exchange.strip()
+        if isinstance(override_exchange, str)
+        else override_exchange
+    )
+    queue = override_queue.strip() if isinstance(override_queue, str) else override_queue
+    routing_key = (
+        override_routing_key.strip()
+        if isinstance(override_routing_key, str)
+        else override_routing_key
+    )
+
     return {
         "section": section_name,
-        "exchange": section["exchange"],
-        "queue": section["queue"],
-        "routing_key": section["routingKey"],
+        "exchange": exchange or section["exchange"],
+        "queue": queue or section["queue"],
+        "routing_key": routing_key or section["routingKey"],
     }
 
 
@@ -1048,19 +1063,19 @@ Examples:
     parser.add_argument(
         "--rabbitmq-exchange",
         default=None,
-        help="Deprecated and ignored. RabbitMQ exchanges come from destination sections.",
+        help="Alias for --rabbit-exchange. Overrides the configured RabbitMQ destination exchange.",
     )
     parser.add_argument(
         "--rabbit-exchange",
-        help="Deprecated and ignored. RabbitMQ exchanges come from destination sections.",
+        help="Override the configured RabbitMQ destination exchange.",
     )
     parser.add_argument(
         "--rabbit-queue",
-        help="Deprecated and ignored. RabbitMQ queues come from destination sections.",
+        help="Override the configured RabbitMQ destination queue.",
     )
     parser.add_argument(
         "--rabbit-routing-key",
-        help="Deprecated and ignored. RabbitMQ routing keys come from destination sections.",
+        help="Override the configured RabbitMQ destination routing key.",
     )
 
     args = parser.parse_args()
@@ -1081,10 +1096,13 @@ Examples:
         "RabbitMQ destination sections available: %s",
         ", ".join(_available_rabbit_destination_sections(rabbitmq_config)) or "none",
     )
-    if args.rabbitmq_exchange or args.rabbit_exchange or args.rabbit_queue or args.rabbit_routing_key:
-        logger.warning(
-            "RabbitMQ destination override flags are ignored; destinations are resolved only from "
-            "rabbitMQ.realAssetCommands, rabbitMQ.simulatedAssetCommands, or rabbitMQ.simulatedAssetMeasures"
+    rabbit_exchange_override = args.rabbit_exchange or args.rabbitmq_exchange
+    if rabbit_exchange_override or args.rabbit_queue or args.rabbit_routing_key:
+        logger.info(
+            "RabbitMQ destination CLI overrides: exchange=%s, queue=%s, routing_key=%s",
+            rabbit_exchange_override or "(config)",
+            args.rabbit_queue or "(config)",
+            args.rabbit_routing_key or "(config)",
         )
 
     fsps = config.get("fm", {}).get("actors", {}).get("fsps", {})
@@ -1130,14 +1148,16 @@ Examples:
                 asset_config=asset_config,
                 rabbitmq_config=rabbitmq_config,
                 logger=logger,
+                override_exchange=rabbit_exchange_override,
+                override_queue=args.rabbit_queue,
+                override_routing_key=args.rabbit_routing_key,
             )
             if destination is None:
                 sys.exit(1)
             command["rabbitmq_destination"] = destination
             logger.info(
-                "RabbitMQ destination for asset %s via section %s: exchange=%s, queue=%s, routing_key=%s",
+                "RabbitMQ final destination for asset %s: exchange=%s, queue=%s, routing_key=%s",
                 asset_id,
-                destination["section"],
                 destination["exchange"],
                 destination["queue"],
                 destination["routing_key"],

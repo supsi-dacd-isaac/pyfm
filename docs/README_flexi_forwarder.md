@@ -53,25 +53,34 @@ The flexibility command forwarding system separates the **decision logic** (what
 
 ### RabbitMQ Topology
 
+The forwarder consumes section-based RabbitMQ sources from the `rabbitMQ`
+object in `conns.json`. Each active section provides its own exchange, queue,
+and routing key.
+
 ```
-Exchange: flexi_commands (topic)
-    │
-    ├── Routing Key: commands.#
-    │       └── Queue: asset_commands
-    │               └── Consumer: forwarder.py
-    │
-    └── Routing Key: measurements.#
-            └── Queue: asset_measurements
-                    └── Consumer: forwarder.py (optional)
+rabbitMQ.realAssetCommands
+    exchange: flexi_commands
+    queue: flexi_commands_queue
+    routingKey: real_asset.command
+
+rabbitMQ.simulatedAssetCommands
+    exchange: flexi_sim_commands
+    queue: flexi_sim_commands_queue
+    routingKey: sim_asset.command
+
+rabbitMQ.simulatedAssetMeasures
+    exchange: flexi_sim_measures
+    queue: flexi_sim_measures_queue
+    routingKey: sim_asset.measure
 ```
 
 ### Message Types
 
 | Type | Description | Routing Key Pattern |
 |------|-------------|---------------------|
-| `command` | Control commands (curtail, restore) | `commands.{asset_type}.{asset_id}` |
-| `measurement` | Measurement data | `measurements.{asset_type}.{asset_id}` |
-| `batch_start` | Batch header with slot info | `commands.batch.header` |
+| `command` | Control commands (curtail, restore) | Configured section `routingKey` |
+| `measurement` | Measurement data | Configured section `routingKey` |
+| `batch_start` | Batch header with slot info | Same command section as the batch commands |
 
 ---
 
@@ -192,12 +201,12 @@ The exchanges and queues are created automatically by the scripts.
 
 | Parameter | Default Value |
 |-----------|---------------|
-| Host | `localhost` |
-| Port | `5672` |
-| Username | `guest` |
-| Password | `guest` |
-| Virtual Host | `/` |
-| Exchange | `flexi_commands` |
+| Host | `rabbitMQ.host`, then `localhost` |
+| Port | `rabbitMQ.port`, then `5672` |
+| Username | `rabbitMQ.username`, then `guest` |
+| Password | `rabbitMQ.password`, then `guest` |
+| Virtual Host | `rabbitMQ.virtualHost`, then `/` |
+| Sources | all valid `rabbitMQ` sections with `exchange`, `queue`, and `routingKey` |
 
 ### Environment Variables (Optional)
 
@@ -209,7 +218,7 @@ export RABBITMQ_PORT=5672
 export RABBITMQ_USER=guest
 export RABBITMQ_PASS=guest
 export RABBITMQ_VHOST=/
-export RABBITMQ_EXCHANGE=flexi_commands
+export FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
 export FORWARDER_CONFIG=../conf/forwarder_targets_aem.json
 export FORWARDER_CONNS=../conf/private/conns.json
 ```
@@ -228,10 +237,31 @@ You can also add RabbitMQ configuration to your `conf/private/conns.json`:
     "username": "guest",
     "password": "guest",
     "virtualHost": "/",
-    "exchange": "flexi_commands"
+    "realAssetCommands": {
+      "exchange": "flexi_commands",
+      "queue": "flexi_commands_queue",
+      "routingKey": "real_asset.command"
+    },
+    "simulatedAssetCommands": {
+      "exchange": "flexi_sim_commands",
+      "queue": "flexi_sim_commands_queue",
+      "routingKey": "sim_asset.command"
+    },
+    "simulatedAssetMeasures": {
+      "exchange": "flexi_sim_measures",
+      "queue": "flexi_sim_measures_queue",
+      "routingKey": "sim_asset.measure"
+    }
   }
 }
 ```
+
+The forwarder uses `conns.json` as the source of truth for RabbitMQ
+exchange/queue/routing key topology. `FORWARDER_RABBIT_SECTIONS` or
+`--rabbit-sections` only selects which configured sections to consume. If no
+sections are selected explicitly, the forwarder consumes all valid section-like
+entries under `rabbitMQ`. The legacy `RABBITMQ_EXCHANGE` /
+`--rabbitmq-exchange` option is ignored for section-based sources.
 
 The forwarder target configuration can also reference API entries in `conns.json`. For example, `conf/forwarder_targets_aem.json` uses `reference_api: "aemAPI"` and resolves the target base URL, credentials, and request-timeout fallback from that connection entry.
 
@@ -331,12 +361,12 @@ python flexi_manager.py --fsp supsi01 --offset 30m --dry-run --rabbitmq
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--rabbitmq` | disabled | Enable RabbitMQ message publishing |
-| `--rabbitmq-host` | `localhost` | RabbitMQ server hostname |
-| `--rabbitmq-port` | `5672` | RabbitMQ server port |
-| `--rabbitmq-user` | `guest` | RabbitMQ username |
-| `--rabbitmq-pass` | `guest` | RabbitMQ password |
-| `--rabbitmq-vhost` | `/` | RabbitMQ virtual host |
-| `--rabbitmq-exchange` | `flexi_commands` | RabbitMQ exchange name |
+| `--rabbitmq-host` | `rabbitMQ.host` or `localhost` | RabbitMQ server hostname |
+| `--rabbitmq-port` | `rabbitMQ.port` or `5672` | RabbitMQ server port |
+| `--rabbitmq-user` | `rabbitMQ.username` or `guest` | RabbitMQ username |
+| `--rabbitmq-pass` | `rabbitMQ.password` or `guest` | RabbitMQ password |
+| `--rabbitmq-vhost` | `rabbitMQ.virtualHost` or `/` | RabbitMQ virtual host |
+| `--rabbitmq-exchange` | none | Deprecated and ignored; exchanges come from destination sections |
 
 #### forwarder.py Arguments
 
@@ -345,17 +375,18 @@ python flexi_manager.py --fsp supsi01 --offset 30m --dry-run --rabbitmq
 | `--dry-run` / `-d` | enabled | Dry-run mode (log only) |
 | `--live` / `-l` | disabled | Allow live HTTP forwarding when message payload `dry_run=false` |
 | `--asset-types` | all | Comma-separated list of asset types to filter |
-| `--queues` | `commands` | Queues to consume: `commands`, `measurements` |
-| `--rabbitmq-host` | `localhost` | RabbitMQ server hostname |
-| `--rabbitmq-port` | `5672` | RabbitMQ server port |
-| `--rabbitmq-user` | `guest` | RabbitMQ username |
-| `--rabbitmq-pass` | `guest` | RabbitMQ password |
-| `--rabbitmq-vhost` | `/` | RabbitMQ virtual host |
-| `--rabbitmq-exchange` | `flexi_commands` | RabbitMQ exchange name |
+| `--rabbit-sections` | all valid sections | Comma-separated `rabbitMQ` sections to consume |
+| `--queues` | none | Legacy queue selector; ignored for section-based sources |
+| `--rabbitmq-host` | `rabbitMQ.host` or `localhost` | RabbitMQ server hostname |
+| `--rabbitmq-port` | `rabbitMQ.port` or `5672` | RabbitMQ server port |
+| `--rabbitmq-user` | `rabbitMQ.username` or `guest` | RabbitMQ username |
+| `--rabbitmq-pass` | `rabbitMQ.password` or `guest` | RabbitMQ password |
+| `--rabbitmq-vhost` | `rabbitMQ.virtualHost` or `/` | RabbitMQ virtual host |
+| `--rabbitmq-exchange` | none | Legacy exchange option; ignored for section-based sources |
 | `--log-level` | `INFO` | Logging level |
 | `--log-file` | none | Log file path |
 | `--config` / `-c` | `../conf/forwarder_targets.json` | Forwarding target configuration |
-| `--conns` | `../conf/private/conns.json` | Connection file used by `reference_api` targets |
+| `--conns` | `../conf/private/conns.json` | Connection file used by RabbitMQ sources and `reference_api` targets |
 
 ---
 
@@ -520,18 +551,19 @@ pip install pika==1.3.2
 pip install -r requirements.txt
 ```
 
-#### 5. Queue Not Found
+#### 5. RabbitMQ Source Not Found
 
-**Symptom**: `NOT_FOUND - no queue 'asset_commands' in vhost '/'`
+**Symptom**: startup fails with `rabbitMQ.<section> section not found` or
+`missing required field(s): exchange, queue, routingKey`.
 
 **Solutions**:
-- Make sure RabbitMQ started with the definitions.json loaded
-- Recreate the container to reload definitions:
+- Check `FORWARDER_RABBIT_SECTIONS` / `--rabbit-sections`.
+- Confirm each selected section exists under `rabbitMQ` in `conns.json`.
+- Confirm each selected section has non-empty `exchange`, `queue`, and
+  `routingKey` values.
 
 ```bash
-cd docker/rabbitmq
-docker-compose down -v
-docker-compose up -d
+export FORWARDER_RABBIT_SECTIONS=realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures
 ```
 
 ### Monitoring Commands
@@ -553,7 +585,7 @@ docker exec pyfm_rabbitmq rabbitmqctl list_queues name messages consumers
 docker exec pyfm_rabbitmq rabbitmqctl list_bindings
 
 # Purge a queue (clear all messages)
-docker exec pyfm_rabbitmq rabbitmqctl purge_queue asset_commands
+docker exec pyfm_rabbitmq rabbitmqctl purge_queue flexi_commands_queue
 ```
 
 ### Log Files
@@ -602,15 +634,16 @@ Configure the forwarder via environment variables or `.env` file:
 | `FORWARDER_LOG_LEVEL` | `INFO` | DEBUG, INFO, WARNING, ERROR |
 | `FORWARDER_LOG_FILE` | `/app/logs/forwarder.log` | Log file path (Docker mount: `./logs`) |
 | `FORWARDER_ASSET_TYPES` | (all) | Filter: `heat_pump,ev_charger` |
-| `FORWARDER_QUEUES` | `commands` | Queues: `commands,measurements` |
+| `FORWARDER_RABBIT_SECTIONS` | all valid sections | RabbitMQ sections: `realAssetCommands,simulatedAssetCommands,simulatedAssetMeasures` |
+| `FORWARDER_QUEUES` | none | Legacy queue selector; ignored |
 | `FORWARDER_CONFIG` | `../conf/forwarder_targets.json` | Target configuration path |
-| `FORWARDER_CONNS` | `../conf/private/conns.json` | Connection file for `reference_api` targets |
-| `RABBITMQ_HOST` | `localhost` | RabbitMQ hostname |
-| `RABBITMQ_PORT` | `5672` | RabbitMQ port |
-| `RABBITMQ_USER` | `guest` | RabbitMQ username |
-| `RABBITMQ_PASS` | `guest` | RabbitMQ password |
-| `RABBITMQ_VHOST` | `/` | RabbitMQ virtual host |
-| `RABBITMQ_EXCHANGE` | `flexi_commands` | RabbitMQ exchange |
+| `FORWARDER_CONNS` | `../conf/private/conns.json` | Connection file for RabbitMQ sources and `reference_api` targets |
+| `RABBITMQ_HOST` | `rabbitMQ.host` or `localhost` | RabbitMQ hostname override |
+| `RABBITMQ_PORT` | `rabbitMQ.port` or `5672` | RabbitMQ port override |
+| `RABBITMQ_USER` | `rabbitMQ.username` or `guest` | RabbitMQ username override |
+| `RABBITMQ_PASS` | `rabbitMQ.password` or `guest` | RabbitMQ password override |
+| `RABBITMQ_VHOST` | `rabbitMQ.virtualHost` or `/` | RabbitMQ virtual host override |
+| `RABBITMQ_EXCHANGE` | none | Legacy exchange override; ignored |
 | `RABBITMQ_CONNECT_RETRIES` | `10` | Connection retry attempts |
 | `RABBITMQ_CONNECT_RETRY_DELAY` | `5` | Seconds between retries |
 
