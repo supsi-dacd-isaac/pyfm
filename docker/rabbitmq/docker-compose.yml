@@ -19,7 +19,7 @@ services:
     container_name: pyfm_rabbitmq
     hostname: rabbitmq
     ports:
-      - "5672:5672"     # AMQP
+      - "9015:5672"     # AMQP
       - "15672:15672"   # Management UI
     environment:
       RABBITMQ_DEFAULT_USER: guest

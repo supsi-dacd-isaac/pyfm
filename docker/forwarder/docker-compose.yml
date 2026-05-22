@@ -40,7 +40,7 @@
         # FORWARDER_ASSET_TYPES: heat_pump,ev_charger       # Filter by asset types
 
         # RabbitMQ connection
-        RABBITMQ_HOST: ${RABBITMQ_HOST:-host.docker.internal}
+        RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
         RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
         RABBITMQ_USER: ${RABBITMQ_USER:-guest}
         RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
