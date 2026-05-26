@@ -1,6 +1,6 @@
 # Bidding Strategies for Flexibility Market
 
-This document explains the bidding strategies configured for the FSP (Flexibility Service Provider) to participate in the flexibility market. It reflects the current `conf/test_fm01_aem.json` configuration, including strategies `strategy_1` through `strategy_9`.
+This document explains the bidding strategies configured for the FSP (Flexibility Service Provider) to participate in the flexibility market. It reflects the current `conf/test_fm01_aem.json` configuration, including strategies `strategy_1` through `strategy_10`.
 
 ## Overview
 
@@ -28,16 +28,17 @@ The active FSP portfolio in `conf/test_fm01_aem.json` currently lists `ECM96.2`,
 
 In strategy mode, flexibility method selection is strategy-scoped:
 
-- Strategies without `flexibility_method: "persistence"` default to the historical/legacy flexibility path.
+- Strategies without an explicit `flexibility_method` default to the historical/legacy flexibility path.
 - A strategy uses persistence only when it explicitly sets `flexibility_method: "persistence"`.
-- This prevents new persistence strategies from changing existing historical strategies.
+- A strategy uses recent-profile forecasting only when it explicitly sets `flexibility_method: "recent_profile"`.
+- This prevents new persistence or recent-profile strategies from changing existing historical strategies.
 
 Baseline persistence and bidding strategy persistence are separate concepts:
 
 - `baseline.dbSettings.strategy = "slot_persistence"` affects baseline generation/uploading.
 - `flexibility_method: "persistence"` inside a bidding strategy affects trader bidding flexibility for the selected strategy.
 
-In the current configuration, `strategy_8` and `strategy_9` are the persistence bidding strategies. `strategy_4` is historical/legacy.
+In the current configuration, `strategy_8` and `strategy_9` are the persistence bidding strategies, and `strategy_10` is the recent-profile bidding strategy. `strategy_4` is historical/legacy.
 
 ## Current Strategy Summary
 
@@ -52,6 +53,7 @@ In the current configuration, `strategy_8` and `strategy_9` are the persistence 
 | `strategy_7` | Double Pre-heating | Heat pumps | `ECM96.2` | Historical/legacy | Morning and evening preheat/peak cycle | Intent is taken from config preheat fields. |
 | `strategy_8` | Persistence HP Strategy | Heat pumps | `ECM96.2`, `ECM97.3` | Persistence | Safer HP-only persistence bidding | Excludes EV chargers. |
 | `strategy_9` | Persistence HP + EV Strategy | HP + EV | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | Persistence | Persistence bidding including EV chargers | Monitor EV telemetry carefully. |
+| `strategy_10` | Recent-profile Short-term Flexibility (EV) | EV (HP-capable) | `ECM63.1`, `ECM63.2` | Recent profile | EV-only short-term profile bidding | HPs excluded by `assets_filter`; warm-season deployment. |
 
 ---
 
@@ -379,15 +381,114 @@ EV telemetry has been observed to be more problematic than HP telemetry. Monitor
 
 ---
 
+## Strategy 10: Recent-profile Short-term Flexibility (EV)
+
+### Description
+EV-only short-term flexibility strategy based on a recent power profile rather than a single lagged persistence baseline.
+
+**Flexibility method:** recent profile via `flexibility_method: "recent_profile"`.
+
+Unlike `strategy_8` and `strategy_9`, this strategy does **not** use simple t-1h persistence. Instead, it estimates expected upcoming power from recent 15-minute measurements and bids a conservative fraction of that estimate.
+
+### Why It Was Introduced
+- EV charging power varies within a session; a single lagged sample is often a poor baseline.
+- A recent-profile estimate adapts to the current charging level while staying conservative.
+- The same architecture can later support discrete HP assets, but HPs are currently excluded from bidding.
+
+### Assets Used
+- ✅ ECM63.1 (EV Charger 1)
+- ✅ ECM63.2 (EV Charger 2)
+- ❌ Heat pumps excluded by `assets_filter` (warm-season deployment; architecture supports discrete HPs for future use)
+
+### Recent-profile Forecasting Logic
+
+For each allowed asset at bid time:
+
+1. **Collect recent measurements** over the configured lookback window (default: 120 minutes of 15-min grouped samples).
+2. **Apply the current-power activity gate:** if the latest measurement is at or below `activeThresholdW` (default: 500 W), the asset contributes 0 flexibility.
+3. **Estimate expected power** as the configured lower quantile of recent samples (default: q25).
+4. **Cap expected power** at `nominal_power_w`.
+5. **Derive flexibility** from expected power using the asset modulation type:
+   - **Continuous / modulated assets** (EV chargers): `flexibility = continuousFactor × expected_power` (default factor: 0.5)
+   - **Discrete / ON-OFF assets** (heat pumps): `flexibility = discreteFactor × expected_power` (default factor: 1.0)
+
+Example for an active EV charger:
+
+| Step | Value |
+|------|-------|
+| Recent samples (kW) | 4, 8, 12, 16 |
+| q25 expected power | 7 kW |
+| Continuous factor | 0.5 |
+| Available flexibility | **3.5 kW** |
+
+If expected charging power were 8 kW with the default factor, available flexibility would be **4 kW**.
+
+### Difference vs Persistence (`strategy_8` / `strategy_9`)
+
+| Aspect | Persistence (`strategy_8` / `strategy_9`) | Recent profile (`strategy_10`) |
+|--------|-------------------------------------------|--------------------------------|
+| Baseline source | Single lagged measurement (e.g. t-90 min) | Lower quantile of recent lookback window |
+| Typical use | HP and mixed HP+EV persistence validation | Short-term modulated EV charging |
+| EV treatment | Uses lagged EV power as baseline | Uses recent charging profile (q25) |
+| Current-power gate | Yes | Yes |
+| Overdelivery | Disallowed (gated method) | Disallowed (gated method) |
+| Activation path | Persistence bid-record / flexi_manager path | Same persistence activation infrastructure |
+
+Both persistence and recent-profile strategies are **gated methods**: they require a fresh current measurement, skip unsafe assets, and reuse the same bid-record activation pipeline in `trader_fsp.py` and `flexi_manager.py`.
+
+### Recent-profile Behaviour
+- Requires at least `minSamples` recent measurements (default: 2); otherwise the asset contributes 0 flexibility.
+- Missing, failed, or stale current measurements skip the affected asset under `missingMeasurementPolicy: "skip_asset"`.
+- Recommended bid quantity uses the same no-overdelivery conservative logic as persistence strategies.
+- `bid_record_assets` stores the selected allocation only, not the full asset list.
+
+### Strategy-owned Settings
+
+Recent-profile parameters belong to the strategy config:
+
+```text
+bidding_strategies.strategy_10.recentProfileSettings
+```
+
+They are **not** global `flexibility.recentProfileSettings` anymore. For backward compatibility, a legacy global block is still accepted with a warning if the strategy block is missing.
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `lookbackMinutes` | 120 | Recent measurement window |
+| `quantile` | 0.25 | Conservative expected-power estimate (q25) |
+| `continuousFactor` | 0.5 | Flexibility fraction for modulated assets |
+| `discreteFactor` | 1.0 | Flexibility fraction for ON/OFF assets |
+| `activeThresholdW` | 500 | Current-power activity gate |
+| `minSamples` | 2 | Minimum recent samples required |
+| `missingMeasurementPolicy` | `skip_asset` | Safe handling when data is missing |
+
+### When to Use
+- When testing short-term EV flexibility based on current charging behaviour
+- During warm season when HP participation is intentionally disabled
+- After validating EV telemetry quality on `ECM63.1` and `ECM63.2`
+
+### Caution
+- Start with `--dry-run` and inspect per-asset recent-profile logs before live bidding.
+- HP support is architecturally ready but currently disabled via `assets_filter`.
+
+---
+
 ## Strategy Comparison
 
-| Metric | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 |
-|--------|----|----|----|----|----|----|----|----|----|
-| Flexibility method | Historical | Historical | Historical | Historical | Historical | Historical | Historical | Persistence | Persistence |
-| Uses EV chargers | No | Yes | No | No | Yes | No | No | No | Yes |
-| Explicit asset filter | No | No | `ECM97.3` | `ECM96.2`, `ECM97.3` | No | No | `ECM96.2` | `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` |
-| Preheat fields | No | No | No | No | No | Yes | Yes | No | No |
-| Persistence current-state gate | No | No | No | No | No | No | No | Yes | Yes |
+| Strategy | Forecasting logic | Asset types | Control |
+|----------|-------------------|-------------|---------|
+| `strategy_8` | Persistence (lagged baseline) | HP | ON/OFF |
+| `strategy_9` | Persistence (lagged baseline) | HP + EV | Mixed |
+| `strategy_10` | Recent profile q25 | EV (currently) | Modulated |
+
+| Metric | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 |
+|--------|----|----|----|----|----|----|----|----|----|-----|
+| Flexibility method | Historical | Historical | Historical | Historical | Historical | Historical | Historical | Persistence | Persistence | Recent profile |
+| Uses EV chargers | No | Yes | No | No | Yes | No | No | No | Yes | Yes |
+| Explicit asset filter | No | No | `ECM97.3` | `ECM96.2`, `ECM97.3` | No | No | `ECM96.2` | `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2` |
+| Preheat fields | No | No | No | No | No | Yes | Yes | No | No | No |
+| Gated current-state method | No | No | No | No | No | No | No | Yes | Yes | Yes |
+| Strategy-owned forecast settings | No | No | No | No | No | No | No | No | No | `recentProfileSettings` |
 
 ---
 
@@ -397,7 +498,8 @@ EV telemetry has been observed to be more problematic than HP telemetry. Monitor
 Each strategy defines which assets can participate:
 - Heat pumps only: `strategy_1`, `strategy_3`, `strategy_4`, `strategy_6`, `strategy_7`, `strategy_8`
 - Heat pumps plus EV chargers: `strategy_2`, `strategy_5`, `strategy_9`
-- Specific asset filters: `strategy_3`, `strategy_4`, `strategy_7`, `strategy_8`, `strategy_9`
+- EV chargers only (current deployment): `strategy_10`
+- Specific asset filters: `strategy_3`, `strategy_4`, `strategy_7`, `strategy_8`, `strategy_9`, `strategy_10`
 
 ### 2. Time-Based Pricing
 Each strategy defines minimum acceptable prices for different time periods:
@@ -456,6 +558,36 @@ Persistence strategies include an explicit method flag:
 }
 ```
 
+Recent-profile strategies include strategy-owned forecast settings:
+
+```json
+"strategy_10": {
+  "name": "Recent-profile Short-term Flexibility (EV)",
+  "asset_types": ["ev_charger", "heat_pump"],
+  "assets_filter": ["ECM63.1", "ECM63.2"],
+  "flexibility_method": "recent_profile",
+  "recentProfileSettings": {
+    "lookbackMinutes": 120,
+    "quantile": 0.25,
+    "continuousFactor": 0.5,
+    "discreteFactor": 1.0,
+    "activeThresholdW": 500,
+    "minSamples": 2,
+    "missingMeasurementPolicy": "skip_asset"
+  },
+  "time_slots": [
+    {"name": "Morning Peak", "start": "06:30", "end": "09:00",
+     "flexibility_mw": 0.011, "bid_price": 9.0, "activation_cost": 2.5},
+    ...
+  ]
+}
+```
+
+Settings resolution order for `recentProfileSettings`:
+1. `bidding_strategies.<strategy_id>.recentProfileSettings` (preferred)
+2. legacy global `flexibility.recentProfileSettings` (warning fallback)
+3. built-in defaults
+
 ### FSP Configuration
 Each FSP can have a default strategy:
 ```json
@@ -479,6 +611,13 @@ python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
 ```bash
 python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
     --fsp supsi01 --strategy strategy_8 --dry-run
+```
+
+Recent-profile dry run:
+
+```bash
+python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
+    --fsp supsi01 --strategy strategy_10 --dry-run
 ```
 
 From the `scripts/` directory:
@@ -507,8 +646,9 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 1. **Use `strategy_4`** when you want the configured recommended historical/legacy HP hybrid.
 2. **Use `strategy_8`** when validating persistence bidding with the safer HP-only asset set.
 3. **Use `strategy_9`** only after validating EV telemetry quality, because it includes EV chargers.
-4. **Use `strategy_6` or `strategy_7`** when specifically testing the configured preheat schedules.
-5. **Use dry-run first** before enabling live bidding for any strategy.
+4. **Use `strategy_10`** when testing recent-profile EV bidding on `ECM63.1` and `ECM63.2`; start with dry-run.
+5. **Use `strategy_6` or `strategy_7`** when specifically testing the configured preheat schedules.
+6. **Use dry-run first** before enabling live bidding for any strategy.
 
 ---
 
@@ -526,3 +666,6 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 | **Portfolio Available Flexibility** | Diagnostic availability across assigned portfolio assets before strategy filtering |
 | **Strategy Available Flexibility** | Availability after applying the selected strategy asset filter |
 | **Recommended Bid** | Quantity used for bidding after strategy filtering and achievable-flexibility logic |
+| **Recent profile** | Short-term flexibility method using a lower quantile of recent measurements |
+| **Persistence current-state gate** | Rule that assets below `activeThresholdW` contribute zero flexibility |
+| **Gated flexibility method** | Real-time method (`persistence`, `recent_profile`) that gates bids on current measurements and reuses the persistence activation path |

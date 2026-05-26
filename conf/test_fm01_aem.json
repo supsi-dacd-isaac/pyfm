@@ -539,6 +539,29 @@
         {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
         {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
       ]
+    },
+    "strategy_10": {
+      "name": "Recent-profile Short-term Flexibility (EV)",
+      "description": "Profile-based forecast: q25 of last 2h of 15-min samples, 50% of expected power for continuous EV chargers; architecture also supports discrete HPs but only EV chargers are enabled for now",
+      "asset_types": ["ev_charger", "heat_pump"],
+      "assets_filter": ["ECM63.1", "ECM63.2"],
+      "flexibility_method": "recent_profile",
+      "recentProfileSettings": {
+        "lookbackMinutes": 120,
+        "quantile": 0.25,
+        "continuousFactor": 0.5,
+        "discreteFactor": 1.0,
+        "activeThresholdW": 500,
+        "minSamples": 2,
+        "missingMeasurementPolicy": "skip_asset"
+      },
+      "time_slots": [
+        {"name": "Morning Peak", "start": "06:30", "end": "09:00", "flexibility_mw": 0.011, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.011, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.011, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.011, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.011, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
     }
   }
 }

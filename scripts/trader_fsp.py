@@ -709,10 +709,13 @@ def resolve_strategy_flexibility_method(strategy, logger):
     aliases = {
         "legacy": "historical",
         "time_based": "historical",
+        "recent-profile": "recent_profile",
+        "recentprofile": "recent_profile",
+        "profile": "recent_profile",
     }
     method = aliases.get(method, method)
 
-    if method not in {"historical", "persistence"}:
+    if method not in {"historical", "persistence", "recent_profile"}:
         logger.warning(
             "Unknown flexibility_method=%s for strategy %s; using historical",
             raw_method,
@@ -734,7 +737,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--fsp", help="FSP identifier", required=True)
     arg_parser.add_argument(
         "--strategy",
-        help="Bidding strategy to use. Options include strategy_1 through strategy_8. "
+        help="Bidding strategy to use. Options include strategy_1 through strategy_10. "
              "If not specified and FSP has no strategy configured, uses simple baseline-based bidding."
     )
     arg_parser.add_argument(
@@ -975,7 +978,12 @@ if __name__ == "__main__":
 
     # Initialize FlexibilityForecaster for the 5-asset portfolio
     flex_forecaster = FlexibilityForecaster(
-        cfg, influx_client, logger, method_override=forecaster_method_override
+        cfg,
+        influx_client,
+        logger,
+        method_override=forecaster_method_override,
+        strategy_config=strategy.config if use_strategy_mode and strategy else None,
+        strategy_id=strategy_id if use_strategy_mode else None,
     )
     
     # FMO object
@@ -1005,19 +1013,35 @@ if __name__ == "__main__":
 
     asset_breakdown = {}
     total_available_flex_kw = 0.0
+    # Methods that pre-compute a real-time per-asset availability gate
+    # (e.g. persistence for strategy_8/9, recent_profile for strategy_10).
+    # Both feed the same portfolio-scoped activation pipeline via bid records.
+    gated_flexibility_methods = {"persistence", "recent_profile"}
     use_persistence_flexibility = (
-        strategy_flexibility_method == "persistence"
+        strategy_flexibility_method in gated_flexibility_methods
         if use_strategy_mode
-        else flex_forecaster.method == "persistence"
+        else flex_forecaster.method in gated_flexibility_methods
     )
     if use_persistence_flexibility:
-        logger.info(
-            "Persistence flexibility mode: target_slot_utc=%s, default persistenceGoBackMinutes=%s, activeThresholdW=%.1f, maxCurrentMeasurementAgeMinutes=%s",
-            slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            flex_forecaster.persistence_go_back_minutes,
-            flex_forecaster.persistence_active_threshold_w,
-            flex_forecaster.max_current_measurement_age_minutes,
-        )
+        if flex_forecaster.method == "recent_profile":
+            logger.info(
+                "Recent-profile flexibility mode: target_slot_utc=%s, lookbackMinutes=%s, quantile=%.3f, continuousFactor=%.3f, discreteFactor=%.3f, activeThresholdW=%.1f, maxCurrentMeasurementAgeMinutes=%s",
+                slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                flex_forecaster.recent_profile_lookback_minutes,
+                flex_forecaster.recent_profile_quantile,
+                flex_forecaster.recent_profile_continuous_factor,
+                flex_forecaster.recent_profile_discrete_factor,
+                flex_forecaster.recent_profile_active_threshold_w,
+                flex_forecaster.max_current_measurement_age_minutes,
+            )
+        else:
+            logger.info(
+                "Persistence flexibility mode: target_slot_utc=%s, default persistenceGoBackMinutes=%s, activeThresholdW=%.1f, maxCurrentMeasurementAgeMinutes=%s",
+                slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                flex_forecaster.persistence_go_back_minutes,
+                flex_forecaster.persistence_active_threshold_w,
+                flex_forecaster.max_current_measurement_age_minutes,
+            )
         portfolio_flexibility_mw_map = {}
         if use_strategy_mode and strategy:
             portfolio_strategy_contexts = {}
@@ -1260,7 +1284,10 @@ if __name__ == "__main__":
             # Convert numpy types to native Python types to avoid SQL issues
             assets_to_activate = []
             if use_strategy_mode and strategy and portfolio_strategy_contexts is not None:
-                if strategy_flexibility_method == "persistence":
+                if strategy_flexibility_method in gated_flexibility_methods:
+                    # Persistence and recent_profile share the same activation
+                    # plan shape (driven by the per-asset breakdown computed
+                    # in this run), so they reuse the same builder.
                     assets_to_activate = build_persistence_assets_to_activate(
                         portfolio_strategy_contexts
                     )
