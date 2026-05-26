@@ -7,6 +7,69 @@ import json
 import os
 
 
+def resolve_recent_profile_settings(
+    main_cfg: dict,
+    strategy_config: Optional[dict] = None,
+    strategy_id: Optional[str] = None,
+    logger=None,
+    persistence_active_threshold_w: float = 500,
+    persistence_missing_measurement_policy: str = "skip_asset",
+) -> Dict:
+    """
+    Resolve recent-profile forecasting/risk settings for a bidding strategy.
+
+    Priority:
+    1. strategy_config.recentProfileSettings (bidding_strategies.<id>)
+    2. flexibility.recentProfileSettings (legacy global fallback, with warning)
+    3. Built-in defaults
+
+    Returns a dict of normalized settings plus a ``source`` key describing
+    where the raw configuration was loaded from.
+    """
+    strategy_settings = (strategy_config or {}).get("recentProfileSettings")
+    global_settings = main_cfg.get("flexibility", {}).get("recentProfileSettings")
+
+    if strategy_settings:
+        raw = strategy_settings
+        if strategy_id:
+            source = f"bidding_strategies.{strategy_id}.recentProfileSettings"
+        else:
+            source = "strategy.recentProfileSettings"
+    elif global_settings:
+        raw = global_settings
+        source = "flexibility.recentProfileSettings"
+        if logger is not None:
+            logger.warning(
+                "recentProfileSettings not found on strategy %s; "
+                "falling back to legacy global flexibility.recentProfileSettings",
+                strategy_id or "unknown",
+            )
+    else:
+        raw = {}
+        source = "defaults"
+        if logger is not None and strategy_id:
+            logger.warning(
+                "recentProfileSettings not found for strategy %s or globally; "
+                "using built-in defaults",
+                strategy_id,
+            )
+
+    return {
+        "source": source,
+        "lookback_minutes": int(raw.get("lookbackMinutes", 120)),
+        "quantile": float(raw.get("quantile", 0.25)),
+        "continuous_factor": float(raw.get("continuousFactor", 0.5)),
+        "discrete_factor": float(raw.get("discreteFactor", 1.0)),
+        "active_threshold_w": float(
+            raw.get("activeThresholdW", persistence_active_threshold_w)
+        ),
+        "min_samples": int(raw.get("minSamples", 2)),
+        "missing_measurement_policy": raw.get(
+            "missingMeasurementPolicy", persistence_missing_measurement_policy
+        ),
+    }
+
+
 class FlexibilityForecaster:
     """
     Forecasts flexibility available from FSP assets for flexibility market bidding.
@@ -30,6 +93,8 @@ class FlexibilityForecaster:
         influx_client,
         logger,
         method_override: Optional[str] = None,
+        strategy_config: Optional[dict] = None,
+        strategy_id: Optional[str] = None,
     ):
         """
         Initialize the FlexibilityForecaster.
@@ -38,6 +103,9 @@ class FlexibilityForecaster:
         :param influx_client: InfluxDB client for historical queries
         :param logger: Logger instance
         :param method_override: Optional flexibility method for the current caller
+        :param strategy_config: Active bidding strategy config (for method-specific
+            settings such as recentProfileSettings on strategy_10)
+        :param strategy_id: Active strategy identifier (for logging/resolution)
         """
         self.main_cfg = main_cfg
         self.influx_client = influx_client
@@ -78,6 +146,32 @@ class FlexibilityForecaster:
         self.max_current_measurement_age_minutes = int(
             persistence_cfg.get("maxCurrentMeasurementAgeMinutes", 30)
         )
+
+        # Recent-profile settings are strategy-owned (strategy_10+). They are
+        # loaded only when the active method is recent_profile.
+        self.recent_profile_settings_source = None
+        self.recent_profile_lookback_minutes = 120
+        self.recent_profile_quantile = 0.25
+        self.recent_profile_continuous_factor = 0.5
+        self.recent_profile_discrete_factor = 1.0
+        self.recent_profile_active_threshold_w = self.persistence_active_threshold_w
+        self.recent_profile_min_samples = 2
+        self.recent_profile_missing_measurement_policy = (
+            self.persistence_missing_measurement_policy
+        )
+        if self.method == "recent_profile":
+            self._load_recent_profile_settings(
+                resolve_recent_profile_settings(
+                    main_cfg=main_cfg,
+                    strategy_config=strategy_config,
+                    strategy_id=strategy_id,
+                    logger=logger,
+                    persistence_active_threshold_w=self.persistence_active_threshold_w,
+                    persistence_missing_measurement_policy=(
+                        self.persistence_missing_measurement_policy
+                    ),
+                )
+            )
         
         # Temperature configuration
         temp_cfg = flex_cfg.get("temperature", {})
@@ -125,6 +219,19 @@ class FlexibilityForecaster:
                 self.persistence_active_threshold_w,
                 self.default_persistence_safety_factor,
                 self.persistence_missing_measurement_policy,
+                self.max_current_measurement_age_minutes,
+            )
+        elif self.method == "recent_profile":
+            self.logger.info(
+                "Recent-profile flexibility settings (source=%s): lookback=%s min, quantile=%.3f, continuousFactor=%.3f, discreteFactor=%.3f, activeThresholdW=%.1f, minSamples=%s, missingMeasurementPolicy=%s, maxCurrentMeasurementAgeMinutes=%s",
+                self.recent_profile_settings_source,
+                self.recent_profile_lookback_minutes,
+                self.recent_profile_quantile,
+                self.recent_profile_continuous_factor,
+                self.recent_profile_discrete_factor,
+                self.recent_profile_active_threshold_w,
+                self.recent_profile_min_samples,
+                self.recent_profile_missing_measurement_policy,
                 self.max_current_measurement_age_minutes,
             )
         
@@ -937,6 +1044,19 @@ class FlexibilityForecaster:
         self.logger.info("Confidence: %s", dict(confidence_counts))
         self.logger.info("=" * 70)
 
+    def _load_recent_profile_settings(self, settings: Dict) -> None:
+        """Apply normalized recent-profile settings onto this forecaster."""
+        self.recent_profile_settings_source = settings.get("source", "unknown")
+        self.recent_profile_lookback_minutes = settings["lookback_minutes"]
+        self.recent_profile_quantile = settings["quantile"]
+        self.recent_profile_continuous_factor = settings["continuous_factor"]
+        self.recent_profile_discrete_factor = settings["discrete_factor"]
+        self.recent_profile_active_threshold_w = settings["active_threshold_w"]
+        self.recent_profile_min_samples = settings["min_samples"]
+        self.recent_profile_missing_measurement_policy = settings[
+            "missing_measurement_policy"
+        ]
+
     def _validate_persistence_alignment(
         self,
         persistence_go_back_minutes: int,
@@ -1253,6 +1373,246 @@ class FlexibilityForecaster:
 
         return breakdown
 
+    def _get_asset_flexibility_breakdown_recent_profile(
+        self,
+        period_from: datetime,
+        current_time_utc: Optional[datetime] = None,
+        asset_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Dict]:
+        """
+        Profile-based short-term flexibility breakdown (used by strategy_10).
+
+        For each selected asset:
+        1. read recent 15-min grouped measurements over a configurable lookback
+        2. use the latest measurement as an "is currently active" gate
+        3. estimate the expected upcoming power as the configured low quantile
+           (q25 by default) of the recent samples, capped by nominal_power_w
+        4. derive flexibility from the expected power according to modulation:
+             - continuous (e.g. EV chargers): flex = continuous_factor * expected
+             - discrete   (e.g. heat pumps): flex = discrete_factor   * expected
+
+        The returned dict shape mirrors the persistence breakdown so that
+        downstream consumers (trader_fsp, flexi_manager, bid records) can be
+        reused unchanged.
+        """
+        if current_time_utc is None:
+            current_time_utc = datetime.utcnow()
+
+        # Reuse the persistence alignment check on the lookback window so we
+        # stay coherent with fm.granularity (15 min by default).
+        if (
+            self._validate_persistence_alignment(
+                self.recent_profile_lookback_minutes,
+                f"{self.recent_profile_settings_source}.lookbackMinutes",
+            )
+            is False
+        ):
+            return {}
+
+        selected_asset_ids = asset_ids or list(self.asset_capacities.keys())
+        breakdown: Dict[str, Dict] = {}
+        target_slot_utc = pd.Timestamp(period_from, tz="UTC")
+
+        lookback_end_utc = pd.Timestamp(current_time_utc, tz="UTC")
+        lookback_start_utc = lookback_end_utc - pd.Timedelta(
+            minutes=self.recent_profile_lookback_minutes
+        )
+
+        for asset_id in selected_asset_ids:
+            mapping = self.asset_mapping.get(asset_id, {})
+            if not isinstance(mapping, dict):
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for %s: legacy asset_mapping entry is not supported",
+                    asset_id,
+                )
+                continue
+
+            nominal_power_w = mapping.get("nominal_power_w")
+            if nominal_power_w is None:
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for %s: nominal_power_w is not configured",
+                    asset_id,
+                )
+                continue
+            nominal_power_w = float(nominal_power_w)
+
+            modulation_type = self._get_modulation_type(asset_id)
+            if modulation_type not in ("continuous", "discrete"):
+                self.logger.warning(
+                    "Unknown modulation_type=%s for asset=%s in recent-profile flexibility; treating as continuous",
+                    modulation_type,
+                    asset_id,
+                )
+                modulation_type = "continuous"
+            asset_type = mapping.get("type", "unknown")
+            description = self.asset_descriptions.get(asset_id, asset_id)
+
+            # Pull the recent 15-min grouped series for the lookback window.
+            recent_series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=lookback_start_utc.to_pydatetime(),
+                end_time_utc=lookback_end_utc.to_pydatetime(),
+            )
+            if recent_series is None:
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for asset=%s target_slot=%s: query failed",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                if (
+                    self.recent_profile_missing_measurement_policy
+                    == "fail_portfolio"
+                ):
+                    return {}
+                continue
+
+            # Current-power gate (max age policy reused from persistence).
+            (
+                gate_measurement_time_utc,
+                current_measured_power_w,
+                current_measurement_age_minutes,
+            ) = self._get_latest_grouped_measurement(
+                asset_id=asset_id,
+                current_time_utc=current_time_utc,
+                max_age_minutes=self.max_current_measurement_age_minutes,
+            )
+
+            if gate_measurement_time_utc is None or current_measured_power_w is None:
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for asset=%s target_slot=%s: current gate measurement is missing",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                continue
+
+            if (
+                current_measurement_age_minutes is None
+                or current_measurement_age_minutes
+                > self.max_current_measurement_age_minutes
+            ):
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for asset=%s target_slot=%s: current gate measurement is too old (timestamp=%s age=%.1f min, max=%s min)",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    gate_measurement_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    current_measurement_age_minutes or float("nan"),
+                    self.max_current_measurement_age_minutes,
+                )
+                continue
+
+            current_measured_power_w = float(current_measured_power_w)
+            is_currently_active = (
+                current_measured_power_w > self.recent_profile_active_threshold_w
+            )
+
+            recent_values = recent_series.dropna().astype(float)
+            sample_count = int(recent_values.size)
+            expected_power_w: Optional[float] = None
+
+            # If the asset isn't really running right now or we don't have
+            # enough recent samples to estimate, do not bid.
+            if not is_currently_active:
+                available_flexibility_w = 0.0
+                modulation_factor = 0.0
+                skip_reason = "inactive"
+            elif sample_count < self.recent_profile_min_samples:
+                available_flexibility_w = 0.0
+                modulation_factor = 0.0
+                skip_reason = "insufficient_samples"
+            else:
+                # Conservative expected future power: lower quantile of the
+                # recent samples, capped by the asset's nominal power.
+                expected_power_w = float(
+                    recent_values.quantile(self.recent_profile_quantile)
+                )
+                expected_power_w = min(expected_power_w, nominal_power_w)
+                expected_power_w = max(expected_power_w, 0.0)
+
+                if modulation_type == "discrete":
+                    modulation_factor = self.recent_profile_discrete_factor
+                else:
+                    modulation_factor = self.recent_profile_continuous_factor
+
+                available_flexibility_w = modulation_factor * expected_power_w
+                # Safety: never offer more than the asset nominal.
+                available_flexibility_w = min(
+                    available_flexibility_w, nominal_power_w
+                )
+                skip_reason = None
+
+            recent_summary = {
+                "count": sample_count,
+                "min_w": float(recent_values.min()) if sample_count else None,
+                "max_w": float(recent_values.max()) if sample_count else None,
+                "mean_w": float(recent_values.mean()) if sample_count else None,
+            }
+
+            self.logger.info(
+                "Recent-profile flexibility asset=%s modulation=%s target_slot_utc=%s lookback_window=[%s, %s] samples=%d current=%.2f W active=%s expected_q%02d=%s W nominal=%.2f W modulation_factor=%.3f flexibility=%.2f W%s",
+                asset_id,
+                modulation_type,
+                target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                lookback_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                lookback_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                sample_count,
+                current_measured_power_w,
+                is_currently_active,
+                int(round(self.recent_profile_quantile * 100)),
+                f"{expected_power_w:.2f}" if expected_power_w is not None else "N/A",
+                nominal_power_w,
+                modulation_factor,
+                available_flexibility_w,
+                f" skipped:{skip_reason}" if skip_reason else "",
+            )
+
+            breakdown[asset_id] = {
+                "description": description,
+                "asset_type": asset_type,
+                "nominal_capacity_kw": nominal_power_w / 1000,
+                # Keep the persistence-shaped keys so existing consumers
+                # (trader_fsp logging, bid record building, flexi_manager)
+                # can be reused without changes. We re-purpose the
+                # "baseline_*" fields to carry the q25-derived expectation.
+                "typical_load_kw": (
+                    expected_power_w / 1000 if expected_power_w is not None else 0.0
+                ),
+                "baseline_power_w": expected_power_w or 0.0,
+                "baseline_source_time_utc": lookback_start_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "flexibility_persistence_go_back_minutes": (
+                    self.recent_profile_lookback_minutes
+                ),
+                "current_measured_power_w": current_measured_power_w,
+                "gate_measurement_time_utc": gate_measurement_time_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "current_measurement_age_minutes": current_measurement_age_minutes,
+                "active_threshold_w": self.recent_profile_active_threshold_w,
+                "is_currently_active": is_currently_active,
+                "safety_factor": modulation_factor,
+                "flexibility_factor": modulation_factor,
+                "nominal_power_w": nominal_power_w,
+                "occupancy_probability": None,
+                "available_flexibility_w": available_flexibility_w,
+                "available_flexibility_kw": available_flexibility_w / 1000,
+                "max_flexibility_kw": (modulation_factor * nominal_power_w) / 1000,
+                # Recent-profile-specific diagnostics:
+                "estimation_method": "recent_profile",
+                "modulation_type": modulation_type,
+                "recent_profile_lookback_minutes": self.recent_profile_lookback_minutes,
+                "recent_profile_quantile": self.recent_profile_quantile,
+                "recent_profile_sample_count": sample_count,
+                "recent_profile_recent_values_summary": recent_summary,
+                "recent_profile_expected_power_w": expected_power_w,
+                "recent_profile_skip_reason": skip_reason,
+                "is_available_for_flexibility": bool(
+                    is_currently_active and available_flexibility_w > 0
+                ),
+            }
+
+        return breakdown
+
     def get_asset_flexibility_breakdown(
         self, 
         period_from: datetime,
@@ -1275,6 +1635,13 @@ class FlexibilityForecaster:
         """
         if self.method == "persistence":
             return self._get_asset_flexibility_breakdown_persistence(
+                period_from=period_from,
+                current_time_utc=current_time_utc,
+                asset_ids=asset_ids,
+            )
+
+        if self.method == "recent_profile":
+            return self._get_asset_flexibility_breakdown_recent_profile(
                 period_from=period_from,
                 current_time_utc=current_time_utc,
                 asset_ids=asset_ids,
@@ -1564,6 +1931,14 @@ class FlexibilityForecaster:
         discrete_assets = {}
         continuous_assets = {}
         
+        # Methods that pre-compute a real-time per-asset availability gate
+        # (current-measurement based). For those, get_achievable_flexibility
+        # must honor `is_available_for_flexibility` and use the per-asset
+        # availability as the discrete ON state, rather than the nominal
+        # capacity. This is the path used by strategy_8/9 (persistence) and
+        # strategy_10 (recent_profile).
+        is_gated_method = self.method in ("persistence", "recent_profile")
+
         for asset_id, info in breakdown.items():
             mod_type = self._get_modulation_type(asset_id)
             
@@ -1572,7 +1947,7 @@ class FlexibilityForecaster:
             flex_factor = info.get("flexibility_factor", 0.5)
             nominal_kw = info.get("nominal_capacity_kw", 0)
             
-            if self.method == "persistence":
+            if is_gated_method:
                 is_available = info.get(
                     "is_available_for_flexibility", available_flex > 0
                 )
@@ -1582,7 +1957,7 @@ class FlexibilityForecaster:
                 is_available = flex_factor >= 0.5  # 50% threshold
             
             if mod_type == "discrete":
-                if self.method == "persistence":
+                if is_gated_method:
                     states_kw = [0.0, available_flex]
                 else:
                     states_kw = None
@@ -1655,7 +2030,7 @@ class FlexibilityForecaster:
                 discrete_combos,
                 continuous_available,
                 continuous_assets,
-                allow_overdelivery=self.method != "persistence",
+                allow_overdelivery=not is_gated_method,
             )
             result["target_kw"] = target_kw
             result["recommended_bid_kw"] = best_bid["bid_kw"]

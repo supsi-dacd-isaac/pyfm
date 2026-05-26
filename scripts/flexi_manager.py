@@ -3211,7 +3211,15 @@ class FlexibilityManager:
                 strategy_obj = self.strategy_manager.get_strategy(strategy_info.get("id"))
                 if strategy_obj:
                     flexibility_method = strategy_obj.config.get("flexibility_method")
-                    is_persistence_strategy = flexibility_method == "persistence"
+                    # Strategies whose bidder pre-computes a per-asset
+                    # activation plan and stores it in bid_record_assets.
+                    # Persistence (strategy_8/9) and recent_profile
+                    # (strategy_10) both follow this contract, so they reuse
+                    # the same activation pipeline downstream.
+                    is_persistence_strategy = flexibility_method in (
+                        "persistence",
+                        "recent_profile",
+                    )
                     summary["flexibility_method"] = flexibility_method
 
                 self.logger.info("  Strategy: %s (%s)", 
