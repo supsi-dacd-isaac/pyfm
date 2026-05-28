@@ -561,3 +561,220 @@ def test_persistence_uses_only_bid_record_assets_not_strategy_allowed(tmp_path):
     assert "ECM96.2" in allocations
     assert "ECM97.3" not in allocations
     assert summary.get("allocation_source") == "bid_record_assets.available_flexibility_kw"
+
+
+# =============================================================================
+# STRATEGY 10 RECENT-PROFILE ACTIVATION TARGET TESTS
+# =============================================================================
+
+_RECENT_PROFILE_STRATEGY_ID = "strategy_10"
+
+
+def _recent_profile_strategy_config():
+    return {
+        "name": "Recent Profile EV Strategy",
+        "description": "test recent profile",
+        "asset_types": ["ev_charger"],
+        "assets_filter": ["ECM63.2"],
+        "flexibility_method": "recent_profile",
+        "time_slots": [
+            {
+                "name": "All day",
+                "start": "00:00",
+                "end": "23:59",
+                "flexibility_mw": 0.002,
+                "bid_price": 9.0,
+                "activation_cost": 2.5,
+            }
+        ],
+    }
+
+
+def _new_recent_profile_manager(tmp_path, asset_mapping, bid_record_assets):
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {
+                "fsps": {
+                    "fsp1": {
+                        "name": "FSP1",
+                        "assets": list(asset_mapping.keys()),
+                    }
+                }
+            },
+        },
+        "asset_mapping": asset_mapping,
+        "bidding_strategies": {
+            _RECENT_PROFILE_STRATEGY_ID: _recent_profile_strategy_config(),
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=str(tmp_path / "controlled_state.json"),
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-recent-profile-1",
+        "total_quantity_mw": 0.00217,
+        "assets_to_activate": bid_record_assets,
+        "strategy": {
+            "id": _RECENT_PROFILE_STRATEGY_ID,
+            "name": "Recent Profile EV Strategy",
+            "description": "test recent profile",
+        },
+    }
+    manager.bid_handler = bid_handler
+    return manager
+
+
+def _continuous_controller(min_power_kw=0.0):
+    return fm.AssetController(
+        {
+            "ECM63.2": {
+                "type": "ev_charger",
+                "description": "continuous charger",
+                "capacity_kw": 11.0,
+                "min_power_kw": min_power_kw,
+                "modulation_type": "continuous",
+            }
+        },
+        _logger(),
+        rabbitmq_publisher=None,
+    )
+
+
+def test_strategy_10_continuous_asset_uses_bid_record_baseline_reference(tmp_path):
+    manager = _new_recent_profile_manager(
+        tmp_path,
+        {
+            "ECM63.2": {
+                "type": "ev_charger",
+                "description": "EV 2",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+            }
+        },
+        [
+            {
+                "asset_id": "ECM63.2",
+                "description": "EV 2",
+                "asset_type": "ev_charger",
+                "available_flexibility_kw": 2.17026,
+                "baseline_power_w": 4340.52,
+                "modulation_type": "continuous",
+            }
+        ],
+    )
+
+    summary = manager.run(
+        slot_override="2026-05-14T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.002,
+    )
+
+    result = summary["control_results"]["ECM63.2"]
+    assert summary["allocations"]["ECM63.2"] == pytest.approx(2.0)
+    assert result["target_power_kw"] == pytest.approx(2.34052)
+    assert result["computed_target_power_kw"] == pytest.approx(2.34052)
+    assert result["reference_power_kw"] == pytest.approx(4.34052)
+    assert result["reference_power_source"] == "bid_record baseline_power_w"
+    assert result["target_power_kw"] != pytest.approx(9.0)
+
+
+def test_continuous_fallback_preserves_nominal_power_behavior():
+    controller = _continuous_controller()
+
+    result = controller.curtail_asset("ECM63.2", curtailment_kw=2.0, dry_run=True)
+
+    assert result["target_power_kw"] == pytest.approx(9.0)
+    assert result["reference_power_kw"] == pytest.approx(11.0)
+    assert result["reference_power_source"] == "nominal_power fallback"
+
+
+def test_continuous_target_respects_lower_bound():
+    controller = _continuous_controller(min_power_kw=0.0)
+
+    result = controller.curtail_asset(
+        "ECM63.2",
+        curtailment_kw=2.0,
+        dry_run=True,
+        reference_power_kw=1.5,
+        reference_power_source="bid_record baseline_power_w",
+    )
+
+    assert result["target_power_kw"] == pytest.approx(0.0)
+
+
+def test_continuous_target_respects_upper_bound():
+    controller = _continuous_controller()
+
+    result = controller.curtail_asset(
+        "ECM63.2",
+        curtailment_kw=1.0,
+        dry_run=True,
+        reference_power_kw=14.0,
+        reference_power_source="bid_record baseline_power_w",
+    )
+
+    assert result["target_power_kw"] == pytest.approx(11.0)
+    assert result["uncapped_target_power_kw"] == pytest.approx(13.0)
+
+
+def test_discrete_asset_behavior_unchanged_by_reference_power():
+    controller = fm.AssetController(
+        {
+            "HP1": {
+                "type": "heat_pump",
+                "description": "test heat pump",
+                "capacity_kw": 10.0,
+                "modulation_type": "discrete",
+                "discrete_states_kw": [0.0, 10.0],
+            }
+        },
+        _logger(),
+        rabbitmq_publisher=None,
+    )
+
+    result = controller.curtail_asset(
+        "HP1",
+        curtailment_kw=1.0,
+        dry_run=True,
+        force_discrete_off=False,
+        reference_power_kw=4.0,
+        reference_power_source="bid_record baseline_power_w",
+    )
+
+    assert result["discrete_state"] == "ON"
+    assert result["target_power_kw"] == pytest.approx(10.0)
+    assert "reference_power_kw" not in result
+
+
+def test_continuous_target_calculation_logging_mentions_reference_and_target(caplog):
+    controller = _continuous_controller()
+
+    with caplog.at_level(logging.INFO, logger="test_flexi_manager_activation"):
+        controller.curtail_asset(
+            "ECM63.2",
+            curtailment_kw=2.0,
+            dry_run=True,
+            reference_power_kw=4.34052,
+            reference_power_source="bid_record baseline_power_w",
+        )
+
+    assert "Continuous target calculation for ECM63.2" in caplog.text
+    assert "source=bid_record baseline_power_w" in caplog.text
+    assert "reference_power=4.34052 kW" in caplog.text
+    assert "allocated_curtailment=2.00000 kW" in caplog.text
+    assert "computed_target_power=2.34052 kW" in caplog.text
