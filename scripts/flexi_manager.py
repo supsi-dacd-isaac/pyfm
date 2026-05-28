@@ -44,6 +44,83 @@ from classes.bidding_strategy import BiddingStrategy, StrategyManager
 import statistics
 
 
+BID_ASSET_REFERENCE_POWER_FIELDS = (
+    ("baseline_power_w", 0.001, "bid_record baseline_power_w"),
+    ("recent_profile_expected_power_w", 0.001, "bid_record recent_profile_expected_power_w"),
+    ("expected_power_w", 0.001, "bid_record expected_power_w"),
+    ("reference_power_w", 0.001, "bid_record reference_power_w"),
+    ("baseline_power_kw", 1.0, "bid_record baseline_power_kw"),
+    ("expected_power_kw", 1.0, "bid_record expected_power_kw"),
+    ("reference_power_kw", 1.0, "bid_record reference_power_kw"),
+    ("typical_load_kw", 1.0, "bid_record typical_load_kw"),
+)
+
+
+def _coerce_optional_float(value) -> Optional[float]:
+    """Return a float for numeric-like values, otherwise None."""
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_bid_asset_reference_power(asset: dict) -> Tuple[Optional[float], Optional[str]]:
+    """Extract a bid-time baseline/reference power in kW from a bid asset row."""
+    if not isinstance(asset, dict):
+        return None, None
+
+    for field_name, multiplier, source in BID_ASSET_REFERENCE_POWER_FIELDS:
+        raw_value = asset.get(field_name)
+        value = _coerce_optional_float(raw_value)
+        if value is None:
+            continue
+        if value != value or value < 0:
+            continue
+        return value * multiplier, source
+
+    return None, None
+
+
+def _build_bid_asset_reference_power_lookup(
+    bid_record: Optional[Dict],
+    logger: logging.Logger,
+) -> Dict[str, Dict]:
+    """Build asset_id -> reference power metadata from bid_record assets."""
+    lookup = {}
+    if not bid_record:
+        return lookup
+
+    for asset in bid_record.get("assets_to_activate", []):
+        asset_id = asset.get("asset_id") if isinstance(asset, dict) else None
+        if not asset_id:
+            continue
+
+        reference_power_kw, reference_power_source = _extract_bid_asset_reference_power(asset)
+        if reference_power_kw is None:
+            continue
+
+        lookup[asset_id] = {
+            "reference_power_kw": reference_power_kw,
+            "reference_power_source": reference_power_source,
+        }
+
+    if lookup:
+        logger.info(
+            "Loaded bid-record reference power for activation target calculation: %s",
+            {
+                asset_id: {
+                    "reference_power_kw": round(info["reference_power_kw"], 6),
+                    "source": info["reference_power_source"],
+                }
+                for asset_id, info in lookup.items()
+            },
+        )
+
+    return lookup
+
+
 ALLOWED_RABBIT_DESTINATION_SECTIONS = (
     "realAssetCommands",
     "simulatedAssetCommands",
@@ -675,6 +752,72 @@ class AssetController:
             state_name = "ON"
         
         return state_name, target_power
+
+    def _calculate_continuous_target_power(
+        self,
+        asset_id: str,
+        modulation_type: str,
+        nominal_power_kw: float,
+        min_power_kw: float,
+        allocated_curtailment_kw: float,
+        reference_power_kw: Optional[float] = None,
+        reference_power_source: Optional[str] = None,
+    ) -> Dict:
+        """Translate accepted continuous curtailment into an absolute target power."""
+        if reference_power_kw is None:
+            reference_power_kw = nominal_power_kw
+            reference_power_source = "nominal_power fallback"
+            formula_used = (
+                "target_power=max(min_power, nominal_power - curtailment), "
+                "capped_to_nominal"
+            )
+            self.logger.info(
+                "Continuous target calculation for %s: reference_power missing; "
+                "falling back to nominal_power",
+                asset_id,
+            )
+        else:
+            formula_used = (
+                "target_power=max(min_power, reference_power - curtailment), "
+                "capped_to_nominal"
+            )
+
+        uncapped_target_kw = max(
+            min_power_kw,
+            reference_power_kw - allocated_curtailment_kw,
+        )
+        computed_target_power_kw = min(uncapped_target_kw, nominal_power_kw)
+
+        self.logger.info(
+            "Continuous target calculation for %s:\n"
+            "  modulation_type=%s\n"
+            "  reference_power=%.5f kW (source=%s)\n"
+            "  allocated_curtailment=%.5f kW\n"
+            "  nominal_power=%.5f kW\n"
+            "  min_power=%.5f kW\n"
+            "  target_power=max(min_power, reference_power - curtailment)=%.5f kW\n"
+            "  computed_target_power=%.5f kW\n"
+            "  formula_used=%s",
+            asset_id,
+            modulation_type,
+            reference_power_kw,
+            reference_power_source,
+            allocated_curtailment_kw,
+            nominal_power_kw,
+            min_power_kw,
+            uncapped_target_kw,
+            computed_target_power_kw,
+            formula_used,
+        )
+
+        return {
+            "reference_power_kw": reference_power_kw,
+            "reference_power_source": reference_power_source,
+            "allocated_curtailment_kw": allocated_curtailment_kw,
+            "computed_target_power_kw": computed_target_power_kw,
+            "uncapped_target_power_kw": uncapped_target_kw,
+            "formula_used": formula_used,
+        }
     
     def curtail_asset(
         self, 
@@ -682,7 +825,9 @@ class AssetController:
         curtailment_kw: float, 
         duration_minutes: int = 15,
         dry_run: bool = True,
-        force_discrete_off: bool = False
+        force_discrete_off: bool = False,
+        reference_power_kw: Optional[float] = None,
+        reference_power_source: Optional[str] = None,
     ) -> Dict:
         """
         Send curtailment command to an asset.
@@ -700,7 +845,8 @@ class AssetController:
         asset_config = self.asset_mapping.get(asset_id, {})
         asset_type = asset_config.get("type", "unknown")
         description = asset_config.get("description", asset_id)
-        capacity_kw = asset_config.get("capacity_kw", 0)
+        capacity_kw = float(asset_config.get("capacity_kw", 0) or 0)
+        min_power_kw = float(asset_config.get("min_power_kw", 0.0) or 0.0)
         modulation_type = self._get_modulation_type(asset_config)
         
         # Calculate curtailment percentage
@@ -717,7 +863,16 @@ class AssetController:
             actual_curtailment_kw = capacity_kw - target_power_kw
         else:
             state_name = None
-            target_power_kw = max(0, capacity_kw - curtailment_kw)
+            target_calculation = self._calculate_continuous_target_power(
+                asset_id=asset_id,
+                modulation_type=modulation_type,
+                nominal_power_kw=capacity_kw,
+                min_power_kw=min_power_kw,
+                allocated_curtailment_kw=curtailment_kw,
+                reference_power_kw=reference_power_kw,
+                reference_power_source=reference_power_source,
+            )
+            target_power_kw = target_calculation["computed_target_power_kw"]
             actual_curtailment_kw = curtailment_kw
         
         result = {
@@ -737,6 +892,8 @@ class AssetController:
         
         if modulation_type == "discrete":
             result["discrete_state"] = state_name
+        else:
+            result.update(target_calculation)
         
         # Build command payload for RabbitMQ
         # Get site_id (pod) from asset config
@@ -759,6 +916,14 @@ class AssetController:
         
         if modulation_type == "discrete":
             command_payload["discrete_state"] = state_name
+        else:
+            command_payload.update({
+                "reference_power_kw": target_calculation["reference_power_kw"],
+                "reference_power_source": target_calculation["reference_power_source"],
+                "allocated_curtailment_kw": target_calculation["allocated_curtailment_kw"],
+                "computed_target_power_kw": target_calculation["computed_target_power_kw"],
+                "target_formula_used": target_calculation["formula_used"],
+            })
 
         if asset_type == "ev_charger":
             command_payload["power_kw"] = float(target_power_kw)
@@ -812,10 +977,19 @@ class AssetController:
                         asset_config,
                         curtailment_kw,
                         duration_minutes,
-                        force_discrete_off=force_discrete_off
+                        force_discrete_off=force_discrete_off,
+                        reference_power_kw=reference_power_kw,
+                        reference_power_source=reference_power_source,
                     )
                 elif asset_type == "ev_charger":
-                    self._control_ev_charger(asset_id, asset_config, curtailment_kw, duration_minutes)
+                    self._control_ev_charger(
+                        asset_id,
+                        asset_config,
+                        curtailment_kw,
+                        duration_minutes,
+                        reference_power_kw=reference_power_kw,
+                        reference_power_source=reference_power_source,
+                    )
                 else:
                     self.logger.warning("Unknown asset type: %s", asset_type)
                     result["status"] = "error"
@@ -848,7 +1022,9 @@ class AssetController:
         config: dict, 
         curtailment_kw: float,
         duration_minutes: int,
-        force_discrete_off: bool = False
+        force_discrete_off: bool = False,
+        reference_power_kw: Optional[float] = None,
+        reference_power_source: Optional[str] = None,
     ):
         """
         Send control command to a heat pump.
@@ -864,7 +1040,7 @@ class AssetController:
         control_cfg = config.get("control", {})
         control_type = control_cfg.get("type", "simulation")
         modulation_type = self._get_modulation_type(config)
-        capacity_kw = config.get("capacity_kw", 0)
+        capacity_kw = float(config.get("capacity_kw", 0) or 0)
         
         # Determine command based on modulation type
         if modulation_type == "discrete":
@@ -884,7 +1060,17 @@ class AssetController:
             log_msg = f"HP {asset_id}: set state to {state_name} (target: {target_power_kw:.2f} kW) for {duration_minutes} min"
         else:
             # Continuous modulation (rare for HPs, but supported)
-            target_power_kw = max(0, capacity_kw - curtailment_kw)
+            min_power_kw = float(config.get("min_power_kw", 0.0) or 0.0)
+            target_calculation = self._calculate_continuous_target_power(
+                asset_id=asset_id,
+                modulation_type=modulation_type,
+                nominal_power_kw=capacity_kw,
+                min_power_kw=min_power_kw,
+                allocated_curtailment_kw=curtailment_kw,
+                reference_power_kw=reference_power_kw,
+                reference_power_source=reference_power_source,
+            )
+            target_power_kw = target_calculation["computed_target_power_kw"]
             command_payload = {
                 "command": "set_power",
                 "target_power_kw": target_power_kw,
@@ -892,6 +1078,13 @@ class AssetController:
                 "duration_minutes": duration_minutes,
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
+            command_payload.update({
+                "reference_power_kw": target_calculation["reference_power_kw"],
+                "reference_power_source": target_calculation["reference_power_source"],
+                "allocated_curtailment_kw": target_calculation["allocated_curtailment_kw"],
+                "computed_target_power_kw": target_calculation["computed_target_power_kw"],
+                "target_formula_used": target_calculation["formula_used"],
+            })
             log_msg = f"HP {asset_id}: set power to {target_power_kw:.2f} kW (reduce by {curtailment_kw:.2f} kW) for {duration_minutes} min"
         
         if control_type == "mqtt":
@@ -916,7 +1109,9 @@ class AssetController:
         asset_id: str, 
         config: dict, 
         curtailment_kw: float,
-        duration_minutes: int
+        duration_minutes: int,
+        reference_power_kw: Optional[float] = None,
+        reference_power_source: Optional[str] = None,
     ):
         """
         Send control command to an EV charger.
@@ -931,13 +1126,20 @@ class AssetController:
         """
         control_cfg = config.get("control", {})
         control_type = control_cfg.get("type", "simulation")
-        capacity_kw = config.get("capacity_kw", 11.0)
-        min_power_kw = config.get("min_power_kw", 0.0)
+        capacity_kw = float(config.get("capacity_kw", 11.0) or 0)
+        min_power_kw = float(config.get("min_power_kw", 0.0) or 0.0)
         modulation_type = self._get_modulation_type(config)
         
-        # Calculate new charging limit (continuous modulation)
-        # Respect minimum power setting (some chargers have minimum charging power)
-        target_power_kw = max(min_power_kw, capacity_kw - curtailment_kw)
+        target_calculation = self._calculate_continuous_target_power(
+            asset_id=asset_id,
+            modulation_type=modulation_type,
+            nominal_power_kw=capacity_kw,
+            min_power_kw=min_power_kw,
+            allocated_curtailment_kw=curtailment_kw,
+            reference_power_kw=reference_power_kw,
+            reference_power_source=reference_power_source,
+        )
+        target_power_kw = target_calculation["computed_target_power_kw"]
         
         # Build command payload
         command_payload = {
@@ -949,6 +1151,13 @@ class AssetController:
             "modulation_type": modulation_type,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
+        command_payload.update({
+            "reference_power_kw": target_calculation["reference_power_kw"],
+            "reference_power_source": target_calculation["reference_power_source"],
+            "allocated_curtailment_kw": target_calculation["allocated_curtailment_kw"],
+            "computed_target_power_kw": target_calculation["computed_target_power_kw"],
+            "target_formula_used": target_calculation["formula_used"],
+        })
         
         log_msg = f"EV {asset_id}: set charging limit to {target_power_kw:.2f} kW (reduce by {curtailment_kw:.2f} kW) for {duration_minutes} min"
         
@@ -3196,6 +3405,7 @@ class FlexibilityManager:
         flexibility_method = None
         is_persistence_strategy = False
         planned_bid_asset_flex_kw = {}
+        bid_asset_reference_power_by_id = {}
         
         # Step 0: Check for bid record from trader_fsp.py
         self.logger.info("Step 0: Checking for bid record...")
@@ -3203,6 +3413,12 @@ class FlexibilityManager:
         
         if bid_record:
             summary["bid_record"] = bid_record
+            bid_asset_reference_power_by_id = _build_bid_asset_reference_power_lookup(
+                bid_record,
+                self.logger,
+            )
+            if bid_asset_reference_power_by_id:
+                summary["activation_reference_power_by_asset"] = bid_asset_reference_power_by_id
             strategy_info = self.bid_handler.get_strategy_info(bid_record)
             allowed_assets = self.bid_handler.get_allowed_assets(bid_record)
             bid_quantity_mw = self.bid_handler.get_total_quantity(bid_record)
@@ -3691,11 +3907,23 @@ class FlexibilityManager:
                     asset_id, asset_desc, curtailment_kw, state
                 )
             else:
-                capacity = asset_config.get("capacity_kw", 0)
-                target_power = max(0, capacity - curtailment_kw)
+                capacity = float(asset_config.get("capacity_kw", 0) or 0)
+                min_power = float(asset_config.get("min_power_kw", 0.0) or 0.0)
+                reference_info = bid_asset_reference_power_by_id.get(asset_id, {})
+                reference_power = reference_info.get("reference_power_kw", capacity)
+                reference_source = reference_info.get(
+                    "reference_power_source",
+                    "nominal_power fallback",
+                )
+                target_power = min(
+                    max(min_power, reference_power - curtailment_kw),
+                    capacity,
+                )
                 self.logger.info(
-                    "  %s (%s): %.2f kW [continuous → limit %.2f kW]", 
-                    asset_id, asset_desc, curtailment_kw, target_power
+                    "  %s (%s): %.2f kW [continuous → limit %.2f kW; "
+                    "reference %.2f kW source=%s]",
+                    asset_id, asset_desc, curtailment_kw, target_power,
+                    reference_power, reference_source,
                 )
             
             total_allocated += curtailment_kw
@@ -3729,7 +3957,15 @@ class FlexibilityManager:
                 curtailment_kw,
                 duration_minutes=15,
                 dry_run=dry_run,
-                force_discrete_off=force_discrete_off
+                force_discrete_off=force_discrete_off,
+                reference_power_kw=bid_asset_reference_power_by_id.get(
+                    asset_id,
+                    {},
+                ).get("reference_power_kw"),
+                reference_power_source=bid_asset_reference_power_by_id.get(
+                    asset_id,
+                    {},
+                ).get("reference_power_source"),
             )
             summary["control_results"][asset_id] = result
 
@@ -3792,7 +4028,11 @@ class FlexibilityManager:
                     "description": asset_info.get("description", asset_id),
                     "asset_type": asset_info.get("type"),
                     "percentage": control_result.get("percentage"),
-                    "status": control_result.get("status", "unknown")
+                    "status": control_result.get("status", "unknown"),
+                    "reference_power_kw": control_result.get("reference_power_kw"),
+                    "reference_power_source": control_result.get("reference_power_source"),
+                    "allocated_curtailment_kw": control_result.get("allocated_curtailment_kw"),
+                    "computed_target_power_kw": control_result.get("computed_target_power_kw"),
                 })
             
             try:
