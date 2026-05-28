@@ -101,6 +101,106 @@ def generate_replay_timestamps(
     return timestamps
 
 
+def _ordered_intersection(primary_assets: List[str], candidate_assets: List[str]) -> List[str]:
+    """Return assets that are in both lists, preserving the FSP-configured order."""
+    candidate_set = set(candidate_assets)
+    return [asset_id for asset_id in primary_assets if asset_id in candidate_set]
+
+
+def _strategy_candidate_assets(strategy: BiddingStrategy, main_cfg: dict) -> List[str]:
+    """
+    Resolve the strategy-side replay candidates without expanding beyond strategy scope.
+
+    If assets_filter is present, use it exactly. Otherwise, derive candidates from
+    the strategy asset_types against asset_mapping, matching BiddingStrategy behavior.
+    """
+    asset_mapping = main_cfg.get("asset_mapping", {})
+    assets_filter = getattr(strategy, "assets_filter", None)
+    if assets_filter:
+        return list(assets_filter)
+
+    asset_types = set(getattr(strategy, "asset_types", []) or [])
+    return [
+        asset_id
+        for asset_id, mapping in asset_mapping.items()
+        if isinstance(mapping, dict) and mapping.get("type", "") in asset_types
+    ]
+
+
+def resolve_replay_asset_scope(
+    fsp_identifier: str,
+    fsp_config: dict,
+    strategy_id: str,
+    strategy: BiddingStrategy,
+    main_cfg: dict,
+    logger: logging.Logger,
+) -> Dict[str, List[str]]:
+    """
+    Resolve the replay-only asset universe as FSP assets intersected with strategy assets.
+
+    This intentionally does not modify BiddingStrategy or live trading behavior.
+    """
+    asset_mapping = main_cfg.get("asset_mapping", {})
+    configured_fsp_assets = fsp_config.get("assets")
+
+    if configured_fsp_assets is None:
+        fsp_assets = list(getattr(strategy, "allowed_assets", []) or [])
+        logger.warning(
+            "FSP %s has no configured assets; replay falls back to strategy assets for backward compatibility: %s",
+            fsp_identifier,
+            fsp_assets,
+        )
+    else:
+        fsp_assets = list(configured_fsp_assets)
+
+    strategy_assets = _strategy_candidate_assets(strategy, main_cfg)
+
+    missing_fsp_assets = sorted(asset_id for asset_id in fsp_assets if asset_id not in asset_mapping)
+    if missing_fsp_assets:
+        message = (
+            f"FSP '{fsp_identifier}' references assets missing from asset_mapping: "
+            f"{missing_fsp_assets}"
+        )
+        logger.error(message)
+        raise ValueError(message)
+
+    missing_strategy_filter_assets: List[str] = []
+    if getattr(strategy, "assets_filter", None):
+        missing_strategy_filter_assets = sorted(
+            asset_id for asset_id in strategy_assets if asset_id not in asset_mapping
+        )
+        if missing_strategy_filter_assets:
+            message = (
+                f"Strategy '{strategy_id}' assets_filter references assets missing from "
+                f"asset_mapping: {missing_strategy_filter_assets}"
+            )
+            logger.error(message)
+            raise ValueError(message)
+
+    replay_assets = _ordered_intersection(fsp_assets, strategy_assets)
+    excluded_assets = sorted((set(fsp_assets) | set(strategy_assets)) - set(replay_assets))
+
+    logger.info("Replay asset scope for FSP=%s strategy=%s", fsp_identifier, strategy_id)
+    logger.info("  FSP assets:                %s", fsp_assets)
+    logger.info("  Strategy candidate assets: %s", strategy_assets)
+    logger.info("  Final replay assets:       %s", replay_assets)
+    logger.info("  Excluded assets:           %s", excluded_assets)
+
+    if not replay_assets:
+        logger.warning(
+            "No replay assets remain after intersecting FSP %s assets with strategy %s candidates",
+            fsp_identifier,
+            strategy_id,
+        )
+
+    return {
+        "fsp_assets": fsp_assets,
+        "strategy_assets": strategy_assets,
+        "replay_assets_used": replay_assets,
+        "excluded_assets": excluded_assets,
+    }
+
+
 def replay_single_timestamp(
     replay_time_utc: datetime,
     strategy: BiddingStrategy,
@@ -111,6 +211,7 @@ def replay_single_timestamp(
     orders_time_shift: int,
     granularity: int,
     logger: logging.Logger,
+    replay_asset_ids: Optional[List[str]] = None,
 ) -> List[Dict]:
     """
     Replay a single bidding decision at a given historical timestamp.
@@ -152,12 +253,38 @@ def replay_single_timestamp(
             "skip_reason": "no_bid_slot",
         }]
 
+    if replay_asset_ids is not None and not replay_asset_ids:
+        logger.warning(
+            "No replay-scoped assets available for strategy %s at %s; skipping asset queries",
+            strategy_id,
+            replay_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        return [{
+            "replay_timestamp_utc": replay_time_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "delivery_slot_utc": slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "strategy": strategy_id,
+            "asset_id": "_portfolio",
+            "modulation_type": "portfolio",
+            "current_power_w": 0.0,
+            "expected_power_w": 0.0,
+            "available_flexibility_w": 0.0,
+            "bid_quantity_w": 0.0,
+            "active_threshold_w": 0.0,
+            "is_currently_active": False,
+            "estimation_method": flex_forecaster.method,
+            "skip_reason": "no_replay_assets",
+        }]
+
     strategy_flexibility_method = resolve_strategy_flexibility_method(strategy, logger)
     strategy_target_kw = bid_params["flexibility_mw"] * 1000
     if bid_params.get("ev_flexibility_mw", 0) > 0:
         strategy_target_kw += bid_params["ev_flexibility_mw"] * 1000
 
-    portfolio_asset_ids = list(flex_forecaster.asset_capacities.keys())
+    portfolio_asset_ids = (
+        list(replay_asset_ids)
+        if replay_asset_ids is not None
+        else list(flex_forecaster.asset_capacities.keys())
+    )
     allowed_assets = strategy.allowed_assets if hasattr(strategy, "allowed_assets") else None
 
     gated_methods = {"persistence", "recent_profile"}
@@ -842,12 +969,26 @@ def main():
     logger.info("=" * 80)
 
     all_asset_results: List[Dict] = []
+    replay_scope_by_strategy: Dict[str, Dict[str, List[str]]] = {}
     total_steps = len(replay_timestamps) * len(strategies_to_replay)
     step = 0
 
     for strategy_id, strategy in strategies_to_replay:
         strategy_method = resolve_strategy_flexibility_method(strategy, logger)
         logger.info("Replaying strategy %s (method=%s)...", strategy_id, strategy_method)
+        try:
+            replay_scope = resolve_replay_asset_scope(
+                fsp_identifier=fsp_identifier,
+                fsp_config=fsp_config,
+                strategy_id=strategy_id,
+                strategy=strategy,
+                main_cfg=cfg,
+                logger=logger,
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}")
+            sys.exit(1)
+        replay_scope_by_strategy[strategy_id] = replay_scope
 
         flex_forecaster = FlexibilityForecaster(
             cfg,
@@ -878,6 +1019,7 @@ def main():
                     orders_time_shift=orders_time_shift,
                     granularity=granularity,
                     logger=logger,
+                    replay_asset_ids=replay_scope["replay_assets_used"],
                 )
                 all_asset_results.extend(results)
             except Exception as e:
@@ -964,6 +1106,23 @@ def main():
         "timestamps_replayed": len(replay_timestamps),
         "total_asset_rows": len(all_asset_results),
         "total_portfolio_rows": len(portfolio_summary),
+        "fsp_assets": (
+            next(iter(replay_scope_by_strategy.values()))["fsp_assets"]
+            if replay_scope_by_strategy
+            else []
+        ),
+        "strategy_assets": {
+            strategy_id: scope["strategy_assets"]
+            for strategy_id, scope in replay_scope_by_strategy.items()
+        },
+        "replay_assets_used": {
+            strategy_id: scope["replay_assets_used"]
+            for strategy_id, scope in replay_scope_by_strategy.items()
+        },
+        "excluded_assets": {
+            strategy_id: scope["excluded_assets"]
+            for strategy_id, scope in replay_scope_by_strategy.items()
+        },
         "plots_enabled": bool(args.plots),
         "plot_files": [os.path.basename(path) for path in plot_paths],
         "generated_at_utc": datetime.utcnow().isoformat() + "Z",
