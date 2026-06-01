@@ -21,6 +21,7 @@ import sys
 import json
 import argparse
 import logging
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -45,13 +46,13 @@ import statistics
 
 
 BID_ASSET_REFERENCE_POWER_FIELDS = (
-    ("baseline_power_w", 0.001, "bid_record baseline_power_w"),
+    ("reference_power_kw", 1.0, "bid_record reference_power_kw"),
+    ("reference_power_w", 0.001, "bid_record reference_power_w"),
     ("recent_profile_expected_power_w", 0.001, "bid_record recent_profile_expected_power_w"),
     ("expected_power_w", 0.001, "bid_record expected_power_w"),
-    ("reference_power_w", 0.001, "bid_record reference_power_w"),
-    ("baseline_power_kw", 1.0, "bid_record baseline_power_kw"),
     ("expected_power_kw", 1.0, "bid_record expected_power_kw"),
-    ("reference_power_kw", 1.0, "bid_record reference_power_kw"),
+    ("baseline_power_w", 0.001, "bid_record baseline_power_w"),
+    ("baseline_power_kw", 1.0, "bid_record baseline_power_kw"),
     ("typical_load_kw", 1.0, "bid_record typical_load_kw"),
 )
 
@@ -76,8 +77,10 @@ def _extract_bid_asset_reference_power(asset: dict) -> Tuple[Optional[float], Op
         value = _coerce_optional_float(raw_value)
         if value is None:
             continue
-        if value != value or value < 0:
+        if not math.isfinite(value) or value <= 0:
             continue
+        if field_name.startswith("reference_power"):
+            source = asset.get("reference_power_source") or source
         return value * multiplier, source
 
     return None, None
@@ -764,23 +767,38 @@ class AssetController:
         reference_power_source: Optional[str] = None,
     ) -> Dict:
         """Translate accepted continuous curtailment into an absolute target power."""
-        if reference_power_kw is None:
-            reference_power_kw = nominal_power_kw
-            reference_power_source = "nominal_power fallback"
-            formula_used = (
-                "target_power=max(min_power, nominal_power - curtailment), "
-                "capped_to_nominal"
-            )
-            self.logger.info(
-                "Continuous target calculation for %s: reference_power missing; "
-                "falling back to nominal_power",
+        reference_power_kw = _coerce_optional_float(reference_power_kw)
+        if (
+            reference_power_kw is None
+            or not math.isfinite(reference_power_kw)
+            or reference_power_kw <= 0
+        ):
+            self.logger.error(
+                "Continuous target calculation skipped for %s:\n"
+                "  allocated_curtailment=%.5f kW\n"
+                "  reference_power=%s\n"
+                "  nominal_power=%.5f kW\n"
+                "  reason=missing reference power; nominal fallback disabled",
                 asset_id,
+                allocated_curtailment_kw,
+                reference_power_kw,
+                nominal_power_kw,
             )
-        else:
-            formula_used = (
-                "target_power=max(min_power, reference_power - curtailment), "
-                "capped_to_nominal"
-            )
+            return {
+                "reference_power_kw": reference_power_kw,
+                "reference_power_source": reference_power_source,
+                "allocated_curtailment_kw": allocated_curtailment_kw,
+                "computed_target_power_kw": None,
+                "uncapped_target_power_kw": None,
+                "formula_used": None,
+                "skip_activation": True,
+                "skip_reason": "missing reference power; nominal fallback disabled",
+            }
+
+        formula_used = (
+            "target_power=max(min_power, reference_power - curtailment), "
+            "capped_to_nominal"
+        )
 
         uncapped_target_kw = max(
             min_power_kw,
@@ -791,12 +809,13 @@ class AssetController:
         self.logger.info(
             "Continuous target calculation for %s:\n"
             "  modulation_type=%s\n"
-            "  reference_power=%.5f kW (source=%s)\n"
+            "  reference_power=%.5f kW\n"
+            "  reference_power_source=%s\n"
             "  allocated_curtailment=%.5f kW\n"
             "  nominal_power=%.5f kW\n"
             "  min_power=%.5f kW\n"
-            "  target_power=max(min_power, reference_power - curtailment)=%.5f kW\n"
-            "  computed_target_power=%.5f kW\n"
+            "  formula=max(min_power, reference_power - curtailment)\n"
+            "  target_power=%.5f kW\n"
             "  formula_used=%s",
             asset_id,
             modulation_type,
@@ -805,7 +824,6 @@ class AssetController:
             allocated_curtailment_kw,
             nominal_power_kw,
             min_power_kw,
-            uncapped_target_kw,
             computed_target_power_kw,
             formula_used,
         )
@@ -817,6 +835,8 @@ class AssetController:
             "computed_target_power_kw": computed_target_power_kw,
             "uncapped_target_power_kw": uncapped_target_kw,
             "formula_used": formula_used,
+            "skip_activation": False,
+            "skip_reason": None,
         }
     
     def curtail_asset(
@@ -872,6 +892,33 @@ class AssetController:
                 reference_power_kw=reference_power_kw,
                 reference_power_source=reference_power_source,
             )
+            if target_calculation["skip_activation"]:
+                result = {
+                    "asset_id": asset_id,
+                    "description": description,
+                    "asset_type": asset_type,
+                    "modulation_type": modulation_type,
+                    "requested_curtailment_kw": curtailment_kw,
+                    "actual_curtailment_kw": 0.0,
+                    "target_power_kw": None,
+                    "curtailment_pct": curtailment_pct,
+                    "duration_minutes": duration_minutes,
+                    "dry_run": dry_run,
+                    "status": "skipped",
+                    "message": target_calculation["skip_reason"],
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    **target_calculation,
+                }
+                self.logger.error(
+                    "Continuous activation skipped for %s:\n"
+                    "  allocated_curtailment=%.5f kW\n"
+                    "  reference_power missing/invalid\n"
+                    "  nominal fallback disabled",
+                    asset_id,
+                    curtailment_kw,
+                )
+                self.control_results[asset_id] = result
+                return result
             target_power_kw = target_calculation["computed_target_power_kw"]
             actual_curtailment_kw = curtailment_kw
         
@@ -1070,6 +1117,8 @@ class AssetController:
                 reference_power_kw=reference_power_kw,
                 reference_power_source=reference_power_source,
             )
+            if target_calculation["skip_activation"]:
+                raise ValueError(target_calculation["skip_reason"])
             target_power_kw = target_calculation["computed_target_power_kw"]
             command_payload = {
                 "command": "set_power",
@@ -1139,6 +1188,8 @@ class AssetController:
             reference_power_kw=reference_power_kw,
             reference_power_source=reference_power_source,
         )
+        if target_calculation["skip_activation"]:
+            raise ValueError(target_calculation["skip_reason"])
         target_power_kw = target_calculation["computed_target_power_kw"]
         
         # Build command payload
@@ -3910,21 +3961,25 @@ class FlexibilityManager:
                 capacity = float(asset_config.get("capacity_kw", 0) or 0)
                 min_power = float(asset_config.get("min_power_kw", 0.0) or 0.0)
                 reference_info = bid_asset_reference_power_by_id.get(asset_id, {})
-                reference_power = reference_info.get("reference_power_kw", capacity)
-                reference_source = reference_info.get(
-                    "reference_power_source",
-                    "nominal_power fallback",
-                )
-                target_power = min(
-                    max(min_power, reference_power - curtailment_kw),
-                    capacity,
-                )
-                self.logger.info(
-                    "  %s (%s): %.2f kW [continuous → limit %.2f kW; "
-                    "reference %.2f kW source=%s]",
-                    asset_id, asset_desc, curtailment_kw, target_power,
-                    reference_power, reference_source,
-                )
+                reference_power = reference_info.get("reference_power_kw")
+                reference_source = reference_info.get("reference_power_source")
+                if reference_power is None:
+                    self.logger.warning(
+                        "  %s (%s): %.2f kW [continuous -> activation will be "
+                        "skipped; reference_power missing; nominal fallback disabled]",
+                        asset_id, asset_desc, curtailment_kw,
+                    )
+                else:
+                    target_power = min(
+                        max(min_power, reference_power - curtailment_kw),
+                        capacity,
+                    )
+                    self.logger.info(
+                        "  %s (%s): %.2f kW [continuous -> limit %.2f kW; "
+                        "reference %.2f kW source=%s]",
+                        asset_id, asset_desc, curtailment_kw, target_power,
+                        reference_power, reference_source,
+                    )
             
             total_allocated += curtailment_kw
         
@@ -3943,7 +3998,8 @@ class FlexibilityManager:
         self.logger.info("-" * 70)
         self.logger.info("Step 3: Sending control commands...")
 
-        current_curtailed = set(allocations.keys())
+        current_curtailed = set()
+        deliverable_allocated = 0.0
 
         for asset_id, curtailment_kw in allocations.items():
             mod_type = self._get_activation_modulation_type(asset_id)
@@ -3968,6 +4024,19 @@ class FlexibilityManager:
                 ).get("reference_power_source"),
             )
             summary["control_results"][asset_id] = result
+            if result.get("status") in ["success", "simulated", "queued"]:
+                current_curtailed.add(asset_id)
+                deliverable_allocated += curtailment_kw
+
+        skipped_assets = [
+            asset_id for asset_id, result in summary["control_results"].items()
+            if result.get("status") == "skipped"
+        ]
+        if skipped_assets:
+            summary["skipped_assets"] = skipped_assets
+            summary["skipped_flexibility_kw"] = sum(
+                allocations.get(asset_id, 0.0) for asset_id in skipped_assets
+            )
 
         # Queue restore commands for previously controlled assets that are
         # no longer selected for curtailment in the current slot.
@@ -4064,10 +4133,27 @@ class FlexibilityManager:
             self.logger.info("Commands queued: %d (actuation delegated to forwarder)", successful)
         else:
             self.logger.info("Assets controlled: %d successful, %d failed", successful, failed)
-        self.logger.info("Total flexibility delivered: %.2f kW (%.3f MW)", 
-                        total_allocated, total_allocated / 1000)
+        self.logger.info(
+            "Total flexibility deliverable: %.2f kW (%.3f MW)",
+            deliverable_allocated,
+            deliverable_allocated / 1000,
+        )
+        if skipped_assets:
+            self.logger.error(
+                "Continuous activation skipped for %d asset(s); skipped flexibility %.2f kW",
+                len(skipped_assets),
+                summary.get("skipped_flexibility_kw", 0.0),
+            )
         
-        if failed > 0:
+        summary["total_flexibility_deliverable_kw"] = deliverable_allocated
+        summary["total_flexibility_deliverable_mw"] = deliverable_allocated / 1000
+
+        if successful == 0 and summary["control_results"]:
+            summary["status"] = "activation_failed"
+            summary["message"] = (
+                "No deliverable flexibility after continuous reference-power validation"
+            )
+        elif failed > 0:
             summary["status"] = "partial_success"
         elif self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
             summary["status"] = "queued"  # All commands queued for forwarder

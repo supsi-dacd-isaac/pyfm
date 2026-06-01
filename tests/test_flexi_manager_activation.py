@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 import sys
 import types
@@ -355,7 +356,8 @@ def test_market_result_source_priority_is_offline_and_respects_fallback_flag(tmp
     assert fallback.market_handler.accepted_trade_calls == 1
     assert fallback.bid_handler.ledger_calls == 1
     assert fallback_summary["market_result_source"] == "market_ledger_fallback"
-    assert fallback_summary["status"] == "success"
+    assert fallback_summary["status"] == "activation_failed"
+    assert fallback_summary["total_flexibility_deliverable_kw"] == pytest.approx(0.0)
 
 
 def test_nodes_interface_does_not_log_raw_access_token_value():
@@ -654,7 +656,7 @@ def _continuous_controller(min_power_kw=0.0):
     )
 
 
-def test_strategy_10_continuous_asset_uses_bid_record_baseline_reference(tmp_path):
+def test_strategy_10_continuous_asset_uses_bid_record_reference_power(tmp_path):
     manager = _new_recent_profile_manager(
         tmp_path,
         {
@@ -671,8 +673,9 @@ def test_strategy_10_continuous_asset_uses_bid_record_baseline_reference(tmp_pat
                 "asset_id": "ECM63.2",
                 "description": "EV 2",
                 "asset_type": "ev_charger",
-                "available_flexibility_kw": 2.17026,
-                "baseline_power_w": 4340.52,
+                "available_flexibility_kw": 2.99,
+                "reference_power_kw": 5.98,
+                "reference_power_source": "recent_profile_baseline",
                 "modulation_type": "continuous",
             }
         ],
@@ -681,26 +684,90 @@ def test_strategy_10_continuous_asset_uses_bid_record_baseline_reference(tmp_pat
     summary = manager.run(
         slot_override="2026-05-14T12:00:00Z",
         dry_run=True,
-        simulate_sold_mw=0.002,
+        simulate_sold_mw=0.00299,
     )
 
     result = summary["control_results"]["ECM63.2"]
-    assert summary["allocations"]["ECM63.2"] == pytest.approx(2.0)
-    assert result["target_power_kw"] == pytest.approx(2.34052)
-    assert result["computed_target_power_kw"] == pytest.approx(2.34052)
-    assert result["reference_power_kw"] == pytest.approx(4.34052)
-    assert result["reference_power_source"] == "bid_record baseline_power_w"
-    assert result["target_power_kw"] != pytest.approx(9.0)
+    assert summary["status"] == "success"
+    assert summary["allocations"]["ECM63.2"] == pytest.approx(2.99)
+    assert result["target_power_kw"] == pytest.approx(2.99)
+    assert result["computed_target_power_kw"] == pytest.approx(2.99)
+    assert result["reference_power_kw"] == pytest.approx(5.98)
+    assert result["reference_power_source"] == "recent_profile_baseline"
+    assert result["target_power_kw"] != pytest.approx(8.01)
 
 
-def test_continuous_fallback_preserves_nominal_power_behavior():
+def test_continuous_missing_reference_skips_nominal_power_fallback(caplog):
     controller = _continuous_controller()
 
-    result = controller.curtail_asset("ECM63.2", curtailment_kw=2.0, dry_run=True)
+    with caplog.at_level(logging.ERROR, logger="test_flexi_manager_activation"):
+        result = controller.curtail_asset("ECM63.2", curtailment_kw=2.99, dry_run=True)
 
-    assert result["target_power_kw"] == pytest.approx(9.0)
-    assert result["reference_power_kw"] == pytest.approx(11.0)
-    assert result["reference_power_source"] == "nominal_power fallback"
+    assert result["status"] == "skipped"
+    assert result["target_power_kw"] is None
+    assert result["computed_target_power_kw"] is None
+    assert result["actual_curtailment_kw"] == pytest.approx(0.0)
+    assert controller._pending_commands == []
+    assert result["target_power_kw"] != pytest.approx(8.01)
+    assert "nominal fallback disabled" in caplog.text
+
+
+def test_strategy_10_missing_reference_fails_closed_without_command(tmp_path, caplog):
+    manager = _new_recent_profile_manager(
+        tmp_path,
+        {
+            "ECM63.2": {
+                "type": "ev_charger",
+                "description": "EV 2",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+            }
+        },
+        [
+            {
+                "asset_id": "ECM63.2",
+                "description": "EV 2",
+                "asset_type": "ev_charger",
+                "available_flexibility_kw": 2.99,
+                "modulation_type": "continuous",
+            }
+        ],
+    )
+
+    with caplog.at_level(logging.ERROR, logger="test_flexi_manager_activation"):
+        summary = manager.run(
+            slot_override="2026-05-14T12:00:00Z",
+            dry_run=True,
+            simulate_sold_mw=0.00299,
+        )
+
+    result = summary["control_results"]["ECM63.2"]
+    assert summary["status"] == "activation_failed"
+    assert summary["total_flexibility_deliverable_kw"] == pytest.approx(0.0)
+    assert result["status"] == "skipped"
+    assert result["target_power_kw"] is None
+    assert result["target_power_kw"] != pytest.approx(8.01)
+    assert manager.controller._pending_commands == []
+    assert "nominal fallback disabled" in caplog.text
+
+
+@pytest.mark.parametrize("reference_power_kw", [None, math.nan, 0.0, -1.0])
+def test_continuous_invalid_reference_power_skips_activation(reference_power_kw):
+    controller = _continuous_controller()
+
+    result = controller.curtail_asset(
+        "ECM63.2",
+        curtailment_kw=2.99,
+        dry_run=True,
+        reference_power_kw=reference_power_kw,
+        reference_power_source="recent_profile_baseline",
+    )
+
+    assert result["status"] == "skipped"
+    assert result["target_power_kw"] is None
+    assert result["computed_target_power_kw"] is None
+    assert controller._pending_commands == []
 
 
 def test_continuous_target_respects_lower_bound():
@@ -710,8 +777,8 @@ def test_continuous_target_respects_lower_bound():
         "ECM63.2",
         curtailment_kw=2.0,
         dry_run=True,
-        reference_power_kw=1.5,
-        reference_power_source="bid_record baseline_power_w",
+        reference_power_kw=1.0,
+        reference_power_source="recent_profile_baseline",
     )
 
     assert result["target_power_kw"] == pytest.approx(0.0)
@@ -725,7 +792,7 @@ def test_continuous_target_respects_upper_bound():
         curtailment_kw=1.0,
         dry_run=True,
         reference_power_kw=14.0,
-        reference_power_source="bid_record baseline_power_w",
+        reference_power_source="recent_profile_baseline",
     )
 
     assert result["target_power_kw"] == pytest.approx(11.0)
@@ -753,7 +820,7 @@ def test_discrete_asset_behavior_unchanged_by_reference_power():
         dry_run=True,
         force_discrete_off=False,
         reference_power_kw=4.0,
-        reference_power_source="bid_record baseline_power_w",
+        reference_power_source="recent_profile_baseline",
     )
 
     assert result["discrete_state"] == "ON"
@@ -770,11 +837,11 @@ def test_continuous_target_calculation_logging_mentions_reference_and_target(cap
             curtailment_kw=2.0,
             dry_run=True,
             reference_power_kw=4.34052,
-            reference_power_source="bid_record baseline_power_w",
+            reference_power_source="recent_profile_baseline",
         )
 
     assert "Continuous target calculation for ECM63.2" in caplog.text
-    assert "source=bid_record baseline_power_w" in caplog.text
+    assert "reference_power_source=recent_profile_baseline" in caplog.text
     assert "reference_power=4.34052 kW" in caplog.text
     assert "allocated_curtailment=2.00000 kW" in caplog.text
-    assert "computed_target_power=2.34052 kW" in caplog.text
+    assert "target_power=2.34052 kW" in caplog.text
