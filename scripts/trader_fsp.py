@@ -196,6 +196,33 @@ def get_strategy_flexibility_discrete(
     return recommended_mw, achievable
 
 
+def _recent_profile_reference_power_fields(asset_info):
+    """
+    Extract the strategy_10 reference power already used to derive flexibility.
+
+    Recent-profile bidding stores the quantile-derived expected power in the
+    persistence-shaped baseline fields so downstream consumers can share the
+    same bid-record contract.
+    """
+    if asset_info.get("estimation_method") != "recent_profile":
+        return {
+            "reference_power_kw": None,
+            "reference_power_source": None,
+        }
+
+    baseline_power_w = asset_info.get("baseline_power_w")
+    if baseline_power_w is None:
+        return {
+            "reference_power_kw": None,
+            "reference_power_source": None,
+        }
+
+    return {
+        "reference_power_kw": float(baseline_power_w) / 1000,
+        "reference_power_source": "recent_profile_baseline",
+    }
+
+
 def build_persistence_assets_to_activate(portfolio_strategy_contexts):
     """
     Build bid_record_assets rows from the selected persistence allocation.
@@ -223,6 +250,7 @@ def build_persistence_assets_to_activate(portfolio_strategy_contexts):
                 "asset_type": info.get("asset_type", "unknown"),
                 "available_flexibility_kw": float(power_kw),
                 "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+                **_recent_profile_reference_power_fields(info),
             })
 
         for asset_id, details in allocation.get("continuous", {}).items():
@@ -237,6 +265,7 @@ def build_persistence_assets_to_activate(portfolio_strategy_contexts):
                 "asset_type": info.get("asset_type", "unknown"),
                 "available_flexibility_kw": float(power_kw),
                 "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
+                **_recent_profile_reference_power_fields(info),
             })
 
     return assets_to_activate

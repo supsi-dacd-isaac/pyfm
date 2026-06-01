@@ -180,8 +180,16 @@ class BidRecordRepository:
                     asset_type VARCHAR(100),
                     available_flexibility_kw DECIMAL(10, 3),
                     flexibility_factor DECIMAL(5, 3),
+                    reference_power_kw DOUBLE PRECISION,
+                    reference_power_source TEXT,
                     created_at TIMESTAMP DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'UTC') NOT NULL
                 )
+            """)
+
+            cur.execute(f"""
+                ALTER TABLE {self.SCHEMA}.{self.TABLE_ASSETS}
+                ADD COLUMN IF NOT EXISTS reference_power_kw DOUBLE PRECISION NULL,
+                ADD COLUMN IF NOT EXISTS reference_power_source TEXT NULL
             """)
             
             # Create indexes for faster lookups
@@ -388,17 +396,31 @@ class BidRecordRepository:
             # Insert assets
             if assets_to_activate:
                 for asset in assets_to_activate:
+                    self.logger.info(
+                        "Saving bid-record asset:\n"
+                        "  asset_id=%s\n"
+                        "  available_flexibility_kw=%s\n"
+                        "  reference_power_kw=%s\n"
+                        "  reference_power_source=%s",
+                        asset.get("asset_id"),
+                        asset.get("available_flexibility_kw"),
+                        asset.get("reference_power_kw"),
+                        asset.get("reference_power_source"),
+                    )
                     cur.execute(f"""
                         INSERT INTO {self.SCHEMA}.{self.TABLE_ASSETS}
-                        (bid_record_id, asset_id, description, asset_type, available_flexibility_kw, flexibility_factor)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        (bid_record_id, asset_id, description, asset_type, available_flexibility_kw,
+                         flexibility_factor, reference_power_kw, reference_power_source)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """, (
                         bid_record_id,
                         asset.get("asset_id"),
                         asset.get("description"),
                         asset.get("asset_type"),
                         asset.get("available_flexibility_kw"),
-                        asset.get("flexibility_factor")
+                        asset.get("flexibility_factor"),
+                        asset.get("reference_power_kw"),
+                        asset.get("reference_power_source")
                     ))
             
             self.conn.commit()

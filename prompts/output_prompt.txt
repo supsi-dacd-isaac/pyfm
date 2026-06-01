@@ -1,0 +1,67 @@
+Flexi Manager Continuous Reference-Power Fail-Closed Report
+
+Root cause:
+flexi_manager.py still allowed continuous/modulated activation to compute an absolute target from nominal_power_kw when no bid-record reference power was available. For strategy_10/recent_profile, the accepted curtailment is relative to the asset-level bid reference power, not the nominal asset capacity, so nominal_power_kw - allocated_curtailment_kw can produce a target above actual/reference consumption and deliver no real curtailment.
+
+Behavior before:
+- Continuous assets without reference_power_kw fell back to nominal_power_kw.
+- Example: nominal_power_kw=11.00 and allocated_curtailment_kw=2.99 produced target_power_kw=8.01.
+- Allocation logs also displayed a nominal fallback reference.
+- Skipped/fail-closed behavior was not enforced for missing continuous reference power.
+
+Behavior after:
+- Continuous/modulated assets require a valid positive finite reference_power_kw.
+- Preferred bid-record field is reference_power_kw, with reference_power_source preserved when present.
+- Other historical reference fields are still accepted additively when present, but non-positive, NaN, and infinite values are rejected.
+- If the reference is missing or invalid, the asset result is status=skipped, no command payload is queued, actual_curtailment_kw is 0, and nominal fallback is explicitly disabled.
+- If all allocated assets are skipped or otherwise non-deliverable, the activation summary reports status=activation_failed and total_flexibility_deliverable_kw=0.
+- nominal_power_kw is still used only as an upper safety cap: target_power_kw = min(max(min_power_kw, reference_power_kw - allocated_curtailment_kw), nominal_power_kw).
+
+Modified files:
+- scripts/flexi_manager.py
+- tests/test_flexi_manager_activation.py
+- prompts/output_prompt.txt
+
+Files intentionally not modified in this task:
+- scripts/trader_fsp.py
+- forwarder.py
+- RabbitMQ routing/forwarder logic
+- NODES logic
+
+Logging changes:
+- Valid continuous calculation now logs reference_power, reference_power_source, allocated_curtailment, nominal_power, min_power, formula, and target_power.
+- Missing/invalid reference logs clearly state that nominal fallback is disabled.
+- The allocation-plan preview also no longer substitutes nominal power as a display reference.
+
+Tests added/updated:
+- Continuous strategy_10 asset with reference_power_kw=5.98 and allocated_curtailment_kw=2.99 produces target_power_kw=2.99, not 8.01.
+- Continuous missing reference power skips activation, queues no command, and logs nominal fallback disabled.
+- Continuous invalid reference values (None, NaN, 0, negative) skip activation.
+- End-to-end strategy_10 missing reference fails closed with activation_failed and zero deliverable flexibility.
+- Lower bound clamps target to min_power_kw when reference - curtailment is below minimum.
+- Upper cap clamps target to nominal_power_kw only as a safety cap.
+- Discrete ON/OFF behavior remains unchanged.
+- Existing market-result source priority test was updated to expect activation_failed when its continuous test asset has no reference power.
+
+Verification performed:
+- Command:
+  PYTHONPATH="/home/dstreppa/development/python/pyfm" .venv/bin/python -m pytest tests/test_flexi_manager_activation.py
+- Result:
+  21 passed in 0.50s
+- Command:
+  PYTHONPATH="/home/dstreppa/development/python/pyfm" .venv/bin/python -m pytest tests/test_strategy_10_recent_profile.py
+- Result:
+  17 passed, 1 third-party DeprecationWarning from influxdb
+- Linter check:
+  No linter errors reported for scripts/flexi_manager.py or tests/test_flexi_manager_activation.py.
+
+Backward compatibility notes:
+- Discrete assets are unchanged and still use ON/OFF state logic.
+- Existing bid records remain readable; if they lack a valid continuous reference power, continuous activation now fails closed instead of using nominal power.
+- Historical reference fields such as baseline_power_w, expected_power_w, recent_profile_expected_power_w, and typical_load_kw are still accepted when present and valid.
+- Generic/legacy continuous activation without bid-record reference power now fails closed by design. This is the intended safety change.
+
+Remaining assumptions:
+- For continuous/modulated assets, a valid bid-record reference power is required before activation can deliver curtailment safely.
+- nominal_power_kw remains acceptable only as an upper cap on the final target setpoint.
+- Activation records may include skipped status for auditability, but skipped continuous assets do not enqueue/send control commands.
