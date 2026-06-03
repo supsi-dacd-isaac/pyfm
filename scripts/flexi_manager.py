@@ -35,6 +35,13 @@ try:
 except ImportError:
     RABBITMQ_AVAILABLE = False
 
+# InfluxDB support (optional, needed for activation-current measurement)
+try:
+    from influxdb import InfluxDBClient
+    INFLUXDB_AVAILABLE = True
+except ImportError:
+    INFLUXDB_AVAILABLE = False
+
 from classes.nodes_interface import NODESInterface as NodesInterface
 from classes.postgresql_interface import PostgreSQLInterface
 from classes.bid_record_repository import BidRecordRepository
@@ -122,6 +129,133 @@ def _build_bid_asset_reference_power_lookup(
         )
 
     return lookup
+
+
+ACTIVATION_CURRENT_DEFAULTS = {
+    "max_measurement_age_minutes": 15,
+    "active_threshold_w": 4000,
+}
+
+
+class ActivationMeasurementProvider:
+    """Minimal provider that queries latest power measurement for an asset at activation time.
+
+    Reuses the same InfluxDB query pattern as FlexibilityForecaster._get_latest_grouped_measurement
+    but without requiring the full forecaster instance.
+    """
+
+    def __init__(self, influx_client, asset_mapping: dict, config: dict, logger: logging.Logger):
+        self.influx_client = influx_client
+        self.asset_mapping = asset_mapping
+        self.logger = logger
+        self.assets_measurement = config.get("influxDB", {}).get(
+            "assetsMeasurement", "assets_data"
+        )
+        self.granularity = config.get("fm", {}).get("granularity", 15)
+
+    def get_latest_power(
+        self,
+        asset_id: str,
+        current_time_utc: datetime,
+        max_age_minutes: int,
+    ) -> Dict:
+        """Query latest grouped measurement for an asset.
+
+        Returns dict with keys: timestamp_utc, power_w, age_minutes, valid.
+        """
+        mapping = self.asset_mapping.get(asset_id, {})
+        if not isinstance(mapping, dict):
+            return {"valid": False, "reason": "asset_mapping entry not a dict"}
+
+        device_name = mapping.get("device_name_tag")
+        if not device_name:
+            return {"valid": False, "reason": "missing device_name_tag"}
+
+        field = mapping.get("field", "active_power")
+        site = mapping.get("pod", asset_id.split(".")[0])
+
+        window_start_utc = current_time_utc - timedelta(minutes=max_age_minutes)
+        query = (
+            f"SELECT MEAN({field}) as mean_power FROM {self.assets_measurement} "
+            f"WHERE time >= '{window_start_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+            f"AND time < '{current_time_utc.strftime('%Y-%m-%dT%H:%M:%SZ')}' "
+            f"AND site='{site}' AND device_name='{device_name}' "
+            f"GROUP BY time({self.granularity}m) fill(none)"
+        )
+
+        try:
+            result = self.influx_client.query(query)
+        except Exception as exc:
+            self.logger.warning(
+                "Activation measurement query failed for %s: %s", asset_id, exc
+            )
+            return {"valid": False, "reason": f"query_error: {exc}"}
+
+        import pandas as pd
+
+        rows = {}
+        for series in result.raw.get("series", []):
+            columns = series.get("columns", [])
+            values = series.get("values", [])
+            if "time" not in columns or "mean_power" not in columns:
+                continue
+            time_idx = columns.index("time")
+            value_idx = columns.index("mean_power")
+            for row in values:
+                ts_raw = row[time_idx]
+                val_raw = row[value_idx]
+                if ts_raw is None or val_raw is None:
+                    continue
+                ts = pd.to_datetime(ts_raw, utc=True, errors="coerce")
+                if pd.isna(ts):
+                    continue
+                rows[ts] = float(val_raw)
+
+        if not rows:
+            return {"valid": False, "reason": "no_data_in_window"}
+
+        latest_ts = max(rows.keys())
+        latest_power_w = rows[latest_ts]
+        age_minutes = (
+            current_time_utc - latest_ts.to_pydatetime().replace(tzinfo=None)
+        ).total_seconds() / 60.0
+
+        if not math.isfinite(latest_power_w):
+            return {"valid": False, "reason": "non_finite_power_value"}
+
+        return {
+            "valid": True,
+            "timestamp_utc": latest_ts,
+            "power_w": latest_power_w,
+            "age_minutes": age_minutes,
+        }
+
+
+def _resolve_activation_current_config(strategy_obj, config: dict) -> Dict:
+    """Resolve max_measurement_age_minutes and active_threshold_w for activation-current logic.
+
+    Looks in strategy.recentProfileSettings first, then flexibility.persistenceSettings,
+    then uses ACTIVATION_CURRENT_DEFAULTS.
+    """
+    strategy_config = strategy_obj.config if strategy_obj else {}
+    rps = strategy_config.get("recentProfileSettings", {})
+    persistence_cfg = config.get("flexibility", {}).get("persistenceSettings", {})
+
+    max_age = (
+        rps.get("maxCurrentMeasurementAgeMinutes")
+        or persistence_cfg.get("maxCurrentMeasurementAgeMinutes")
+        or ACTIVATION_CURRENT_DEFAULTS["max_measurement_age_minutes"]
+    )
+    active_threshold_w = float(
+        rps.get("activeThresholdW")
+        or persistence_cfg.get("activeThresholdW")
+        or ACTIVATION_CURRENT_DEFAULTS["active_threshold_w"]
+    )
+
+    return {
+        "max_measurement_age_minutes": int(max_age),
+        "active_threshold_w": active_threshold_w,
+    }
 
 
 ALLOWED_RABBIT_DESTINATION_SECTIONS = (
@@ -765,8 +899,13 @@ class AssetController:
         allocated_curtailment_kw: float,
         reference_power_kw: Optional[float] = None,
         reference_power_source: Optional[str] = None,
+        activation_current_power_kw: Optional[float] = None,
     ) -> Dict:
-        """Translate accepted continuous curtailment into an absolute target power."""
+        """Translate accepted continuous curtailment into an absolute target power.
+
+        When activation_current_power_kw is provided (for recent_profile_baseline assets),
+        it overrides the bid-time reference_power_kw as the activation reference.
+        """
         reference_power_kw = _coerce_optional_float(reference_power_kw)
         if (
             reference_power_kw is None
@@ -795,14 +934,19 @@ class AssetController:
                 "skip_reason": "missing reference power; nominal fallback disabled",
             }
 
+        selected_reference_kw = reference_power_kw
+        activation_current_power_kw = _coerce_optional_float(activation_current_power_kw)
+        if activation_current_power_kw is not None and math.isfinite(activation_current_power_kw):
+            selected_reference_kw = activation_current_power_kw
+
         formula_used = (
-            "target_power=max(min_power, reference_power - curtailment), "
+            "target_power=max(min_power, selected_reference - curtailment), "
             "capped_to_nominal"
         )
 
         uncapped_target_kw = max(
             min_power_kw,
-            reference_power_kw - allocated_curtailment_kw,
+            selected_reference_kw - allocated_curtailment_kw,
         )
         computed_target_power_kw = min(uncapped_target_kw, nominal_power_kw)
 
@@ -811,16 +955,20 @@ class AssetController:
             "  modulation_type=%s\n"
             "  reference_power=%.5f kW\n"
             "  reference_power_source=%s\n"
+            "  activation_current_power_kw=%s\n"
+            "  selected_activation_reference_kw=%.5f\n"
             "  allocated_curtailment=%.5f kW\n"
             "  nominal_power=%.5f kW\n"
             "  min_power=%.5f kW\n"
-            "  formula=max(min_power, reference_power - curtailment)\n"
+            "  formula=max(min_power, selected_reference - curtailment)\n"
             "  target_power=%.5f kW\n"
             "  formula_used=%s",
             asset_id,
             modulation_type,
             reference_power_kw,
             reference_power_source,
+            ("%.5f" % activation_current_power_kw) if activation_current_power_kw is not None else "N/A",
+            selected_reference_kw,
             allocated_curtailment_kw,
             nominal_power_kw,
             min_power_kw,
@@ -831,6 +979,8 @@ class AssetController:
         return {
             "reference_power_kw": reference_power_kw,
             "reference_power_source": reference_power_source,
+            "activation_current_power_kw": activation_current_power_kw,
+            "selected_activation_reference_kw": selected_reference_kw,
             "allocated_curtailment_kw": allocated_curtailment_kw,
             "computed_target_power_kw": computed_target_power_kw,
             "uncapped_target_power_kw": uncapped_target_kw,
@@ -848,6 +998,7 @@ class AssetController:
         force_discrete_off: bool = False,
         reference_power_kw: Optional[float] = None,
         reference_power_source: Optional[str] = None,
+        activation_current_power_kw: Optional[float] = None,
     ) -> Dict:
         """
         Send curtailment command to an asset.
@@ -860,6 +1011,8 @@ class AssetController:
         :param duration_minutes: Duration of curtailment
         :param dry_run: If True, only log what would be done
         :param force_discrete_off: If True, positive discrete curtailment forces OFF
+        :param activation_current_power_kw: Latest measured power at activation time (kW).
+            Used as activation reference for recent_profile_baseline continuous assets.
         :return: Result dictionary with status and details
         """
         asset_config = self.asset_mapping.get(asset_id, {})
@@ -891,6 +1044,7 @@ class AssetController:
                 allocated_curtailment_kw=curtailment_kw,
                 reference_power_kw=reference_power_kw,
                 reference_power_source=reference_power_source,
+                activation_current_power_kw=activation_current_power_kw,
             )
             if target_calculation["skip_activation"]:
                 result = {
@@ -2827,6 +2981,7 @@ class FlexibilityManager:
         rabbitmq_config: dict = None,
         demand_repo: DemandRecordRepository = None,
         state_file: str = None,
+        influx_client=None,
     ):
         self.config = config
         self.fsp_id = fsp_id
@@ -2863,6 +3018,14 @@ class FlexibilityManager:
             rabbitmq_config=self.rabbitmq_config,
         )
         self.bid_handler = BidRecordHandler(bid_repo, logger)
+        self.activation_measurement_provider = None
+        if influx_client is not None:
+            self.activation_measurement_provider = ActivationMeasurementProvider(
+                influx_client=influx_client,
+                asset_mapping=self.asset_mapping,
+                config=config,
+                logger=logger,
+            )
         
         # Autonomous mode configuration
         self.autonomous_config = config.get("autonomous", {})
@@ -3240,6 +3403,165 @@ class FlexibilityManager:
 
         asset_type = asset_config.get("type", "")
         return "discrete" if asset_type == "heat_pump" else "continuous"
+
+    def _resolve_recent_profile_activation_current(
+        self,
+        asset_id: str,
+        curtailment_kw: float,
+        bid_reference_power_kw: Optional[float],
+        bid_reference_source: Optional[str],
+        activation_current_cfg: Dict,
+    ):
+        """Resolve activation-time current power for a recent_profile_baseline continuous EV asset.
+
+        Returns:
+            float: activation_current_power_kw if valid measurement found and activation should proceed.
+            str: skip_reason if activation should be skipped (fail-closed).
+        """
+        max_age_minutes = activation_current_cfg["max_measurement_age_minutes"]
+        active_threshold_w = activation_current_cfg["active_threshold_w"]
+        active_threshold_kw = active_threshold_w / 1000.0
+
+        if self.activation_measurement_provider is None:
+            reason = (
+                "skipped: no measurement provider available for recent_profile_baseline "
+                "continuous EV activation-current reference"
+            )
+            self.logger.warning(
+                "Continuous activation reference decision for %s:\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  bid_reference_power_kw=%s\n"
+                "  bid_reference_source=%s\n"
+                "  activation_current_power_kw=N/A\n"
+                "  decision=%s",
+                asset_id, curtailment_kw,
+                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                bid_reference_source, reason,
+            )
+            return reason
+
+        current_time_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        measurement = self.activation_measurement_provider.get_latest_power(
+            asset_id=asset_id,
+            current_time_utc=current_time_utc,
+            max_age_minutes=max_age_minutes,
+        )
+
+        if not measurement.get("valid"):
+            reason = (
+                f"skipped: no valid current measurement for recent_profile_baseline "
+                f"continuous EV (reason={measurement.get('reason', 'unknown')})"
+            )
+            self.logger.warning(
+                "Continuous activation reference decision for %s:\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  bid_reference_power_kw=%s\n"
+                "  bid_reference_source=%s\n"
+                "  activation_current_power_kw=N/A\n"
+                "  max_measurement_age_minutes=%d\n"
+                "  decision=%s",
+                asset_id, curtailment_kw,
+                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                bid_reference_source, max_age_minutes, reason,
+            )
+            return reason
+
+        current_power_w = measurement["power_w"]
+        current_power_kw = current_power_w / 1000.0
+        age_minutes = measurement["age_minutes"]
+        measurement_time_utc = measurement["timestamp_utc"]
+
+        if age_minutes > max_age_minutes:
+            reason = (
+                f"skipped: current measurement too stale for recent_profile_baseline "
+                f"continuous EV (age={age_minutes:.1f} min > max={max_age_minutes} min)"
+            )
+            self.logger.warning(
+                "Continuous activation reference decision for %s:\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  bid_reference_power_kw=%s\n"
+                "  bid_reference_source=%s\n"
+                "  activation_current_power_kw=%.3f\n"
+                "  activation_current_time_utc=%s\n"
+                "  activation_measurement_age_minutes=%.1f\n"
+                "  max_measurement_age_minutes=%d\n"
+                "  decision=%s",
+                asset_id, curtailment_kw,
+                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                bid_reference_source,
+                current_power_kw, str(measurement_time_utc), age_minutes,
+                max_age_minutes, reason,
+            )
+            return reason
+
+        if current_power_kw <= active_threshold_kw:
+            reason = (
+                f"skipped: current power {current_power_kw:.3f} kW at or below "
+                f"active threshold {active_threshold_kw:.3f} kW; "
+                f"EV appears inactive for recent_profile_baseline activation"
+            )
+            self.logger.warning(
+                "Continuous activation reference decision for %s:\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  bid_reference_power_kw=%s\n"
+                "  bid_reference_source=%s\n"
+                "  activation_current_power_kw=%.3f\n"
+                "  activation_current_time_utc=%s\n"
+                "  activation_measurement_age_minutes=%.1f\n"
+                "  active_threshold_kw=%.3f\n"
+                "  decision=%s",
+                asset_id, curtailment_kw,
+                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                bid_reference_source,
+                current_power_kw, str(measurement_time_utc), age_minutes,
+                active_threshold_kw, reason,
+            )
+            return reason
+
+        if current_power_kw < curtailment_kw:
+            reason = (
+                f"skipped: current power {current_power_kw:.3f} kW below allocated "
+                f"curtailment {curtailment_kw:.3f} kW; skipping recent-profile EV "
+                f"activation to avoid uncertain delivery"
+            )
+            self.logger.warning(
+                "Continuous activation reference decision for %s:\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  bid_reference_power_kw=%s\n"
+                "  bid_reference_source=%s\n"
+                "  activation_current_power_kw=%.3f\n"
+                "  activation_current_time_utc=%s\n"
+                "  activation_measurement_age_minutes=%.1f\n"
+                "  active_threshold_kw=%.3f\n"
+                "  decision=%s",
+                asset_id, curtailment_kw,
+                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                bid_reference_source,
+                current_power_kw, str(measurement_time_utc), age_minutes,
+                active_threshold_kw, reason,
+            )
+            return reason
+
+        self.logger.info(
+            "Continuous activation reference decision for %s:\n"
+            "  allocated_curtailment_kw=%.3f\n"
+            "  bid_reference_power_kw=%s\n"
+            "  bid_reference_source=%s\n"
+            "  activation_current_power_kw=%.3f\n"
+            "  activation_current_time_utc=%s\n"
+            "  activation_measurement_age_minutes=%.1f\n"
+            "  active_threshold_kw=%.3f\n"
+            "  selected_activation_reference_kw=%.3f\n"
+            "  target_power_kw=%.3f\n"
+            "  decision=used activation current power for recent_profile_baseline continuous EV",
+            asset_id, curtailment_kw,
+            "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+            bid_reference_source,
+            current_power_kw, str(measurement_time_utc), age_minutes,
+            active_threshold_kw, current_power_kw,
+            max(0.0, current_power_kw - curtailment_kw),
+        )
+        return current_power_kw
 
     def _build_persistence_activation_allocations(
         self,
@@ -4001,6 +4323,8 @@ class FlexibilityManager:
         current_curtailed = set()
         deliverable_allocated = 0.0
 
+        activation_current_cfg = _resolve_activation_current_config(strategy_obj, self.config)
+
         for asset_id, curtailment_kw in allocations.items():
             mod_type = self._get_activation_modulation_type(asset_id)
             force_discrete_off = (
@@ -4008,20 +4332,72 @@ class FlexibilityManager:
                 and mod_type == "discrete"
                 and curtailment_kw > 0
             )
+
+            bid_ref_info = bid_asset_reference_power_by_id.get(asset_id, {})
+            bid_reference_power_kw = bid_ref_info.get("reference_power_kw")
+            bid_reference_source = bid_ref_info.get("reference_power_source")
+
+            activation_current_power_kw = None
+
+            if (
+                mod_type != "discrete"
+                and bid_reference_source == "recent_profile_baseline"
+            ):
+                asset_config = self.asset_mapping.get(asset_id, {})
+                asset_type = asset_config.get("type", "unknown")
+                if asset_type == "ev_charger":
+                    skip_reason = self._resolve_recent_profile_activation_current(
+                        asset_id=asset_id,
+                        curtailment_kw=curtailment_kw,
+                        bid_reference_power_kw=bid_reference_power_kw,
+                        bid_reference_source=bid_reference_source,
+                        activation_current_cfg=activation_current_cfg,
+                    )
+                    if isinstance(skip_reason, str):
+                        result = {
+                            "asset_id": asset_id,
+                            "description": asset_config.get("description", asset_id),
+                            "asset_type": asset_type,
+                            "modulation_type": mod_type,
+                            "requested_curtailment_kw": curtailment_kw,
+                            "actual_curtailment_kw": 0.0,
+                            "target_power_kw": None,
+                            "computed_target_power_kw": None,
+                            "reference_power_kw": bid_reference_power_kw,
+                            "reference_power_source": bid_reference_source,
+                            "status": "skipped",
+                            "skip_activation": True,
+                            "skip_reason": skip_reason,
+                            "message": skip_reason,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        }
+                        summary["control_results"][asset_id] = result
+                        continue
+                    else:
+                        activation_current_power_kw = skip_reason
+            elif mod_type != "discrete" and bid_reference_source and bid_reference_source != "recent_profile_baseline":
+                self.logger.info(
+                    "Continuous activation reference decision for %s:\n"
+                    "  allocated_curtailment_kw=%.3f\n"
+                    "  bid_reference_power_kw=%s\n"
+                    "  bid_reference_source=%s\n"
+                    "  selected_activation_reference_kw=%s\n"
+                    "  decision=used bid reference because source is not recent_profile_baseline",
+                    asset_id, curtailment_kw,
+                    "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                    bid_reference_source,
+                    "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
+                )
+
             result = self.controller.curtail_asset(
                 asset_id,
                 curtailment_kw,
                 duration_minutes=15,
                 dry_run=dry_run,
                 force_discrete_off=force_discrete_off,
-                reference_power_kw=bid_asset_reference_power_by_id.get(
-                    asset_id,
-                    {},
-                ).get("reference_power_kw"),
-                reference_power_source=bid_asset_reference_power_by_id.get(
-                    asset_id,
-                    {},
-                ).get("reference_power_source"),
+                reference_power_kw=bid_reference_power_kw,
+                reference_power_source=bid_reference_source,
+                activation_current_power_kw=activation_current_power_kw,
             )
             summary["control_results"][asset_id] = result
             if result.get("status") in ["success", "simulated", "queued"]:
@@ -4448,6 +4824,29 @@ Examples:
     except Exception as e:
         logger.warning("Error loading connections: %s - running in offline mode", str(e))
 
+    # Initialize InfluxDB client for activation-time measurement queries
+    influx_client = None
+    influx_cfg = conns.get("influxDB", {})
+    if influx_cfg and INFLUXDB_AVAILABLE:
+        try:
+            influx_client = InfluxDBClient(
+                host=influx_cfg["host"],
+                port=influx_cfg["port"],
+                username=influx_cfg["user"],
+                password=influx_cfg["password"],
+                database=influx_cfg["database"],
+            )
+            logger.info("InfluxDB client initialized for activation-current measurements")
+        except Exception as e:
+            logger.warning("Could not initialize InfluxDB client: %s", str(e))
+    elif not INFLUXDB_AVAILABLE:
+        logger.warning(
+            "influxdb package not installed; activation-current measurement "
+            "for recent-profile EV assets will not be available"
+        )
+    if influx_cfg:
+        config.setdefault("influxDB", {}).update(influx_cfg)
+
     rabbitmq_cfg = conns.get("rabbitMQ", {})
     
     # Initialize RabbitMQ publisher if requested
@@ -4513,6 +4912,7 @@ Examples:
             rabbitmq_config=rabbitmq_cfg,
             demand_repo=demand_repo,
             state_file=args.state_file,
+            influx_client=influx_client,
         )
     else:
         # Create a mock manager for testing
@@ -4531,6 +4931,7 @@ Examples:
             rabbitmq_config=rabbitmq_cfg,
             demand_repo=None,
             state_file=args.state_file,
+            influx_client=influx_client,
         )
     
     # Determine slot override from --slot or --offset
