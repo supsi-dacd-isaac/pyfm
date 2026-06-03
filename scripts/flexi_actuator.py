@@ -67,7 +67,7 @@ def _build_rabbitmq_command_message(
     payload: dict,
     priority: int,
 ) -> dict:
-    """Build the RabbitMQ command message body."""
+    """Build one RabbitMQ command envelope object."""
     return {
         "message_type": "command",
         "asset_id": asset_id,
@@ -79,13 +79,23 @@ def _build_rabbitmq_command_message(
     }
 
 
-def _log_rabbitmq_messages(
-    commands: List[dict],
-    slot_info: Optional[dict],
-    logger: logging.Logger,
-) -> None:
-    """Log the RabbitMQ JSON body strings that will be published."""
-    destination_counts: Dict[tuple, int] = {}
+def _build_rabbitmq_command_envelopes(commands: List[dict]) -> List[dict]:
+    """Build the RabbitMQ command list body from prepared actuator commands."""
+    return [
+        _build_rabbitmq_command_message(
+            asset_id=command.get("asset_id"),
+            asset_type=command.get("asset_type"),
+            command_type=command.get("command_type"),
+            payload=command.get("payload", {}),
+            priority=command.get("priority", 5),
+        )
+        for command in commands
+    ]
+
+
+def _group_commands_by_rabbitmq_destination(commands: List[dict]) -> Dict[tuple, List[dict]]:
+    """Group prepared commands by resolved RabbitMQ destination."""
+    grouped: Dict[tuple, List[dict]] = {}
     for command in commands:
         destination = command.get("rabbitmq_destination", {})
         destination_key = (
@@ -93,11 +103,26 @@ def _log_rabbitmq_messages(
             destination.get("queue"),
             destination.get("routing_key"),
         )
-        destination_counts[destination_key] = destination_counts.get(destination_key, 0) + 1
+        grouped.setdefault(destination_key, []).append(command)
+    return grouped
 
-    if slot_info:
-        for (exchange, queue, routing_key), command_count in destination_counts.items():
-            batch_body = json.dumps(_build_rabbitmq_batch_header(slot_info, command_count))
+
+def _log_rabbitmq_messages(
+    commands: List[dict],
+    slot_info: Optional[dict],
+    logger: logging.Logger,
+) -> None:
+    """Log the RabbitMQ JSON body strings that will be published."""
+    grouped_commands = _group_commands_by_rabbitmq_destination(commands)
+
+    for (exchange, queue, routing_key), destination_commands in grouped_commands.items():
+        if not exchange or not queue or not routing_key:
+            continue
+
+        if slot_info:
+            batch_body = json.dumps(
+                _build_rabbitmq_batch_header(slot_info, len(destination_commands))
+            )
             logger.info(
                 "RabbitMQ batch header JSON (exchange=%s, queue=%s, routing_key=%s): %s",
                 exchange,
@@ -106,23 +131,12 @@ def _log_rabbitmq_messages(
                 batch_body,
             )
 
-    for command in commands:
-        destination = command.get("rabbitmq_destination", {})
-        command_routing_key = destination.get("routing_key")
-        command_body = json.dumps(
-            _build_rabbitmq_command_message(
-                asset_id=command.get("asset_id"),
-                asset_type=command.get("asset_type"),
-                command_type=command.get("command_type"),
-                payload=command.get("payload", {}),
-                priority=command.get("priority", 5),
-            )
-        )
+        command_body = json.dumps(_build_rabbitmq_command_envelopes(destination_commands))
         logger.info(
             "RabbitMQ command JSON (exchange=%s, queue=%s, routing_key=%s): %s",
-            destination.get("exchange"),
-            destination.get("queue"),
-            command_routing_key,
+            exchange,
+            queue,
+            routing_key,
             command_body,
         )
 
@@ -254,32 +268,33 @@ class RabbitMQPublisher:
             ),
         )
 
-    def publish_command(
+    def publish_command_list(
         self,
-        asset_id: str,
-        asset_type: str,
-        command_type: str,
-        payload: dict,
-        priority: int = 5,
+        command_envelopes: List[dict],
         verbose: bool = False,
         exchange: Optional[str] = None,
         queue: Optional[str] = None,
         routing_key: Optional[str] = None,
     ) -> bool:
-        """Publish a control command to RabbitMQ."""
+        """Publish a JSON list of command envelopes to RabbitMQ in one message."""
         if not self.is_connected():
-            self.logger.warning("Not connected to RabbitMQ - cannot publish command")
+            self.logger.warning("Not connected to RabbitMQ - cannot publish command list")
             return False
 
         if not exchange or not queue or not routing_key:
             self.logger.error(
-                "Missing RabbitMQ destination for command asset %s - cannot publish",
-                asset_id,
+                "Missing RabbitMQ destination for command list - cannot publish"
             )
             return False
 
-        message = _build_rabbitmq_command_message(asset_id, asset_type, command_type, payload, priority)
-        body = json.dumps(message)
+        if not command_envelopes:
+            self.logger.warning("No command envelopes to publish")
+            return False
+
+        body = json.dumps(command_envelopes)
+        message_priority = max(
+            envelope.get("priority", 5) for envelope in command_envelopes
+        )
 
         try:
             self._declare_destination(exchange, queue, routing_key)
@@ -298,21 +313,24 @@ class RabbitMQPublisher:
                 properties=pika.BasicProperties(
                     delivery_mode=2,
                     content_type="application/json",
-                    priority=priority,
+                    priority=message_priority,
                 ),
             )
+            asset_ids = ", ".join(
+                envelope.get("asset_id", "unknown") for envelope in command_envelopes
+            )
             self.logger.debug(
-                "Published command to exchange=%s queue=%s routing_key=%s: %s -> %s",
+                "Published command list to exchange=%s queue=%s routing_key=%s: %d command(s) [%s]",
                 exchange,
                 queue,
                 routing_key,
-                command_type,
-                asset_id,
+                len(command_envelopes),
+                asset_ids,
             )
             return True
 
         except Exception as exc:
-            self.logger.error("Failed to publish command: %s", str(exc))
+            self.logger.error("Failed to publish command list: %s", str(exc))
             return False
 
     def publish_batch_commands(
@@ -327,29 +345,21 @@ class RabbitMQPublisher:
             return 0
 
         success_count = 0
+        grouped_commands = _group_commands_by_rabbitmq_destination(commands)
 
         if slot_info:
-            destination_counts: Dict[tuple, int] = {}
-            for command in commands:
-                destination = command.get("rabbitmq_destination", {})
-                if not destination.get("exchange") or not destination.get("queue") or not destination.get("routing_key"):
-                    self.logger.warning(
-                        "Skipping RabbitMQ batch header for command without destination: asset=%s",
-                        command.get("asset_id"),
-                    )
-                    continue
-                destination_key = (
-                    destination.get("exchange"),
-                    destination.get("queue"),
-                    destination.get("routing_key"),
-                )
-                destination_counts[destination_key] = destination_counts.get(destination_key, 0) + 1
-
             try:
-                for (exchange, queue, routing_key), command_count in destination_counts.items():
+                for (exchange, queue, routing_key), destination_commands in grouped_commands.items():
+                    if not exchange or not queue or not routing_key:
+                        for command in destination_commands:
+                            self.logger.warning(
+                                "Skipping RabbitMQ batch header for command without destination: asset=%s",
+                                command.get("asset_id"),
+                            )
+                        continue
                     self._publish_batch_header(
                         slot_info=slot_info,
-                        command_count=command_count,
+                        command_count=len(destination_commands),
                         exchange=exchange,
                         queue=queue,
                         routing_key=routing_key,
@@ -358,20 +368,24 @@ class RabbitMQPublisher:
             except Exception as exc:
                 self.logger.warning("Failed to publish batch header: %s", str(exc))
 
-        for cmd in commands:
-            destination = cmd.get("rabbitmq_destination", {})
-            if self.publish_command(
-                asset_id=cmd.get("asset_id"),
-                asset_type=cmd.get("asset_type"),
-                command_type=cmd.get("command_type"),
-                payload=cmd.get("payload", {}),
-                priority=cmd.get("priority", 5),
+        for (exchange, queue, routing_key), destination_commands in grouped_commands.items():
+            if not exchange or not queue or not routing_key:
+                for command in destination_commands:
+                    self.logger.error(
+                        "Missing RabbitMQ destination for command asset %s - cannot publish",
+                        command.get("asset_id"),
+                    )
+                continue
+
+            command_envelopes = _build_rabbitmq_command_envelopes(destination_commands)
+            if self.publish_command_list(
+                command_envelopes=command_envelopes,
                 verbose=verbose,
-                exchange=destination.get("exchange"),
-                queue=destination.get("queue"),
-                routing_key=destination.get("routing_key"),
+                exchange=exchange,
+                queue=queue,
+                routing_key=routing_key,
             ):
-                success_count += 1
+                success_count += len(destination_commands)
 
         self.logger.info(
             "Published %d/%d commands to RabbitMQ",
