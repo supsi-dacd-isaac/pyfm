@@ -290,13 +290,14 @@ def test_persistence_bid_assets_are_selected_allocation_only():
 
     assets = build_persistence_assets_to_activate(contexts)
 
-    assert assets == [{
-        "asset_id": "EV",
-        "description": "charger",
-        "asset_type": "ev_charger",
-        "available_flexibility_kw": 4.0,
-        "flexibility_factor": 1.0,
-    }]
+    assert len(assets) == 1
+    selected = assets[0]
+    assert selected["asset_id"] == "EV"
+    assert selected["description"] == "charger"
+    assert selected["asset_type"] == "ev_charger"
+    assert selected["available_flexibility_kw"] == pytest.approx(4.0)
+    assert selected["flexibility_factor"] == pytest.approx(1.0)
+    assert all(asset["asset_id"] != "HP_LARGE" for asset in assets)
 
 
 def test_non_persistence_default_still_allows_overdelivery_when_closer():

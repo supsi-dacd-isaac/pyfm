@@ -44,6 +44,8 @@ if psycopg2_missing:
 from classes.bidding_strategy import StrategyManager  # noqa: E402
 from classes.flexibility_forecaster import (  # noqa: E402
     FlexibilityForecaster,
+    build_recent_profile_available_flex_explanation,
+    format_recent_profile_asset_log_lines,
     resolve_recent_profile_settings,
 )
 from scripts.trader_fsp import (  # noqa: E402
@@ -562,4 +564,114 @@ def test_strategy_10_method_resolves_to_gated_recent_profile():
         resolve_strategy_flexibility_method(strategy, logging.getLogger(__name__))
         == "recent_profile"
     )
+
+
+def test_recent_profile_breakdown_includes_logging_metadata():
+    cfg = _base_cfg(
+        {"ECM63.1": _asset()},
+        recent_settings={
+            "lookbackMinutes": 120,
+            "quantile": 0.25,
+            "continuousFactor": 0.5,
+            "minSamples": 2,
+            "activeThresholdW": 500,
+        },
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {"ECM63.1": _series([4000, 8000, 12000, 16000])},
+        {"ECM63.1": 8000},
+    )
+
+    info = forecaster.get_asset_flexibility_breakdown(
+        SLOT_TIME,
+        asset_ids=["ECM63.1"],
+        current_time_utc=CURRENT_TIME,
+    )["ECM63.1"]
+
+    assert info["estimation_method"] == "recent_profile"
+    assert info["recent_profile_positive_sample_count"] == 4
+    assert info["recent_profile_zero_sample_count"] == 0
+    assert info["target_slot_utc"] == "2026-05-26T11:00:00Z"
+    assert info["lookback_window_end_utc"] == "2026-05-26T10:00:00Z"
+    assert info["aggregation_resolution_minutes"] == 15
+    assert info["recent_profile_min_samples"] == 2
+    assert "available_flex_kw = 0.500 × 7.00 = 3.50 kW" in info[
+        "recent_profile_available_flex_explanation"
+    ]
+
+
+def test_recent_profile_zero_reference_while_currently_charging():
+    """ECM63.2-style case: active charging but q25 reference stays zero."""
+    cfg = _base_cfg(
+        {
+            "ECM63.2": _asset(description="ECM63.2 charger"),
+        },
+        recent_settings={
+            "lookbackMinutes": 120,
+            "quantile": 0.25,
+            "continuousFactor": 0.5,
+            "activeThresholdW": 500,
+        },
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {
+            "ECM63.2": _series(
+                [0, 0, 0, 0, 0, 10920, 10920, 10920],
+                step_minutes=15,
+            )
+        },
+        {"ECM63.2": 10920},
+    )
+
+    info = forecaster.get_asset_flexibility_breakdown(
+        SLOT_TIME,
+        asset_ids=["ECM63.2"],
+        current_time_utc=CURRENT_TIME,
+    )["ECM63.2"]
+
+    assert info["is_currently_active"] is True
+    assert info["recent_profile_expected_power_w"] == pytest.approx(0.0)
+    assert info["available_flexibility_kw"] == pytest.approx(0.0)
+    assert info["recent_profile_positive_sample_count"] == 3
+    assert info["recent_profile_zero_sample_count"] == 5
+    assert "q25 over the last 120 min is zero" in info[
+        "recent_profile_available_flex_explanation"
+    ]
+    assert "No bid flexibility is assigned" in info[
+        "recent_profile_available_flex_explanation"
+    ]
+
+    log_lines = format_recent_profile_asset_log_lines("ECM63.2", info)
+    joined = "\n".join(log_lines)
+    assert "Recent-profile reference calculation for ECM63.2" in joined
+    assert "positive_samples=3" in joined
+    assert "zero_samples=5" in joined
+    assert "q25_reference=0.00 kW" in joined
+    assert "current_power=10.92 kW" in joined
+
+
+def test_recent_profile_available_flex_explanation_helper():
+    explanation = build_recent_profile_available_flex_explanation(
+        "ECM63.2",
+        skip_reason=None,
+        is_currently_active=True,
+        current_measured_power_w=10920,
+        expected_power_w=0.0,
+        available_flexibility_kw=0.0,
+        modulation_factor=0.5,
+        nominal_power_w=12000,
+        quantile=0.25,
+        lookback_minutes=120,
+        positive_sample_count=3,
+        sample_count=8,
+        active_threshold_w=500,
+    )
+    assert "ECM63.2" in explanation
+    assert "10.92 kW" in explanation
+    assert "positive_samples=3" in explanation
+    assert "total_samples=8" in explanation
 

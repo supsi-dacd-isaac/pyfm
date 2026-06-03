@@ -16,7 +16,10 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from classes.fsp import FSP
 from classes.player import Player
 from classes.fmo import FMO
-from classes.flexibility_forecaster import FlexibilityForecaster
+from classes.flexibility_forecaster import (
+    FlexibilityForecaster,
+    format_recent_profile_asset_log_lines,
+)
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
 
 POSTGRESQL_IMPORT_ERROR = None
@@ -194,6 +197,14 @@ def get_strategy_flexibility_discrete(
     logger.info("-" * 70)
     
     return recommended_mw, achievable
+
+
+def _log_recent_profile_asset_diagnostics(logger, asset_id, info):
+    """Emit recent-profile reference/flex diagnostic lines (logging only)."""
+    if info.get("estimation_method") != "recent_profile":
+        return
+    for line in format_recent_profile_asset_log_lines(asset_id, info):
+        logger.info(line)
 
 
 def _recent_profile_reference_power_fields(asset_info):
@@ -559,6 +570,8 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             for asset_id, info in portfolio_context.get("asset_breakdown", {}).items():
                 mod_type = flex_forecaster._get_modulation_type(asset_id)
                 mod_label = "[D]" if mod_type == "discrete" else "[C]"
+                if info.get("estimation_method") == "recent_profile":
+                    _log_recent_profile_asset_diagnostics(logger, asset_id, info)
                 logger.info(
                     "  %s %s (%s): baseline=%.2f kW, current=%.2f kW @ %s, active=%s, available_flex=%.2f kW",
                     mod_label,
@@ -1054,13 +1067,19 @@ if __name__ == "__main__":
     if use_persistence_flexibility:
         if flex_forecaster.method == "recent_profile":
             logger.info(
-                "Recent-profile flexibility mode: target_slot_utc=%s, lookbackMinutes=%s, quantile=%.3f, continuousFactor=%.3f, discreteFactor=%.3f, activeThresholdW=%.1f, maxCurrentMeasurementAgeMinutes=%s",
+                "Recent-profile flexibility mode (strategy_10 / recent-profile; not persistence): "
+                "settings_source=%s, target_slot_utc=%s, lookbackMinutes=%s, quantile=%.3f, "
+                "minSamples=%s, continuousFactor=%.3f, discreteFactor=%.3f, activeThresholdW=%.1f, "
+                "aggregation_resolution_min=%s, maxCurrentMeasurementAgeMinutes=%s",
+                flex_forecaster.recent_profile_settings_source,
                 slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 flex_forecaster.recent_profile_lookback_minutes,
                 flex_forecaster.recent_profile_quantile,
+                flex_forecaster.recent_profile_min_samples,
                 flex_forecaster.recent_profile_continuous_factor,
                 flex_forecaster.recent_profile_discrete_factor,
                 flex_forecaster.recent_profile_active_threshold_w,
+                flex_forecaster.granularity,
                 flex_forecaster.max_current_measurement_age_minutes,
             )
         else:
@@ -1076,7 +1095,14 @@ if __name__ == "__main__":
             portfolio_strategy_contexts = {}
 
         logger.info("-" * 70)
-        logger.info("Portfolio-scoped persistence flexibility breakdown:")
+        if flex_forecaster.method == "recent_profile":
+            logger.info(
+                "Portfolio-scoped recent-profile flexibility breakdown:"
+            )
+        else:
+            logger.info(
+                "Portfolio-scoped persistence flexibility breakdown:"
+            )
         for p_k in fsp.portfolios.keys():
             portfolio_name = fsp.portfolios[p_k].metadata["name"]
             portfolio_asset_ids = fsp.get_portfolio_asset_names(p_k)
@@ -1093,6 +1119,8 @@ if __name__ == "__main__":
             )
             portfolio_total_kw = 0.0
             for asset_id, info in portfolio_breakdown.items():
+                if info.get("estimation_method") == "recent_profile":
+                    _log_recent_profile_asset_diagnostics(logger, asset_id, info)
                 logger.info(
                     "  %s (%s): flexibility_go_back_minutes=%s baseline_source_time_utc=%s baseline=%.2f kW, gate_measurement_time_utc=%s current=%.2f kW, active=%s, nominal=%.2f kW, safety_factor=%.3f, available_flex=%.2f kW",
                     asset_id,

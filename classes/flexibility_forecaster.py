@@ -70,6 +70,143 @@ def resolve_recent_profile_settings(
     }
 
 
+def _recent_profile_quantile_label(quantile: float) -> str:
+    return f"q{int(round(quantile * 100))}"
+
+
+def build_recent_profile_available_flex_explanation(
+    asset_id: str,
+    *,
+    skip_reason: Optional[str],
+    is_currently_active: bool,
+    current_measured_power_w: float,
+    expected_power_w: Optional[float],
+    available_flexibility_kw: float,
+    modulation_factor: float,
+    nominal_power_w: float,
+    quantile: float,
+    lookback_minutes: int,
+    positive_sample_count: int,
+    sample_count: int,
+    active_threshold_w: float,
+) -> str:
+    """Human-readable explanation of available_flex for recent-profile assets (logging only)."""
+    current_kw = current_measured_power_w / 1000
+    ref_kw = (expected_power_w or 0.0) / 1000
+    q_label = _recent_profile_quantile_label(quantile)
+    active_threshold_kw = active_threshold_w / 1000
+
+    if skip_reason == "inactive":
+        return (
+            f"available_flex={available_flexibility_kw:.2f} kW because current power "
+            f"{current_kw:.2f} kW is at or below active threshold {active_threshold_kw:.2f} kW"
+        )
+    if skip_reason == "insufficient_samples":
+        return (
+            f"available_flex={available_flexibility_kw:.2f} kW because only "
+            f"{sample_count} sample(s) in lookback (minimum required for bidding not met)"
+        )
+    if (
+        is_currently_active
+        and current_kw > active_threshold_kw
+        and ref_kw == 0.0
+        and available_flexibility_kw == 0.0
+    ):
+        return (
+            f"Recent-profile reference for {asset_id} is 0.00 kW although current power is "
+            f"{current_kw:.2f} kW because {q_label} over the last {lookback_minutes} min is zero "
+            f"(positive_samples={positive_sample_count}, total_samples={sample_count}). "
+            f"No bid flexibility is assigned."
+        )
+    if ref_kw == 0.0 and available_flexibility_kw == 0.0:
+        return (
+            f"available_flex={available_flexibility_kw:.2f} kW because {q_label} reference is zero"
+        )
+
+    raw_flex_kw = modulation_factor * ref_kw
+    nominal_kw = nominal_power_w / 1000
+    if available_flexibility_kw < raw_flex_kw - 1e-9:
+        return (
+            f"available_flex_kw = min({modulation_factor:.3f} × {ref_kw:.2f}, "
+            f"nominal={nominal_kw:.2f}) = {available_flexibility_kw:.2f} kW"
+        )
+    return (
+        f"available_flex_kw = {modulation_factor:.3f} × {ref_kw:.2f} = "
+        f"{available_flexibility_kw:.2f} kW"
+    )
+
+
+def format_recent_profile_asset_log_lines(asset_id: str, info: Dict) -> List[str]:
+    """
+    Build INFO-level diagnostic lines for a recent-profile per-asset breakdown entry.
+
+    Reads only fields already stored on ``info`` by
+    ``_get_asset_flexibility_breakdown_recent_profile`` (no extra queries).
+    """
+    if info.get("estimation_method") != "recent_profile":
+        return []
+
+    quantile = float(info.get("recent_profile_quantile", 0.25))
+    q_label = _recent_profile_quantile_label(quantile)
+    lookback_minutes = info.get("recent_profile_lookback_minutes", "N/A")
+    sample_count = info.get("recent_profile_sample_count", 0)
+    positive_samples = info.get("recent_profile_positive_sample_count", 0)
+    zero_samples = info.get("recent_profile_zero_sample_count", 0)
+    ref_kw = float(info.get("baseline_power_w", 0.0) or 0.0) / 1000
+    current_kw = float(info.get("current_measured_power_w", 0.0) or 0.0) / 1000
+    active = info.get("is_currently_active", False)
+    summary = info.get("recent_profile_recent_values_summary") or {}
+
+    lines = [
+        f"Recent-profile reference calculation for {asset_id}:",
+        (
+            "  method=recent_profile (strategy_10 / recent-profile; not generic "
+            "persistence)"
+        ),
+        (
+            f"  settings_source={info.get('recent_profile_settings_source', 'N/A')}, "
+            f"lookback_minutes={lookback_minutes}, quantile={quantile:.3f}, "
+            f"min_samples={info.get('recent_profile_min_samples', 'N/A')}, "
+            f"active_threshold_w={info.get('active_threshold_w', 'N/A')}, "
+            f"flexibility_factor={info.get('flexibility_factor', 0.0):.3f}"
+        ),
+        (
+            f"  target_slot_utc={info.get('target_slot_utc', 'N/A')}, "
+            f"gate_measurement_time_utc={info.get('gate_measurement_time_utc', 'N/A')}, "
+            f"aggregation_resolution_min={info.get('aggregation_resolution_minutes', 'N/A')}"
+        ),
+        (
+            f"  lookback_window_utc=[{info.get('lookback_window_start_utc', 'N/A')}, "
+            f"{info.get('lookback_window_end_utc', 'N/A')}]"
+        ),
+        (
+            f"  lookback_minutes={lookback_minutes}, quantile={quantile:.3f}, "
+            f"samples={sample_count}, positive_samples={positive_samples}, "
+            f"zero_samples={zero_samples}"
+        ),
+    ]
+
+    if summary.get("min_w") is not None:
+        lines.append(
+            "  sample_stats_w: min={:.2f}, max={:.2f}, mean={:.2f}".format(
+                summary["min_w"],
+                summary["max_w"],
+                summary["mean_w"],
+            )
+        )
+
+    lines.append(
+        f"  {q_label}_reference={ref_kw:.2f} kW, current_power={current_kw:.2f} kW, "
+        f"active={active}"
+    )
+
+    explanation = info.get("recent_profile_available_flex_explanation")
+    if explanation:
+        lines.append(f"  {explanation}")
+
+    return lines
+
+
 class FlexibilityForecaster:
     """
     Forecasts flexibility available from FSP assets for flexibility market bidding.
@@ -1507,6 +1644,12 @@ class FlexibilityForecaster:
 
             recent_values = recent_series.dropna().astype(float)
             sample_count = int(recent_values.size)
+            positive_sample_count = (
+                int((recent_values > 0).sum()) if sample_count else 0
+            )
+            zero_sample_count = (
+                int((recent_values == 0).sum()) if sample_count else 0
+            )
             expected_power_w: Optional[float] = None
 
             # If the asset isn't really running right now or we don't have
@@ -1546,6 +1689,22 @@ class FlexibilityForecaster:
                 "max_w": float(recent_values.max()) if sample_count else None,
                 "mean_w": float(recent_values.mean()) if sample_count else None,
             }
+            available_flexibility_kw = available_flexibility_w / 1000
+            available_flex_explanation = build_recent_profile_available_flex_explanation(
+                asset_id,
+                skip_reason=skip_reason,
+                is_currently_active=is_currently_active,
+                current_measured_power_w=current_measured_power_w,
+                expected_power_w=expected_power_w,
+                available_flexibility_kw=available_flexibility_kw,
+                modulation_factor=modulation_factor,
+                nominal_power_w=nominal_power_w,
+                quantile=self.recent_profile_quantile,
+                lookback_minutes=self.recent_profile_lookback_minutes,
+                positive_sample_count=positive_sample_count,
+                sample_count=sample_count,
+                active_threshold_w=self.recent_profile_active_threshold_w,
+            )
 
             self.logger.info(
                 "Recent-profile flexibility asset=%s modulation=%s target_slot_utc=%s lookback_window=[%s, %s] samples=%d current=%.2f W active=%s expected_q%02d=%s W nominal=%.2f W modulation_factor=%.3f flexibility=%.2f W%s",
@@ -1603,9 +1762,25 @@ class FlexibilityForecaster:
                 "recent_profile_lookback_minutes": self.recent_profile_lookback_minutes,
                 "recent_profile_quantile": self.recent_profile_quantile,
                 "recent_profile_sample_count": sample_count,
+                "recent_profile_positive_sample_count": positive_sample_count,
+                "recent_profile_zero_sample_count": zero_sample_count,
                 "recent_profile_recent_values_summary": recent_summary,
                 "recent_profile_expected_power_w": expected_power_w,
                 "recent_profile_skip_reason": skip_reason,
+                "recent_profile_settings_source": self.recent_profile_settings_source,
+                "recent_profile_min_samples": self.recent_profile_min_samples,
+                "target_slot_utc": target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "lookback_window_start_utc": lookback_start_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "lookback_window_end_utc": lookback_end_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "aggregation_resolution_minutes": self.granularity,
+                "recent_profile_quantile_reference_kw": (
+                    (expected_power_w or 0.0) / 1000
+                ),
+                "recent_profile_available_flex_explanation": available_flex_explanation,
                 "is_available_for_flexibility": bool(
                     is_currently_active and available_flexibility_w > 0
                 ),
