@@ -560,11 +560,11 @@
           "mode": "load_ratio",
           "rules": [
             {
-              "minLoadRatio": 0.70,
+              "minLoadRatio": 0.80,
               "lookbackMinutes": 45
             },
             {
-              "minLoadRatio": 0.45,
+              "minLoadRatio": 0.65,
               "lookbackMinutes": 60
             }
           ]
