@@ -551,7 +551,7 @@
         "quantile": 0.25,
         "continuousFactor": 0.5,
         "discreteFactor": 1.0,
-        "activeThresholdW": 4000,
+        "activeThresholdW": 5000,
         "minSamples": 2,
         "missingMeasurementPolicy": "skip_asset",
         "adaptiveLookback": {
