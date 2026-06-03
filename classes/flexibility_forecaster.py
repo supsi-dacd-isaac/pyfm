@@ -67,6 +67,7 @@ def resolve_recent_profile_settings(
         "missing_measurement_policy": raw.get(
             "missingMeasurementPolicy", persistence_missing_measurement_policy
         ),
+        "adaptive_lookback": raw.get("adaptiveLookback", {}),
     }
 
 
@@ -195,6 +196,33 @@ def format_recent_profile_asset_log_lines(asset_id: str, info: Dict) -> List[str
             )
         )
 
+    adaptive_enabled = info.get("recent_profile_adaptive_lookback_enabled", False)
+    adaptive_applied = info.get("recent_profile_adaptive_lookback_applied", False)
+    adaptive_parts = [
+        f"enabled={adaptive_enabled}",
+        f"applied={adaptive_applied}",
+        (
+            "default_lookback={} min".format(
+                info.get("recent_profile_default_lookback_minutes", "N/A")
+            )
+        ),
+        (
+            "effective_lookback={} min".format(
+                info.get("recent_profile_effective_lookback_minutes", lookback_minutes)
+            )
+        ),
+    ]
+    load_ratio = info.get("recent_profile_load_ratio")
+    if load_ratio is not None:
+        adaptive_parts.append(f"load_ratio={load_ratio:.3f}")
+    rule_min = info.get("recent_profile_adaptive_rule_min_load_ratio")
+    if rule_min is not None:
+        adaptive_parts.append(f"rule=minLoadRatio>={rule_min:.2f}")
+    skip_reason = info.get("recent_profile_adaptive_skip_reason")
+    if skip_reason:
+        adaptive_parts.append(f"reason={skip_reason}")
+    lines.append("  adaptive_lookback: " + ", ".join(adaptive_parts))
+
     lines.append(
         f"  {q_label}_reference={ref_kw:.2f} kW, current_power={current_kw:.2f} kW, "
         f"active={active}"
@@ -296,6 +324,7 @@ class FlexibilityForecaster:
         self.recent_profile_missing_measurement_policy = (
             self.persistence_missing_measurement_policy
         )
+        self.recent_profile_adaptive_lookback = {}
         if self.method == "recent_profile":
             self._load_recent_profile_settings(
                 resolve_recent_profile_settings(
@@ -1193,6 +1222,143 @@ class FlexibilityForecaster:
         self.recent_profile_missing_measurement_policy = settings[
             "missing_measurement_policy"
         ]
+        adaptive_lookback = settings.get("adaptive_lookback", {})
+        self.recent_profile_adaptive_lookback = (
+            adaptive_lookback if isinstance(adaptive_lookback, dict) else {}
+        )
+
+    def _is_recent_profile_continuous_asset(
+        self,
+        mapping: Dict,
+        modulation_type: str,
+    ) -> bool:
+        """Return whether adaptive recent-profile behavior may apply."""
+        asset_type = mapping.get("asset_type", mapping.get("type", ""))
+        if modulation_type == "discrete" or asset_type == "heat_pump":
+            return False
+        return modulation_type == "continuous" or asset_type == "ev_charger"
+
+    def _resolve_recent_profile_effective_lookback(
+        self,
+        asset_id: str,
+        mapping: Dict,
+        modulation_type: str,
+        nominal_power_w: float,
+        current_measured_power_w: float,
+    ) -> Dict:
+        """Resolve per-asset lookback and adaptive diagnostics for recent-profile."""
+        default_lookback = self.recent_profile_lookback_minutes
+        diagnostics = {
+            "recent_profile_default_lookback_minutes": default_lookback,
+            "recent_profile_effective_lookback_minutes": default_lookback,
+            "recent_profile_adaptive_lookback_enabled": False,
+            "recent_profile_adaptive_lookback_applied": False,
+            "recent_profile_load_ratio": None,
+            "recent_profile_adaptive_rule_min_load_ratio": None,
+            "recent_profile_adaptive_skip_reason": None,
+        }
+
+        adaptive = self.recent_profile_adaptive_lookback
+        if adaptive.get("enabled") is not True:
+            return diagnostics
+
+        diagnostics["recent_profile_adaptive_lookback_enabled"] = True
+
+        applies_to = adaptive.get("appliesTo", "continuous")
+        if applies_to != "continuous":
+            diagnostics["recent_profile_adaptive_skip_reason"] = (
+                "unsupported_applies_to"
+            )
+            return diagnostics
+
+        if adaptive.get("mode") != "load_ratio":
+            diagnostics["recent_profile_adaptive_skip_reason"] = "unsupported_mode"
+            return diagnostics
+
+        if not self._is_recent_profile_continuous_asset(mapping, modulation_type):
+            diagnostics["recent_profile_adaptive_skip_reason"] = (
+                "non_continuous_asset"
+            )
+            return diagnostics
+
+        if not np.isfinite(nominal_power_w) or nominal_power_w <= 0:
+            diagnostics["recent_profile_adaptive_skip_reason"] = (
+                "invalid_nominal_power"
+            )
+            self.logger.warning(
+                "Recent-profile adaptive lookback disabled for asset=%s: invalid nominal_power_w=%s",
+                asset_id,
+                nominal_power_w,
+            )
+            return diagnostics
+
+        if (
+            current_measured_power_w is None
+            or not np.isfinite(current_measured_power_w)
+            or current_measured_power_w < 0
+        ):
+            diagnostics["recent_profile_adaptive_skip_reason"] = (
+                "invalid_current_power"
+            )
+            self.logger.warning(
+                "Recent-profile adaptive lookback disabled for asset=%s: invalid current_power_w=%s",
+                asset_id,
+                current_measured_power_w,
+            )
+            return diagnostics
+
+        load_ratio = current_measured_power_w / nominal_power_w
+        diagnostics["recent_profile_load_ratio"] = float(load_ratio)
+
+        rules = adaptive.get("rules", [])
+        if not isinstance(rules, list):
+            diagnostics["recent_profile_adaptive_skip_reason"] = "invalid_rules"
+            return diagnostics
+
+        normalized_rules = []
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            try:
+                min_load_ratio = float(rule["minLoadRatio"])
+                lookback_minutes = int(rule["lookbackMinutes"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not np.isfinite(min_load_ratio) or lookback_minutes <= 0:
+                continue
+            normalized_rules.append((min_load_ratio, lookback_minutes))
+
+        for min_load_ratio, lookback_minutes in sorted(
+            normalized_rules,
+            key=lambda item: item[0],
+            reverse=True,
+        ):
+            if load_ratio >= min_load_ratio:
+                if (
+                    self._validate_persistence_alignment(
+                        lookback_minutes,
+                        (
+                            f"{self.recent_profile_settings_source}."
+                            "adaptiveLookback.rules.lookbackMinutes"
+                        ),
+                    )
+                    is False
+                ):
+                    diagnostics["recent_profile_adaptive_skip_reason"] = (
+                        "invalid_rule_lookback"
+                    )
+                    return diagnostics
+                diagnostics["recent_profile_effective_lookback_minutes"] = (
+                    lookback_minutes
+                )
+                diagnostics["recent_profile_adaptive_lookback_applied"] = True
+                diagnostics["recent_profile_adaptive_rule_min_load_ratio"] = (
+                    min_load_ratio
+                )
+                return diagnostics
+
+        diagnostics["recent_profile_adaptive_skip_reason"] = "no_rule_matched"
+        return diagnostics
 
     def _validate_persistence_alignment(
         self,
@@ -1551,9 +1717,6 @@ class FlexibilityForecaster:
         target_slot_utc = pd.Timestamp(period_from, tz="UTC")
 
         lookback_end_utc = pd.Timestamp(current_time_utc, tz="UTC")
-        lookback_start_utc = lookback_end_utc - pd.Timedelta(
-            minutes=self.recent_profile_lookback_minutes
-        )
 
         for asset_id in selected_asset_ids:
             mapping = self.asset_mapping.get(asset_id, {})
@@ -1565,13 +1728,25 @@ class FlexibilityForecaster:
                 continue
 
             nominal_power_w = mapping.get("nominal_power_w")
+            if nominal_power_w is None and mapping.get("nominal_power_kw") is not None:
+                nominal_power_w = mapping["nominal_power_kw"]
             if nominal_power_w is None:
                 self.logger.warning(
                     "Skipping recent-profile flexibility for %s: nominal_power_w is not configured",
                     asset_id,
                 )
                 continue
-            nominal_power_w = float(nominal_power_w)
+            try:
+                nominal_power_w = float(nominal_power_w)
+                if "nominal_power_w" not in mapping and "nominal_power_kw" in mapping:
+                    nominal_power_w *= 1000
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for %s: nominal_power_w=%s is invalid",
+                    asset_id,
+                    nominal_power_w,
+                )
+                continue
 
             modulation_type = self._get_modulation_type(asset_id)
             if modulation_type not in ("continuous", "discrete"):
@@ -1584,26 +1759,9 @@ class FlexibilityForecaster:
             asset_type = mapping.get("type", "unknown")
             description = self.asset_descriptions.get(asset_id, asset_id)
 
-            # Pull the recent 15-min grouped series for the lookback window.
-            recent_series = self._query_grouped_asset_series(
-                asset_id=asset_id,
-                start_time_utc=lookback_start_utc.to_pydatetime(),
-                end_time_utc=lookback_end_utc.to_pydatetime(),
-            )
-            if recent_series is None:
-                self.logger.warning(
-                    "Skipping recent-profile flexibility for asset=%s target_slot=%s: query failed",
-                    asset_id,
-                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                )
-                if (
-                    self.recent_profile_missing_measurement_policy
-                    == "fail_portfolio"
-                ):
-                    return {}
-                continue
-
-            # Current-power gate (max age policy reused from persistence).
+            # Current-power gate (max age policy reused from persistence). The
+            # adaptive lookback, when enabled, is selected from this same
+            # current measurement before querying the recent profile window.
             (
                 gate_measurement_time_utc,
                 current_measured_power_w,
@@ -1637,7 +1795,85 @@ class FlexibilityForecaster:
                 )
                 continue
 
-            current_measured_power_w = float(current_measured_power_w)
+            try:
+                current_measured_power_w = float(current_measured_power_w)
+            except (TypeError, ValueError):
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for asset=%s target_slot=%s: current gate measurement is invalid (%s)",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    current_measured_power_w,
+                )
+                continue
+            adaptive_lookback_info = self._resolve_recent_profile_effective_lookback(
+                asset_id=asset_id,
+                mapping=mapping,
+                modulation_type=modulation_type,
+                nominal_power_w=nominal_power_w,
+                current_measured_power_w=current_measured_power_w,
+            )
+            effective_lookback_minutes = adaptive_lookback_info[
+                "recent_profile_effective_lookback_minutes"
+            ]
+            lookback_start_utc = lookback_end_utc - pd.Timedelta(
+                minutes=effective_lookback_minutes
+            )
+
+            adaptive_log_parts = [
+                (
+                    "adaptive_lookback: enabled=%s"
+                    % adaptive_lookback_info[
+                        "recent_profile_adaptive_lookback_enabled"
+                    ]
+                ),
+                (
+                    "applied=%s"
+                    % adaptive_lookback_info[
+                        "recent_profile_adaptive_lookback_applied"
+                    ]
+                ),
+            ]
+            load_ratio = adaptive_lookback_info.get("recent_profile_load_ratio")
+            if load_ratio is not None:
+                adaptive_log_parts.append(f"load_ratio={load_ratio:.3f}")
+            adaptive_log_parts.extend(
+                [
+                    f"default_lookback={self.recent_profile_lookback_minutes} min",
+                    f"effective_lookback={effective_lookback_minutes} min",
+                ]
+            )
+            rule_min = adaptive_lookback_info.get(
+                "recent_profile_adaptive_rule_min_load_ratio"
+            )
+            if rule_min is not None:
+                adaptive_log_parts.append(f"rule=minLoadRatio>={rule_min:.2f}")
+            skip_reason = adaptive_lookback_info.get(
+                "recent_profile_adaptive_skip_reason"
+            )
+            if skip_reason:
+                adaptive_log_parts.append(f"reason={skip_reason}")
+            self.logger.info(", ".join(adaptive_log_parts))
+
+            # Pull the recent 15-min grouped series for the effective lookback
+            # window selected for this asset.
+            recent_series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=lookback_start_utc.to_pydatetime(),
+                end_time_utc=lookback_end_utc.to_pydatetime(),
+            )
+            if recent_series is None:
+                self.logger.warning(
+                    "Skipping recent-profile flexibility for asset=%s target_slot=%s: query failed",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                if (
+                    self.recent_profile_missing_measurement_policy
+                    == "fail_portfolio"
+                ):
+                    return {}
+                continue
+
             is_currently_active = (
                 current_measured_power_w > self.recent_profile_active_threshold_w
             )
@@ -1700,7 +1936,7 @@ class FlexibilityForecaster:
                 modulation_factor=modulation_factor,
                 nominal_power_w=nominal_power_w,
                 quantile=self.recent_profile_quantile,
-                lookback_minutes=self.recent_profile_lookback_minutes,
+                lookback_minutes=effective_lookback_minutes,
                 positive_sample_count=positive_sample_count,
                 sample_count=sample_count,
                 active_threshold_w=self.recent_profile_active_threshold_w,
@@ -1740,7 +1976,7 @@ class FlexibilityForecaster:
                     "%Y-%m-%dT%H:%M:%SZ"
                 ),
                 "flexibility_persistence_go_back_minutes": (
-                    self.recent_profile_lookback_minutes
+                    effective_lookback_minutes
                 ),
                 "current_measured_power_w": current_measured_power_w,
                 "gate_measurement_time_utc": gate_measurement_time_utc.strftime(
@@ -1759,7 +1995,8 @@ class FlexibilityForecaster:
                 # Recent-profile-specific diagnostics:
                 "estimation_method": "recent_profile",
                 "modulation_type": modulation_type,
-                "recent_profile_lookback_minutes": self.recent_profile_lookback_minutes,
+                "recent_profile_lookback_minutes": effective_lookback_minutes,
+                **adaptive_lookback_info,
                 "recent_profile_quantile": self.recent_profile_quantile,
                 "recent_profile_sample_count": sample_count,
                 "recent_profile_positive_sample_count": positive_sample_count,

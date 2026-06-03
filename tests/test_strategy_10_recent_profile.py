@@ -146,8 +146,12 @@ def _install_measurements(
 ):
     current_by_asset = current_by_asset or {}
     age_minutes_by_asset = age_minutes_by_asset or {}
+    forecaster._test_query_windows = []
 
     def query(asset_id, start_time_utc, end_time_utc):
+        forecaster._test_query_windows.append(
+            (asset_id, start_time_utc, end_time_utc)
+        )
         return recent_by_asset.get(asset_id, pd.Series(dtype=float))
 
     def latest(asset_id, current_time_utc, max_age_minutes):
@@ -162,6 +166,33 @@ def _install_measurements(
 
     forecaster._query_grouped_asset_series = query
     forecaster._get_latest_grouped_measurement = latest
+
+
+def _adaptive_recent_settings(rules=None, enabled=True):
+    return {
+        "lookbackMinutes": 90,
+        "quantile": 0.25,
+        "continuousFactor": 0.5,
+        "activeThresholdW": 500,
+        "minSamples": 2,
+        "adaptiveLookback": {
+            "enabled": enabled,
+            "appliesTo": "continuous",
+            "mode": "load_ratio",
+            "rules": rules
+            if rules is not None
+            else [
+                {"minLoadRatio": 0.70, "lookbackMinutes": 45},
+                {"minLoadRatio": 0.45, "lookbackMinutes": 60},
+            ],
+        },
+    }
+
+
+def _assert_recent_profile_lookback(info, expected_minutes):
+    assert info["recent_profile_effective_lookback_minutes"] == expected_minutes
+    assert info["recent_profile_lookback_minutes"] == expected_minutes
+    assert info["flexibility_persistence_go_back_minutes"] == expected_minutes
 
 
 def test_recent_profile_uses_strategy_level_settings():
@@ -229,6 +260,177 @@ def test_recent_profile_uses_defaults_without_strategy_or_global_settings(caplog
     assert forecaster.recent_profile_active_threshold_w == pytest.approx(500)
     assert forecaster.recent_profile_min_samples == 2
     assert "using built-in defaults" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "recent_settings",
+    [
+        {"lookbackMinutes": 90, "quantile": 0.25, "minSamples": 2},
+        _adaptive_recent_settings(enabled=False),
+    ],
+)
+def test_recent_profile_adaptive_lookback_backward_compatible(recent_settings):
+    cfg = _base_cfg(
+        {"ECM63.2": _asset(nominal_power_w=11000, capacity_kw=11.0)},
+        recent_settings=recent_settings,
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {"ECM63.2": _series([8000, 9000, 10000, 10900])},
+        {"ECM63.2": 10900},
+    )
+
+    info = forecaster.get_asset_flexibility_breakdown(
+        SLOT_TIME,
+        asset_ids=["ECM63.2"],
+        current_time_utc=CURRENT_TIME,
+    )["ECM63.2"]
+
+    _assert_recent_profile_lookback(info, 90)
+    assert info["recent_profile_default_lookback_minutes"] == 90
+    assert info["recent_profile_adaptive_lookback_applied"] is False
+    assert info["recent_profile_load_ratio"] is None
+
+
+@pytest.mark.parametrize(
+    "current_power_w,expected_lookback,expected_rule,expected_applied,expected_reason",
+    [
+        (10900, 45, 0.70, True, None),
+        (5500, 60, 0.45, True, None),
+        (3600, 90, None, False, "no_rule_matched"),
+    ],
+)
+def test_recent_profile_adaptive_lookback_for_continuous_ev_load_ratio(
+    current_power_w,
+    expected_lookback,
+    expected_rule,
+    expected_applied,
+    expected_reason,
+):
+    cfg = _base_cfg(
+        {"ECM63.2": _asset(nominal_power_w=11000, capacity_kw=11.0)},
+        recent_settings=_adaptive_recent_settings(),
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {"ECM63.2": _series([4000, 7000, 9000, current_power_w])},
+        {"ECM63.2": current_power_w},
+    )
+
+    info = forecaster.get_asset_flexibility_breakdown(
+        SLOT_TIME,
+        asset_ids=["ECM63.2"],
+        current_time_utc=CURRENT_TIME,
+    )["ECM63.2"]
+
+    _assert_recent_profile_lookback(info, expected_lookback)
+    assert info["recent_profile_default_lookback_minutes"] == 90
+    assert info["recent_profile_adaptive_lookback_enabled"] is True
+    assert info["recent_profile_adaptive_lookback_applied"] is expected_applied
+    assert info["recent_profile_load_ratio"] == pytest.approx(
+        current_power_w / 11000
+    )
+    assert info["recent_profile_adaptive_rule_min_load_ratio"] == expected_rule
+    assert info["recent_profile_adaptive_skip_reason"] == expected_reason
+
+    asset_id, start_time, end_time = forecaster._test_query_windows[-1]
+    assert asset_id == "ECM63.2"
+    assert (end_time - start_time).total_seconds() / 60 == expected_lookback
+
+
+def test_recent_profile_adaptive_lookback_skips_discrete_heat_pump():
+    cfg = _base_cfg(
+        {
+            "HP": _asset(
+                asset_type="heat_pump",
+                modulation_type="discrete",
+                nominal_power_w=11000,
+                capacity_kw=11.0,
+            )
+        },
+        recent_settings=_adaptive_recent_settings(),
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {"HP": _series([9000, 10000, 11000, 11000])},
+        {"HP": 10900},
+    )
+
+    info = forecaster.get_asset_flexibility_breakdown(
+        SLOT_TIME,
+        asset_ids=["HP"],
+        current_time_utc=CURRENT_TIME,
+    )["HP"]
+
+    _assert_recent_profile_lookback(info, 90)
+    assert info["recent_profile_adaptive_lookback_enabled"] is True
+    assert info["recent_profile_adaptive_lookback_applied"] is False
+    assert info["recent_profile_load_ratio"] is None
+    assert (
+        info["recent_profile_adaptive_skip_reason"]
+        == "non_continuous_asset"
+    )
+
+
+def test_recent_profile_adaptive_lookback_invalid_nominal_power_uses_default(caplog):
+    cfg = _base_cfg(
+        {"ECM63.2": _asset(nominal_power_w=0, capacity_kw=11.0)},
+        recent_settings=_adaptive_recent_settings(),
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {"ECM63.2": _series([4000, 7000, 9000, 10900])},
+        {"ECM63.2": 10900},
+    )
+
+    with caplog.at_level(logging.WARNING):
+        info = forecaster.get_asset_flexibility_breakdown(
+            SLOT_TIME,
+            asset_ids=["ECM63.2"],
+            current_time_utc=CURRENT_TIME,
+        )["ECM63.2"]
+
+    _assert_recent_profile_lookback(info, 90)
+    assert info["recent_profile_adaptive_lookback_applied"] is False
+    assert info["recent_profile_load_ratio"] is None
+    assert (
+        info["recent_profile_adaptive_skip_reason"]
+        == "invalid_nominal_power"
+    )
+    assert "invalid nominal_power_w=0.0" in caplog.text
+
+
+def test_recent_profile_adaptive_lookback_sorts_rules_descending():
+    cfg = _base_cfg(
+        {"ECM63.2": _asset(nominal_power_w=11000, capacity_kw=11.0)},
+        recent_settings=_adaptive_recent_settings(
+            rules=[
+                {"minLoadRatio": 0.45, "lookbackMinutes": 60},
+                {"minLoadRatio": 0.70, "lookbackMinutes": 45},
+            ]
+        ),
+    )
+    forecaster = _forecaster(cfg)
+    _install_measurements(
+        forecaster,
+        {"ECM63.2": _series([8000, 9000, 10000, 10900])},
+        {"ECM63.2": 10900},
+    )
+
+    info = forecaster.get_asset_flexibility_breakdown(
+        SLOT_TIME,
+        asset_ids=["ECM63.2"],
+        current_time_utc=CURRENT_TIME,
+    )["ECM63.2"]
+
+    _assert_recent_profile_lookback(info, 45)
+    assert info["recent_profile_adaptive_rule_min_load_ratio"] == pytest.approx(
+        0.70
+    )
 
 
 def test_active_ev_charger_uses_q25_recent_profile_and_continuous_factor():
@@ -597,6 +799,10 @@ def test_recent_profile_breakdown_includes_logging_metadata():
     assert info["lookback_window_end_utc"] == "2026-05-26T10:00:00Z"
     assert info["aggregation_resolution_minutes"] == 15
     assert info["recent_profile_min_samples"] == 2
+    assert info["recent_profile_default_lookback_minutes"] == 120
+    assert info["recent_profile_effective_lookback_minutes"] == 120
+    assert info["recent_profile_adaptive_lookback_enabled"] is False
+    assert info["recent_profile_adaptive_lookback_applied"] is False
     assert "available_flex_kw = 0.500 × 7.00 = 3.50 kW" in info[
         "recent_profile_available_flex_explanation"
     ]

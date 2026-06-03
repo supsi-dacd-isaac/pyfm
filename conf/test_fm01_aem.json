@@ -553,7 +553,22 @@
         "discreteFactor": 1.0,
         "activeThresholdW": 500,
         "minSamples": 2,
-        "missingMeasurementPolicy": "skip_asset"
+        "missingMeasurementPolicy": "skip_asset",
+        "adaptiveLookback": {
+          "enabled": true,
+          "appliesTo": "continuous",
+          "mode": "load_ratio",
+          "rules": [
+            {
+              "minLoadRatio": 0.70,
+              "lookbackMinutes": 45
+            },
+            {
+              "minLoadRatio": 0.45,
+              "lookbackMinutes": 60
+            }
+          ]
+        }
       },
       "time_slots": [
         {"name": "Morning Peak", "start": "06:30", "end": "09:00", "flexibility_mw": 0.011, "bid_price": 7.5, "activation_cost": 2.5},
