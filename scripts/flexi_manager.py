@@ -3411,16 +3411,27 @@ class FlexibilityManager:
         bid_reference_power_kw: Optional[float],
         bid_reference_source: Optional[str],
         activation_current_cfg: Dict,
+        is_continuation: bool = False,
     ):
         """Resolve activation-time current power for a recent_profile_baseline continuous EV asset.
 
+        When *is_continuation* is True the asset was controlled in the immediately
+        previous slot.  The measured current may already reflect the previous
+        command limit so the ``current_power < allocated_curtailment`` skip is
+        bypassed and ``bid_reference_power_kw`` is returned as the activation
+        reference instead.  The active-threshold check is still enforced because
+        a very low reading may indicate the EV has disconnected.
+
         Returns:
-            float: activation_current_power_kw if valid measurement found and activation should proceed.
+            float: activation_current_power_kw (or bid_reference_power_kw for
+                   continuation) if activation should proceed.
             str: skip_reason if activation should be skipped (fail-closed).
         """
         max_age_minutes = activation_current_cfg["max_measurement_age_minutes"]
         active_threshold_w = activation_current_cfg["active_threshold_w"]
         active_threshold_kw = active_threshold_w / 1000.0
+
+        bid_ref_str = "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A"
 
         if self.activation_measurement_provider is None:
             reason = (
@@ -3433,10 +3444,11 @@ class FlexibilityManager:
                 "  bid_reference_power_kw=%s\n"
                 "  bid_reference_source=%s\n"
                 "  activation_current_power_kw=N/A\n"
+                "  is_continuation=%s\n"
                 "  decision=%s",
                 asset_id, curtailment_kw,
-                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
-                bid_reference_source, reason,
+                bid_ref_str, bid_reference_source,
+                is_continuation, reason,
             )
             return reason
 
@@ -3459,10 +3471,11 @@ class FlexibilityManager:
                 "  bid_reference_source=%s\n"
                 "  activation_current_power_kw=N/A\n"
                 "  max_measurement_age_minutes=%d\n"
+                "  is_continuation=%s\n"
                 "  decision=%s",
                 asset_id, curtailment_kw,
-                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
-                bid_reference_source, max_age_minutes, reason,
+                bid_ref_str, bid_reference_source,
+                max_age_minutes, is_continuation, reason,
             )
             return reason
 
@@ -3485,20 +3498,24 @@ class FlexibilityManager:
                 "  activation_current_time_utc=%s\n"
                 "  activation_measurement_age_minutes=%.1f\n"
                 "  max_measurement_age_minutes=%d\n"
+                "  is_continuation=%s\n"
                 "  decision=%s",
                 asset_id, curtailment_kw,
-                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
-                bid_reference_source,
+                bid_ref_str, bid_reference_source,
                 current_power_kw, str(measurement_time_utc), age_minutes,
-                max_age_minutes, reason,
+                max_age_minutes, is_continuation, reason,
             )
             return reason
 
         if current_power_kw <= active_threshold_kw:
+            qualifier = (
+                "continuation asset appears inactive/disconnected"
+                if is_continuation
+                else "EV appears inactive for recent_profile_baseline activation"
+            )
             reason = (
                 f"skipped: current power {current_power_kw:.3f} kW at or below "
-                f"active threshold {active_threshold_kw:.3f} kW; "
-                f"EV appears inactive for recent_profile_baseline activation"
+                f"active threshold {active_threshold_kw:.3f} kW; {qualifier}"
             )
             self.logger.warning(
                 "Continuous activation reference decision for %s:\n"
@@ -3509,14 +3526,39 @@ class FlexibilityManager:
                 "  activation_current_time_utc=%s\n"
                 "  activation_measurement_age_minutes=%.1f\n"
                 "  active_threshold_kw=%.3f\n"
+                "  is_continuation=%s\n"
                 "  decision=%s",
                 asset_id, curtailment_kw,
-                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
-                bid_reference_source,
+                bid_ref_str, bid_reference_source,
                 current_power_kw, str(measurement_time_utc), age_minutes,
-                active_threshold_kw, reason,
+                active_threshold_kw, is_continuation, reason,
             )
             return reason
+
+        # --- Consecutive-slot continuation ---
+        if is_continuation:
+            continuation_ref = bid_reference_power_kw
+            continuation_target = max(0.0, continuation_ref - curtailment_kw)
+            self.logger.info(
+                "Consecutive activation continuation for %s:\n"
+                "  bid_reference_power_kw=%.3f\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  activation_current_power_kw=%.3f\n"
+                "  activation_current_time_utc=%s\n"
+                "  activation_measurement_age_minutes=%.1f\n"
+                "  active_threshold_kw=%.3f\n"
+                "  decision=continuing previous control; "
+                "activation current may be control-affected\n"
+                "  continuation_reference_kw=%.3f\n"
+                "  target_power_kw=%.3f\n"
+                "  restore_suppressed=True",
+                asset_id,
+                bid_reference_power_kw, curtailment_kw,
+                current_power_kw, str(measurement_time_utc), age_minutes,
+                active_threshold_kw,
+                continuation_ref, continuation_target,
+            )
+            return continuation_ref
 
         if current_power_kw < curtailment_kw:
             reason = (
@@ -3535,8 +3577,7 @@ class FlexibilityManager:
                 "  active_threshold_kw=%.3f\n"
                 "  decision=%s",
                 asset_id, curtailment_kw,
-                "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
-                bid_reference_source,
+                bid_ref_str, bid_reference_source,
                 current_power_kw, str(measurement_time_utc), age_minutes,
                 active_threshold_kw, reason,
             )
@@ -3555,8 +3596,7 @@ class FlexibilityManager:
             "  target_power_kw=%.3f\n"
             "  decision=used activation current power for recent_profile_baseline continuous EV",
             asset_id, curtailment_kw,
-            "%.3f" % bid_reference_power_kw if bid_reference_power_kw else "N/A",
-            bid_reference_source,
+            bid_ref_str, bid_reference_source,
             current_power_kw, str(measurement_time_utc), age_minutes,
             active_threshold_kw, current_power_kw,
             max(0.0, current_power_kw - curtailment_kw),
@@ -4324,6 +4364,7 @@ class FlexibilityManager:
         deliverable_allocated = 0.0
 
         activation_current_cfg = _resolve_activation_current_config(strategy_obj, self.config)
+        current_slot_start_str = _format_aem_utc(slot_start)
 
         for asset_id, curtailment_kw in allocations.items():
             mod_type = self._get_activation_modulation_type(asset_id)
@@ -4346,12 +4387,29 @@ class FlexibilityManager:
                 asset_config = self.asset_mapping.get(asset_id, {})
                 asset_type = asset_config.get("type", "unknown")
                 if asset_type == "ev_charger":
+                    is_continuation = (
+                        asset_id in previous_state
+                        and previous_state[asset_id].get("slot_end") == current_slot_start_str
+                    )
+                    bid_ref_valid = (
+                        bid_reference_power_kw is not None
+                        and math.isfinite(bid_reference_power_kw)
+                        and bid_reference_power_kw > 0
+                    )
+                    if is_continuation and not bid_ref_valid:
+                        is_continuation = False
+                        self.logger.warning(
+                            "Consecutive-slot continuation disabled for %s: "
+                            "bid_reference_power_kw=%s is invalid",
+                            asset_id, bid_reference_power_kw,
+                        )
                     skip_reason = self._resolve_recent_profile_activation_current(
                         asset_id=asset_id,
                         curtailment_kw=curtailment_kw,
                         bid_reference_power_kw=bid_reference_power_kw,
                         bid_reference_source=bid_reference_source,
                         activation_current_cfg=activation_current_cfg,
+                        is_continuation=is_continuation,
                     )
                     if isinstance(skip_reason, str):
                         result = {
@@ -4445,10 +4503,16 @@ class FlexibilityManager:
         new_state = {}
         for asset_id in current_curtailed:
             ac = self.asset_mapping.get(asset_id, {})
+            cr = summary["control_results"].get(asset_id, {})
             new_state[asset_id] = {
                 "asset_type": ac.get("type", "unknown"),
                 "slot_start": _format_aem_utc(slot_start),
                 "slot_end": _format_aem_utc(slot_end),
+                "target_power_kw": cr.get("target_power_kw"),
+                "allocated_curtailment_kw": cr.get("allocated_curtailment_kw"),
+                "reference_power_kw": cr.get("reference_power_kw"),
+                "reference_power_source": cr.get("reference_power_source"),
+                "strategy_id": strategy_info.get("id") if strategy_info else None,
             }
         self._save_controlled_state(new_state)
         
