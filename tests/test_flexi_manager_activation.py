@@ -1373,3 +1373,683 @@ def test_activation_current_valid_measurement_produces_correct_target(tmp_path):
     assert result["activation_current_power_kw"] == pytest.approx(11.0)
     assert result["reference_power_kw"] == pytest.approx(3.59)
     assert result["target_power_kw"] != pytest.approx(1.88, abs=0.1)
+
+
+# =============================================================================
+# CONSECUTIVE-SLOT EV ACTIVATION CONTINUATION TESTS
+# =============================================================================
+
+
+def _write_previous_state(state_file, state_dict):
+    """Write a controlled-state JSON file to simulate a previous run."""
+    import json
+    with open(state_file, "w") as fh:
+        json.dump(state_dict, fh)
+
+
+def _new_continuation_manager(
+    tmp_path,
+    previous_state=None,
+    measurement_data=None,
+    bid_reference_power_kw=10.3645,
+    allocated_flexibility_kw=5.0,
+    slot_override="2026-06-05T13:00:00Z",
+    simulate_sold_mw=0.005,
+    strategy_id="strategy_10",
+    reference_power_source="recent_profile_baseline",
+    asset_id="ECM63.1",
+):
+    """Create a FlexibilityManager wired for consecutive-slot continuation tests."""
+    import pandas as pd
+
+    state_file = str(tmp_path / "state.json")
+    if previous_state is not None:
+        _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": [asset_id]}}},
+        },
+        "asset_mapping": {
+            asset_id: {
+                "type": "ev_charger",
+                "description": "EV charger 1",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev1",
+                "pod": asset_id.split(".")[0],
+            }
+        },
+        "bidding_strategies": {
+            strategy_id: _recent_profile_strategy_config(),
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+
+    if measurement_data is not None:
+        manager.activation_measurement_provider = FakeMeasurementProvider(
+            measurement_data
+        )
+    else:
+        manager.activation_measurement_provider = FakeMeasurementProvider({})
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-cont-1",
+        "total_quantity_mw": simulate_sold_mw,
+        "assets_to_activate": [
+            {
+                "asset_id": asset_id,
+                "available_flexibility_kw": allocated_flexibility_kw,
+                "reference_power_kw": bid_reference_power_kw,
+                "reference_power_source": reference_power_source,
+                "modulation_type": "continuous",
+            }
+        ],
+        "strategy": {"id": strategy_id, "name": "Recent Profile EV Strategy"},
+    }
+    manager.bid_handler = bid_handler
+    return manager, state_file
+
+
+def test_consecutive_activation_uses_bid_reference_and_suppresses_restore(tmp_path):
+    """Test B: Previously controlled + adjacent slot -> continuation target."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    measurement = {
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:45:00Z"),
+            "power_w": 4158.0,
+            "age_minutes": 14.1,
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=measurement,
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        slot_override="2026-06-05T13:00:00Z",
+        simulate_sold_mw=0.005,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped", (
+        f"Expected continuation, got skip: {result.get('skip_reason')}"
+    )
+    assert result["target_power_kw"] == pytest.approx(5.3645, abs=0.01)
+    assert result["computed_target_power_kw"] == pytest.approx(5.3645, abs=0.01)
+    assert result["selected_activation_reference_kw"] == pytest.approx(10.3645)
+    assert result["reference_power_kw"] == pytest.approx(10.3645)
+
+    assert manager.controller._pending_commands == [] or all(
+        cmd.get("command_type") != "restore"
+        for cmd in manager.controller._pending_commands
+    )
+
+    import json
+    with open(state_file) as fh:
+        saved = json.load(fh)
+    assert "ECM63.1" in saved
+    assert saved["ECM63.1"]["slot_start"] == "2026-06-05T13:00:00"
+    assert saved["ECM63.1"]["slot_end"] == "2026-06-05T13:15:00"
+
+
+def test_previously_controlled_not_selected_restores(tmp_path):
+    """Test C: Previously controlled but different asset selected -> restore."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    measurement = {
+        "ECM63.2": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 11000.0,
+            "age_minutes": 5.0,
+        }
+    }
+
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["ECM63.1", "ECM63.2"]}}},
+        },
+        "asset_mapping": {
+            "ECM63.1": {
+                "type": "ev_charger",
+                "description": "EV charger 1",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev1",
+                "pod": "ECM63",
+            },
+            "ECM63.2": {
+                "type": "ev_charger",
+                "description": "EV charger 2",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev2",
+                "pod": "ECM63",
+            },
+        },
+        "bidding_strategies": {
+            "strategy_10": _recent_profile_strategy_config(),
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider(measurement)
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-cont-2",
+        "total_quantity_mw": 0.003,
+        "assets_to_activate": [
+            {
+                "asset_id": "ECM63.2",
+                "available_flexibility_kw": 3.0,
+                "reference_power_kw": 8.0,
+                "reference_power_source": "recent_profile_baseline",
+                "modulation_type": "continuous",
+            }
+        ],
+        "strategy": {"id": "strategy_10", "name": "Recent Profile EV Strategy"},
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.003,
+    )
+
+    import json
+    with open(state_file) as fh:
+        saved = json.load(fh)
+    assert "ECM63.1" not in saved, "ECM63.1 should NOT be in controlled state (was restored)"
+    assert "ECM63.2" in saved, "ECM63.2 should be in controlled state"
+
+    result_2 = summary["control_results"]["ECM63.2"]
+    assert result_2["status"] != "skipped"
+
+
+def test_previously_controlled_no_trade_restores(tmp_path):
+    """Test D: Previously controlled + no accepted trade -> restore."""
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["ECM63.1"]}}},
+        },
+        "asset_mapping": {
+            "ECM63.1": {
+                "type": "ev_charger",
+                "description": "EV charger 1",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev1",
+                "pod": "ECM63",
+            },
+        },
+        "bidding_strategies": {
+            "strategy_10": _recent_profile_strategy_config(),
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider({})
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-cont-3",
+        "total_quantity_mw": 0.005,
+        "assets_to_activate": [
+            {
+                "asset_id": "ECM63.1",
+                "available_flexibility_kw": 5.0,
+                "reference_power_kw": 10.3645,
+                "reference_power_source": "recent_profile_baseline",
+                "modulation_type": "continuous",
+            }
+        ],
+        "strategy": {"id": "strategy_10", "name": "Recent Profile EV Strategy"},
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+    )
+
+    assert summary["status"] in ("no_trades", "no_bid_record")
+
+    import json
+    with open(state_file) as fh:
+        saved = json.load(fh)
+    assert saved == {}, "State should be empty after restore (no trades)"
+
+
+def test_previously_controlled_gap_between_slots_not_continuation(tmp_path):
+    """Test E: Gap between previous slot and current -> not continuation."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:30:00",
+            "slot_end": "2026-06-05T12:45:00",
+        }
+    }
+    measurement = {
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 4158.0,
+            "age_minutes": 5.0,
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=measurement,
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        slot_override="2026-06-05T13:00:00Z",
+        simulate_sold_mw=0.005,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "below allocated curtailment" in result.get("skip_reason", "")
+
+
+def test_continuation_current_below_active_threshold_skips(tmp_path):
+    """Test F: Continuation + current below active threshold -> skip/restore."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    measurement = {
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 1000.0,
+            "age_minutes": 5.0,
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=measurement,
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        slot_override="2026-06-05T13:00:00Z",
+        simulate_sold_mw=0.005,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "active threshold" in result.get("skip_reason", "") or \
+           "inactive" in result.get("skip_reason", "") or \
+           "disconnected" in result.get("skip_reason", "")
+
+
+def test_continuation_missing_measurement_skips(tmp_path):
+    """Test G: Continuation + no measurement data -> skip/fail closed."""
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data={},
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        slot_override="2026-06-05T13:00:00Z",
+        simulate_sold_mw=0.005,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "no valid current measurement" in result.get("skip_reason", "")
+
+
+def test_strategy9_unchanged_by_continuation_logic(tmp_path):
+    """Test H: Strategy 9 / persistence_baseline is NOT affected by continuation."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": {
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    measurement = {
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 4158.0,
+            "age_minutes": 5.0,
+        }
+    }
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["ECM63.1"]}}},
+        },
+        "asset_mapping": {
+            "ECM63.1": {
+                "type": "ev_charger",
+                "description": "EV charger 1",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev1",
+                "pod": "ECM63",
+            },
+        },
+        "bidding_strategies": {
+            "strategy_9": {
+                "name": "Persistence EV Strategy",
+                "description": "test persistence EV",
+                "asset_types": ["ev_charger"],
+                "assets_filter": ["ECM63.1"],
+                "flexibility_method": "persistence",
+                "time_slots": [{
+                    "name": "All day",
+                    "start": "00:00",
+                    "end": "23:59",
+                    "flexibility_mw": 0.002,
+                    "bid_price": 9.0,
+                    "activation_cost": 2.5,
+                }],
+            },
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider(measurement)
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-persistence-cont",
+        "total_quantity_mw": 0.005,
+        "assets_to_activate": [
+            {
+                "asset_id": "ECM63.1",
+                "available_flexibility_kw": 5.0,
+                "reference_power_kw": 10.3645,
+                "reference_power_source": "persistence_baseline",
+                "modulation_type": "continuous",
+            }
+        ],
+        "strategy": {"id": "strategy_9", "name": "Persistence EV Strategy"},
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    assert result["computed_target_power_kw"] == pytest.approx(5.3645, abs=0.01)
+    assert result.get("activation_current_power_kw") is None
+    assert result["reference_power_kw"] == pytest.approx(10.3645)
+
+
+def test_discrete_hp_unchanged_by_continuation_logic(tmp_path):
+    """Test I: Discrete HP is NOT affected by continuation logic."""
+    import pandas as pd
+
+    previous_state = {
+        "HP1": {
+            "asset_type": "heat_pump",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+        }
+    }
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["HP1"]}}},
+        },
+        "asset_mapping": {
+            "HP1": {
+                "type": "heat_pump",
+                "description": "test heat pump",
+                "capacity_kw": 10.0,
+                "modulation_type": "discrete",
+                "discrete_states_kw": [0.0, 10.0],
+            },
+        },
+        "bidding_strategies": {
+            "strategy_8": {
+                "name": "Persistence HP Strategy",
+                "description": "test persistence",
+                "asset_types": ["heat_pump"],
+                "assets_filter": ["HP1"],
+                "flexibility_method": "persistence",
+                "time_slots": [{
+                    "name": "All day",
+                    "start": "00:00",
+                    "end": "23:59",
+                    "flexibility_mw": 0.010,
+                    "bid_price": 9.0,
+                    "activation_cost": 2.5,
+                }],
+            },
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider({})
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-hp-cont",
+        "total_quantity_mw": 0.010,
+        "assets_to_activate": [
+            {
+                "asset_id": "HP1",
+                "available_flexibility_kw": 10.0,
+                "reference_power_kw": 10.0,
+                "reference_power_source": "persistence_baseline",
+                "modulation_type": "discrete",
+            }
+        ],
+        "strategy": {
+            "id": "strategy_8",
+            "name": "Persistence HP Strategy",
+            "description": "test persistence",
+        },
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.010,
+    )
+
+    result = summary["control_results"]["HP1"]
+    assert result["status"] != "skipped"
+    assert result["discrete_state"] == "OFF"
+    assert result["target_power_kw"] == pytest.approx(0.0)
+
+
+def test_enriched_state_file_has_diagnostic_fields(tmp_path):
+    """Verify state file includes target_power_kw, reference, etc."""
+    import pandas as pd
+
+    measurement = {
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 11000.0,
+            "age_minutes": 5.0,
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=None,
+        measurement_data=measurement,
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        slot_override="2026-06-05T13:00:00Z",
+        simulate_sold_mw=0.005,
+    )
+
+    manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    import json
+    with open(state_file) as fh:
+        saved = json.load(fh)
+
+    assert "ECM63.1" in saved
+    entry = saved["ECM63.1"]
+    assert entry["slot_start"] == "2026-06-05T13:00:00"
+    assert entry["slot_end"] == "2026-06-05T13:15:00"
+    assert entry.get("target_power_kw") is not None
+    assert entry.get("allocated_curtailment_kw") is not None
+    assert entry.get("reference_power_kw") is not None
+    assert entry.get("reference_power_source") == "recent_profile_baseline"
+    assert entry.get("strategy_id") == "strategy_10"
