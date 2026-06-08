@@ -1399,6 +1399,7 @@ def _new_continuation_manager(
     reference_power_source="recent_profile_baseline",
     asset_id="ECM63.1",
     recent_profile_settings=None,
+    persistence_settings=None,
 ):
     """Create a FlexibilityManager wired for consecutive-slot continuation tests."""
     import pandas as pd
@@ -1432,6 +1433,10 @@ def _new_continuation_manager(
         },
         "autonomous": {"enabled": False},
     }
+    if persistence_settings is not None:
+        config["flexibility"] = {
+            "persistenceSettings": persistence_settings,
+        }
     manager = fm.FlexibilityManager(
         config=config,
         fsp_id="fsp1",
@@ -2385,8 +2390,8 @@ def test_comfort_H_missing_count_defaults_safely(tmp_path):
     assert saved["ECM63.1"]["consecutive_activation_slots"] == 2
 
 
-def test_comfort_I_config_override_max2_blocks_at_count2(tmp_path):
-    """I: recentProfileSettings.maxConsecutiveActivationSlots=2 blocks at prev=2."""
+def test_comfort_I_strategy_recent_profile_settings_override_blocks_and_sets_cooldown(tmp_path):
+    """I: strategy recentProfileSettings max=2/cooldown=1 override defaults."""
     previous_state = {
         "ECM63.1": _controlled_prev_entry(
             consecutive=2, control_sequence_start="2026-06-05T12:30:00"
@@ -2400,7 +2405,7 @@ def test_comfort_I_config_override_max2_blocks_at_count2(tmp_path):
         allocated_flexibility_kw=5.0,
         recent_profile_settings={
             "maxConsecutiveActivationSlots": 2,
-            "cooldownSlotsAfterMaxActivation": 2,
+            "cooldownSlotsAfterMaxActivation": 1,
         },
     )
 
@@ -2415,7 +2420,7 @@ def test_comfort_I_config_override_max2_blocks_at_count2(tmp_path):
     assert "maximum consecutive activation slots" in result.get("skip_reason", "")
     saved = _load_state(state_file)
     assert saved["ECM63.1"]["state"] == "cooldown"
-    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:30:00"
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:15:00"
 
 
 def test_comfort_J_config_override_cooldown1(tmp_path):
@@ -2446,6 +2451,104 @@ def test_comfort_J_config_override_cooldown1(tmp_path):
     saved = _load_state(state_file)
     assert saved["ECM63.1"]["state"] == "cooldown"
     # cooldown_until = 13:00 + 1 * 15min = 13:15 -> slot starting 13:15 eligible
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:15:00"
+
+
+def test_comfort_config_defaults_used_when_keys_missing(tmp_path):
+    """Missing comfort keys -> defaults max=4, cooldown=2."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=4, control_sequence_start="2026-06-05T12:00:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        recent_profile_settings=None,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "maximum consecutive activation slots" in result.get("skip_reason", "")
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    # Default cooldown=2 -> 13:00 + 2 * 15min = 13:30
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:30:00"
+
+
+def test_comfort_invalid_strategy_config_values_fall_back_to_defaults(tmp_path):
+    """Invalid strategy comfort values -> defaults max=4, cooldown=2."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=4, control_sequence_start="2026-06-05T12:00:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        recent_profile_settings={
+            "maxConsecutiveActivationSlots": "bad",
+            "cooldownSlotsAfterMaxActivation": -1,
+        },
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:30:00"
+
+
+def test_comfort_persistence_settings_fallback_used_when_strategy_keys_missing(tmp_path):
+    """flexibility.persistenceSettings fallback applies when strategy keys are absent."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=2, control_sequence_start="2026-06-05T12:30:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        recent_profile_settings=None,
+        persistence_settings={
+            "maxConsecutiveActivationSlots": 2,
+            "cooldownSlotsAfterMaxActivation": 1,
+        },
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "maximum consecutive activation slots" in result.get("skip_reason", "")
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    # persistenceSettings cooldown=1 -> 13:00 + 1 * 15min = 13:15
     assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:15:00"
 
 
