@@ -1398,6 +1398,7 @@ def _new_continuation_manager(
     strategy_id="strategy_10",
     reference_power_source="recent_profile_baseline",
     asset_id="ECM63.1",
+    recent_profile_settings=None,
 ):
     """Create a FlexibilityManager wired for consecutive-slot continuation tests."""
     import pandas as pd
@@ -1405,6 +1406,10 @@ def _new_continuation_manager(
     state_file = str(tmp_path / "state.json")
     if previous_state is not None:
         _write_previous_state(state_file, previous_state)
+
+    strategy_cfg = _recent_profile_strategy_config()
+    if recent_profile_settings is not None:
+        strategy_cfg["recentProfileSettings"] = recent_profile_settings
 
     config = {
         "fm": {
@@ -1423,7 +1428,7 @@ def _new_continuation_manager(
             }
         },
         "bidding_strategies": {
-            strategy_id: _recent_profile_strategy_config(),
+            strategy_id: strategy_cfg,
         },
         "autonomous": {"enabled": False},
     }
@@ -2053,3 +2058,770 @@ def test_enriched_state_file_has_diagnostic_fields(tmp_path):
     assert entry.get("reference_power_kw") is not None
     assert entry.get("reference_power_source") == "recent_profile_baseline"
     assert entry.get("strategy_id") == "strategy_10"
+
+
+# =============================================================================
+# EV COMFORT GUARD: MAX CONSECUTIVE SLOTS + COOLDOWN TESTS
+# =============================================================================
+
+
+def _controlled_prev_entry(
+    slot_start="2026-06-05T12:45:00",
+    slot_end="2026-06-05T13:00:00",
+    consecutive=None,
+    control_sequence_start=None,
+    strategy_id="strategy_10",
+):
+    """Build a controlled previous-state entry for comfort guard tests."""
+    entry = {
+        "state": "controlled",
+        "asset_type": "ev_charger",
+        "slot_start": slot_start,
+        "slot_end": slot_end,
+        "target_power_kw": 5.36,
+        "allocated_curtailment_kw": 5.0,
+        "reference_power_kw": 10.3645,
+        "reference_power_source": "recent_profile_baseline",
+        "strategy_id": strategy_id,
+    }
+    if consecutive is not None:
+        entry["consecutive_activation_slots"] = consecutive
+    if control_sequence_start is not None:
+        entry["control_sequence_start"] = control_sequence_start
+    return entry
+
+
+def _valid_measurement(power_w=4158.0, age_minutes=10.0):
+    import pandas as pd
+    return {
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": power_w,
+            "age_minutes": age_minutes,
+        }
+    }
+
+
+def _load_state(state_file):
+    import json
+    with open(state_file) as fh:
+        return json.load(fh)
+
+
+def test_comfort_A_new_activation_starts_sequence(tmp_path):
+    """A: New activation (no previous state) -> controlled, count=1."""
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=None,
+        measurement_data=_valid_measurement(power_w=11000.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "controlled"
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 1
+    assert saved["ECM63.1"]["control_sequence_start"] == "2026-06-05T13:00:00"
+
+
+def test_comfort_B_continuation_below_max_increments(tmp_path):
+    """B: Continuation below max -> count increments, no restore."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=2, control_sequence_start="2026-06-05T12:30:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    assert result["target_power_kw"] == pytest.approx(5.3645, abs=0.01)
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "controlled"
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 3
+    assert saved["ECM63.1"]["control_sequence_start"] == "2026-06-05T12:30:00"
+
+
+def test_comfort_C_continuation_reaching_max_allowed(tmp_path):
+    """C: Continuation reaching max (3 -> 4) still allowed."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=3, control_sequence_start="2026-06-05T12:15:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "controlled"
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 4
+
+
+def test_comfort_D_beyond_max_blocked_and_enters_cooldown(tmp_path):
+    """D: Continuation beyond max (prev=4, max=4) blocked, restored, cooldown."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=4, control_sequence_start="2026-06-05T12:00:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+    # Truthy controller publisher so restore_asset queues a restore command we
+    # can count (manager-level publisher stays None so publish step is skipped).
+    manager.controller.rabbitmq_publisher = object()
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "maximum consecutive activation slots" in result.get("skip_reason", "")
+
+    restore_cmds = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "restore" and cmd.get("asset_id") == "ECM63.1"
+    ]
+    assert len(restore_cmds) == 1, "ECM63.1 should be restored exactly once"
+
+    curtail_cmds = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "curtail" and cmd.get("asset_id") == "ECM63.1"
+    ]
+    assert curtail_cmds == [], "Blocked asset must not be curtailed"
+
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    assert saved["ECM63.1"]["cooldown_reason"] == "max_consecutive_activation_slots"
+    # cooldown_until = 13:00 + 2 * 15min = 13:30
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:30:00"
+    assert saved["ECM63.1"]["last_consecutive_activation_slots"] == 4
+
+
+def test_comfort_E_active_cooldown_blocks_without_repeated_restore(tmp_path):
+    """E: Active cooldown blocks activation, no curtail, no restore."""
+    previous_state = {
+        "ECM63.1": {
+            "state": "cooldown",
+            "asset_type": "ev_charger",
+            "cooldown_reason": "max_consecutive_activation_slots",
+            "cooldown_started_slot": "2026-06-05T13:00:00",
+            "cooldown_until_slot_start": "2026-06-05T13:30:00",
+            "cooldown_slots_after_max_activation": 2,
+            "last_control_sequence_start": "2026-06-05T12:00:00",
+            "last_consecutive_activation_slots": 4,
+            "strategy_id": "strategy_10",
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=11000.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+    manager.controller.rabbitmq_publisher = object()
+
+    # Current slot 13:15 is still inside cooldown window (until 13:30).
+    summary = manager.run(
+        slot_override="2026-06-05T13:15:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "cooldown" in result.get("skip_reason", "").lower()
+
+    restore_cmds = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "restore"
+    ]
+    assert restore_cmds == [], "No restore should be sent during active cooldown"
+    curtail_cmds = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "curtail"
+    ]
+    assert curtail_cmds == [], "No curtail should be sent during active cooldown"
+
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:30:00"
+
+
+def test_comfort_F_cooldown_expiry_allows_new_activation(tmp_path):
+    """F: Cooldown expired -> new activation, count reset to 1."""
+    previous_state = {
+        "ECM63.1": {
+            "state": "cooldown",
+            "asset_type": "ev_charger",
+            "cooldown_reason": "max_consecutive_activation_slots",
+            "cooldown_started_slot": "2026-06-05T13:00:00",
+            "cooldown_until_slot_start": "2026-06-05T13:30:00",
+            "cooldown_slots_after_max_activation": 2,
+            "last_control_sequence_start": "2026-06-05T12:00:00",
+            "last_consecutive_activation_slots": 4,
+            "strategy_id": "strategy_10",
+        }
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=11000.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+
+    # Current slot 13:30 == cooldown_until -> eligible again.
+    summary = manager.run(
+        slot_override="2026-06-05T13:30:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "controlled"
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 1
+    assert saved["ECM63.1"]["control_sequence_start"] == "2026-06-05T13:30:00"
+
+
+def test_comfort_G_gap_resets_count(tmp_path):
+    """G: Gap (non-adjacent) with high count -> treated as new activation."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            slot_start="2026-06-05T12:15:00",
+            slot_end="2026-06-05T12:30:00",  # gap before 13:00
+            consecutive=4,
+            control_sequence_start="2026-06-05T11:30:00",
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=11000.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "controlled"
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 1
+    assert saved["ECM63.1"]["control_sequence_start"] == "2026-06-05T13:00:00"
+
+
+def test_comfort_H_missing_count_defaults_safely(tmp_path):
+    """H: Adjacent controlled entry with no count -> prev treated as 1, new=2."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(consecutive=None)
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 2
+
+
+def test_comfort_I_config_override_max2_blocks_at_count2(tmp_path):
+    """I: recentProfileSettings.maxConsecutiveActivationSlots=2 blocks at prev=2."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=2, control_sequence_start="2026-06-05T12:30:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        recent_profile_settings={
+            "maxConsecutiveActivationSlots": 2,
+            "cooldownSlotsAfterMaxActivation": 2,
+        },
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped"
+    assert "maximum consecutive activation slots" in result.get("skip_reason", "")
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:30:00"
+
+
+def test_comfort_J_config_override_cooldown1(tmp_path):
+    """J: cooldownSlotsAfterMaxActivation=1 -> only current slot blocked."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=4, control_sequence_start="2026-06-05T12:00:00"
+        )
+    }
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data=_valid_measurement(power_w=4158.0),
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+        recent_profile_settings={
+            "maxConsecutiveActivationSlots": 4,
+            "cooldownSlotsAfterMaxActivation": 1,
+        },
+    )
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    # cooldown_until = 13:00 + 1 * 15min = 13:15 -> slot starting 13:15 eligible
+    assert saved["ECM63.1"]["cooldown_until_slot_start"] == "2026-06-05T13:15:00"
+
+
+def test_comfort_K_strategy9_unaffected(tmp_path):
+    """K: strategy_9 / persistence_baseline ignores comfort cap."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": {
+            "state": "controlled",
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+            "consecutive_activation_slots": 10,
+            "control_sequence_start": "2026-06-05T10:00:00",
+            "strategy_id": "strategy_9",
+        }
+    }
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["ECM63.1"]}}},
+        },
+        "asset_mapping": {
+            "ECM63.1": {
+                "type": "ev_charger",
+                "description": "EV charger 1",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev1",
+                "pod": "ECM63",
+            },
+        },
+        "bidding_strategies": {
+            "strategy_9": {
+                "name": "Persistence EV Strategy",
+                "description": "test persistence EV",
+                "asset_types": ["ev_charger"],
+                "assets_filter": ["ECM63.1"],
+                "flexibility_method": "persistence",
+                "time_slots": [{
+                    "name": "All day",
+                    "start": "00:00",
+                    "end": "23:59",
+                    "flexibility_mw": 0.002,
+                    "bid_price": 9.0,
+                    "activation_cost": 2.5,
+                }],
+            },
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider(
+        _valid_measurement(power_w=11000.0)
+    )
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-s9",
+        "total_quantity_mw": 0.005,
+        "assets_to_activate": [
+            {
+                "asset_id": "ECM63.1",
+                "available_flexibility_kw": 5.0,
+                "reference_power_kw": 10.3645,
+                "reference_power_source": "persistence_baseline",
+                "modulation_type": "continuous",
+            }
+        ],
+        "strategy": {"id": "strategy_9", "name": "Persistence EV Strategy"},
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    # strategy_9 uses bid reference directly and is not blocked by the cap
+    assert result["status"] != "skipped"
+    assert result.get("activation_current_power_kw") is None
+    saved = _load_state(state_file)
+    # No cooldown introduced; comfort fields not added for strategy_9
+    assert saved["ECM63.1"].get("state") != "cooldown"
+    assert "consecutive_activation_slots" not in saved["ECM63.1"]
+
+
+def test_comfort_L_discrete_hp_unaffected(tmp_path):
+    """L: discrete HP ignores comfort cap."""
+    previous_state = {
+        "HP1": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+            "consecutive_activation_slots": 9,
+            "strategy_id": "strategy_8",
+        }
+    }
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["HP1"]}}},
+        },
+        "asset_mapping": {
+            "HP1": {
+                "type": "heat_pump",
+                "description": "test heat pump",
+                "capacity_kw": 10.0,
+                "modulation_type": "discrete",
+                "discrete_states_kw": [0.0, 10.0],
+            },
+        },
+        "bidding_strategies": {
+            "strategy_8": {
+                "name": "Persistence HP Strategy",
+                "description": "test persistence",
+                "asset_types": ["heat_pump"],
+                "assets_filter": ["HP1"],
+                "flexibility_method": "persistence",
+                "time_slots": [{
+                    "name": "All day",
+                    "start": "00:00",
+                    "end": "23:59",
+                    "flexibility_mw": 0.010,
+                    "bid_price": 9.0,
+                    "activation_cost": 2.5,
+                }],
+            },
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider({})
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-hp",
+        "total_quantity_mw": 0.010,
+        "assets_to_activate": [
+            {
+                "asset_id": "HP1",
+                "available_flexibility_kw": 10.0,
+                "reference_power_kw": 10.0,
+                "reference_power_source": "persistence_baseline",
+                "modulation_type": "discrete",
+            }
+        ],
+        "strategy": {
+            "id": "strategy_8",
+            "name": "Persistence HP Strategy",
+            "description": "test persistence",
+        },
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.010,
+    )
+
+    result = summary["control_results"]["HP1"]
+    assert result["status"] != "skipped"
+    assert result["discrete_state"] == "OFF"
+    saved = _load_state(state_file)
+    assert saved["HP1"].get("state") != "cooldown"
+
+
+def test_comfort_M_separate_assets_tracked_independently(tmp_path):
+    """M: ECM63.1 (count=4) blocked, ECM63.2 (count=1) continues; no contamination."""
+    import pandas as pd
+
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=4, control_sequence_start="2026-06-05T12:00:00"
+        ),
+        "ECM63.2": {
+            "state": "controlled",
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+            "consecutive_activation_slots": 1,
+            "control_sequence_start": "2026-06-05T12:45:00",
+            "reference_power_kw": 8.0,
+            "reference_power_source": "recent_profile_baseline",
+            "strategy_id": "strategy_10",
+        },
+    }
+    state_file = str(tmp_path / "state.json")
+    _write_previous_state(state_file, previous_state)
+
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {"fsps": {"fsp1": {"name": "FSP1", "assets": ["ECM63.1", "ECM63.2"]}}},
+        },
+        "asset_mapping": {
+            "ECM63.1": {
+                "type": "ev_charger",
+                "description": "EV charger 1",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev1",
+                "pod": "ECM63",
+            },
+            "ECM63.2": {
+                "type": "ev_charger",
+                "description": "EV charger 2",
+                "capacity_kw": 11.0,
+                "min_power_kw": 0.0,
+                "modulation_type": "continuous",
+                "device_name_tag": "ev2",
+                "pod": "ECM63",
+            },
+        },
+        "bidding_strategies": {
+            "strategy_10": _recent_profile_strategy_config(),
+        },
+        "autonomous": {"enabled": False},
+    }
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="fsp1",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=None,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-1"
+    manager.market_handler = FakeMarketHandler([])
+    manager.activation_measurement_provider = FakeMeasurementProvider({
+        "ECM63.1": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 4158.0,
+            "age_minutes": 10.0,
+        },
+        "ECM63.2": {
+            "valid": True,
+            "timestamp_utc": pd.Timestamp("2026-06-05T12:55:00Z"),
+            "power_w": 4158.0,
+            "age_minutes": 10.0,
+        },
+    })
+    manager.controller.rabbitmq_publisher = object()
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-multi",
+        "total_quantity_mw": 0.008,
+        "assets_to_activate": [
+            {
+                "asset_id": "ECM63.1",
+                "available_flexibility_kw": 5.0,
+                "reference_power_kw": 10.3645,
+                "reference_power_source": "recent_profile_baseline",
+                "modulation_type": "continuous",
+            },
+            {
+                "asset_id": "ECM63.2",
+                "available_flexibility_kw": 3.0,
+                "reference_power_kw": 8.0,
+                "reference_power_source": "recent_profile_baseline",
+                "modulation_type": "continuous",
+            },
+        ],
+        "strategy": {"id": "strategy_10", "name": "Recent Profile EV Strategy"},
+    }
+    manager.bid_handler = bid_handler
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.008,
+    )
+
+    r1 = summary["control_results"]["ECM63.1"]
+    r2 = summary["control_results"]["ECM63.2"]
+    assert r1["status"] == "skipped"
+    assert "maximum consecutive activation slots" in r1.get("skip_reason", "")
+    assert r2["status"] != "skipped"
+
+    restore_1 = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "restore" and cmd.get("asset_id") == "ECM63.1"
+    ]
+    assert len(restore_1) == 1
+    restore_2 = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "restore" and cmd.get("asset_id") == "ECM63.2"
+    ]
+    assert restore_2 == []
+
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "cooldown"
+    assert saved["ECM63.2"]["state"] == "controlled"
+    assert saved["ECM63.2"]["consecutive_activation_slots"] == 2
+
+
+def test_comfort_N_existing_continuation_still_works(tmp_path):
+    """N: Observed case continuation below max -> target 5.3645, no restore."""
+    previous_state = {
+        "ECM63.1": _controlled_prev_entry(
+            consecutive=1, control_sequence_start="2026-06-05T12:45:00"
+        )
+    }
+    import pandas as pd
+    manager, state_file = _new_continuation_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_data={
+            "ECM63.1": {
+                "valid": True,
+                "timestamp_utc": pd.Timestamp("2026-06-05T12:45:00Z"),
+                "power_w": 4158.0,
+                "age_minutes": 14.1,
+            }
+        },
+        bid_reference_power_kw=10.3645,
+        allocated_flexibility_kw=5.0,
+    )
+    manager.controller.rabbitmq_publisher = object()
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] != "skipped"
+    assert result["target_power_kw"] == pytest.approx(5.3645, abs=0.01)
+    restore_cmds = [
+        cmd for cmd in manager.controller._pending_commands
+        if cmd.get("command_type") == "restore"
+    ]
+    assert restore_cmds == []
+    saved = _load_state(state_file)
+    assert saved["ECM63.1"]["state"] == "controlled"
+    assert saved["ECM63.1"]["consecutive_activation_slots"] == 2
