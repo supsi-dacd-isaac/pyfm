@@ -137,6 +137,16 @@ ACTIVATION_CURRENT_DEFAULTS = {
 }
 
 
+EV_COMFORT_GUARD_DEFAULTS = {
+    # Maximum number of consecutive 15-minute slots a strategy_10 recent-profile
+    # EV may stay under control before a mandatory cooldown is enforced.
+    "max_consecutive_activation_slots": 4,
+    # Number of slots the EV is released (cooldown) once the maximum consecutive
+    # activation cap is reached.
+    "cooldown_slots_after_max_activation": 2,
+}
+
+
 class ActivationMeasurementProvider:
     """Minimal provider that queries latest power measurement for an asset at activation time.
 
@@ -255,6 +265,52 @@ def _resolve_activation_current_config(strategy_obj, config: dict) -> Dict:
     return {
         "max_measurement_age_minutes": int(max_age),
         "active_threshold_w": active_threshold_w,
+    }
+
+
+def _resolve_ev_comfort_guard_config(strategy_obj, config: dict) -> Dict:
+    """Resolve the strategy_10 recent-profile EV comfort guard configuration.
+
+    Resolution priority for each setting:
+        1. strategy.recentProfileSettings.<key>
+        2. flexibility.persistenceSettings.<key>
+        3. EV_COMFORT_GUARD_DEFAULTS
+
+    ``maxConsecutiveActivationSlots`` must be a positive integer (>= 1).
+    ``cooldownSlotsAfterMaxActivation`` must be a non-negative integer (>= 0).
+    Invalid or missing values fall back to the defaults.
+    """
+    strategy_config = strategy_obj.config if strategy_obj else {}
+    rps = strategy_config.get("recentProfileSettings", {}) or {}
+    persistence_cfg = config.get("flexibility", {}).get("persistenceSettings", {}) or {}
+
+    def _resolve_int(key: str, default: int, minimum: int) -> int:
+        for source in (rps, persistence_cfg):
+            if not isinstance(source, dict):
+                continue
+            if key in source and source.get(key) is not None:
+                try:
+                    value = int(source.get(key))
+                except (TypeError, ValueError):
+                    continue
+                if value >= minimum:
+                    return value
+        return default
+
+    max_slots = _resolve_int(
+        "maxConsecutiveActivationSlots",
+        EV_COMFORT_GUARD_DEFAULTS["max_consecutive_activation_slots"],
+        minimum=1,
+    )
+    cooldown_slots = _resolve_int(
+        "cooldownSlotsAfterMaxActivation",
+        EV_COMFORT_GUARD_DEFAULTS["cooldown_slots_after_max_activation"],
+        minimum=0,
+    )
+
+    return {
+        "max_consecutive_activation_slots": max_slots,
+        "cooldown_slots_after_max_activation": cooldown_slots,
     }
 
 
@@ -1944,6 +2000,25 @@ def _format_aem_utc(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
 
 
+def _parse_aem_utc(value) -> Optional[datetime]:
+    """Parse a naive UTC ISO string (as produced by ``_format_aem_utc``).
+
+    Returns a naive UTC ``datetime`` or ``None`` if the value is missing or
+    cannot be parsed.
+    """
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None) if value.tzinfo else value
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
 def _build_ev_schedule(
     slot_start: datetime,
     slot_end: datetime,
@@ -3138,11 +3213,19 @@ class FlexibilityManager:
         dry_run: bool,
     ) -> None:
         """Queue restore commands for assets that were previously controlled
-        but are *not* selected for curtailment in the current slot."""
+        but are *not* selected for curtailment in the current slot.
+
+        Assets whose stored ``state`` is ``"cooldown"`` are skipped: they have
+        already been restored when the cooldown began and must not be restored
+        again on every cooldown slot.  Entries without a ``state`` field are
+        treated as ``"controlled"`` for backward compatibility.
+        """
         for asset_id, meta in previous_state.items():
             if asset_id in current_curtailed:
                 continue
-            slot_str = meta.get("slot_start", "?")
+            if isinstance(meta, dict) and meta.get("state") == "cooldown":
+                continue
+            slot_str = meta.get("slot_start", "?") if isinstance(meta, dict) else "?"
             self.logger.info(
                 "Restoring previously controlled asset %s (last slot=%s)",
                 asset_id, slot_str,
@@ -3403,6 +3486,35 @@ class FlexibilityManager:
 
         asset_type = asset_config.get("type", "")
         return "discrete" if asset_type == "heat_pump" else "continuous"
+
+    def _build_ev_skip_result(
+        self,
+        asset_id: str,
+        asset_config: Dict,
+        mod_type: str,
+        curtailment_kw: float,
+        bid_reference_power_kw: Optional[float],
+        bid_reference_source: Optional[str],
+        skip_reason: str,
+    ) -> Dict:
+        """Build a uniform skipped control-result dict for a recent-profile EV asset."""
+        return {
+            "asset_id": asset_id,
+            "description": asset_config.get("description", asset_id),
+            "asset_type": asset_config.get("type", "unknown"),
+            "modulation_type": mod_type,
+            "requested_curtailment_kw": curtailment_kw,
+            "actual_curtailment_kw": 0.0,
+            "target_power_kw": None,
+            "computed_target_power_kw": None,
+            "reference_power_kw": bid_reference_power_kw,
+            "reference_power_source": bid_reference_source,
+            "status": "skipped",
+            "skip_activation": True,
+            "skip_reason": skip_reason,
+            "message": skip_reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     def _resolve_recent_profile_activation_current(
         self,
@@ -4364,7 +4476,18 @@ class FlexibilityManager:
         deliverable_allocated = 0.0
 
         activation_current_cfg = _resolve_activation_current_config(strategy_obj, self.config)
+        ev_comfort_cfg = _resolve_ev_comfort_guard_config(strategy_obj, self.config)
         current_slot_start_str = _format_aem_utc(slot_start)
+        slot_duration = slot_end - slot_start
+        # Per-asset comfort-guard bookkeeping for this run.
+        ev_activation_meta = {}      # controlled EV -> {consecutive_activation_slots, control_sequence_start}
+        newly_blocked_cooldown = {}  # EV blocked by the cap this slot -> cooldown state entry
+        self.logger.info(
+            "Strategy_10 EV comfort guard config: "
+            "max_consecutive_activation_slots=%d, cooldown_slots_after_max_activation=%d",
+            ev_comfort_cfg["max_consecutive_activation_slots"],
+            ev_comfort_cfg["cooldown_slots_after_max_activation"],
+        )
 
         for asset_id, curtailment_kw in allocations.items():
             mod_type = self._get_activation_modulation_type(asset_id)
@@ -4387,10 +4510,58 @@ class FlexibilityManager:
                 asset_config = self.asset_mapping.get(asset_id, {})
                 asset_type = asset_config.get("type", "unknown")
                 if asset_type == "ev_charger":
+                    prev_meta = previous_state.get(asset_id, {})
+                    if not isinstance(prev_meta, dict):
+                        prev_meta = {}
+                    # Missing "state" means a legacy controlled entry.
+                    prev_state_type = prev_meta.get("state", "controlled")
+
                     is_continuation = (
                         asset_id in previous_state
-                        and previous_state[asset_id].get("slot_end") == current_slot_start_str
+                        and prev_meta.get("slot_end") == current_slot_start_str
                     )
+
+                    max_slots = ev_comfort_cfg["max_consecutive_activation_slots"]
+                    cooldown_slots = ev_comfort_cfg["cooldown_slots_after_max_activation"]
+
+                    # --- Comfort cooldown: block while the cooldown window is open ---
+                    if prev_state_type == "cooldown":
+                        cooldown_until = _parse_aem_utc(
+                            prev_meta.get("cooldown_until_slot_start")
+                        )
+                        if cooldown_until is not None and slot_start < cooldown_until:
+                            reason = (
+                                "skipped: comfort cooldown active until "
+                                f"{prev_meta.get('cooldown_until_slot_start')}"
+                            )
+                            self.logger.info(
+                                "Strategy_10 EV activation sequence for %s:\n"
+                                "  state=cooldown\n"
+                                "  cooldown_until_slot_start=%s\n"
+                                "  current_slot_start=%s\n"
+                                "  decision=skipped: comfort cooldown active",
+                                asset_id,
+                                prev_meta.get("cooldown_until_slot_start"),
+                                current_slot_start_str,
+                            )
+                            summary["control_results"][asset_id] = self._build_ev_skip_result(
+                                asset_id, asset_config, mod_type, curtailment_kw,
+                                bid_reference_power_kw, bid_reference_source, reason,
+                            )
+                            continue
+                        # Cooldown expired -> treat as a brand new activation.
+                        self.logger.info(
+                            "Strategy_10 EV activation sequence for %s:\n"
+                            "  state=cooldown\n"
+                            "  cooldown_until_slot_start=%s\n"
+                            "  current_slot_start=%s\n"
+                            "  decision=cooldown expired; treating as new activation",
+                            asset_id,
+                            prev_meta.get("cooldown_until_slot_start"),
+                            current_slot_start_str,
+                        )
+                        is_continuation = False
+
                     bid_ref_valid = (
                         bid_reference_power_kw is not None
                         and math.isfinite(bid_reference_power_kw)
@@ -4403,6 +4574,92 @@ class FlexibilityManager:
                             "bid_reference_power_kw=%s is invalid",
                             asset_id, bid_reference_power_kw,
                         )
+
+                    # Resolve the previous consecutive-activation count.
+                    if is_continuation and prev_state_type == "controlled":
+                        prev_count = prev_meta.get("consecutive_activation_slots", 1)
+                        try:
+                            prev_count = int(prev_count)
+                        except (TypeError, ValueError):
+                            prev_count = 1
+                        if prev_count < 1:
+                            prev_count = 1
+                    else:
+                        prev_count = 0
+
+                    # --- Max consecutive activation cap ---
+                    if is_continuation and prev_count >= max_slots:
+                        cooldown_until_dt = slot_start + cooldown_slots * slot_duration
+                        cooldown_until_str = _format_aem_utc(cooldown_until_dt)
+                        last_seq_start = prev_meta.get(
+                            "control_sequence_start", prev_meta.get("slot_start")
+                        )
+                        reason = (
+                            "skipped: maximum consecutive activation slots reached "
+                            f"(previous_count={prev_count}, max={max_slots}); restoring "
+                            f"and entering cooldown until {cooldown_until_str}"
+                        )
+                        self.logger.warning(
+                            "Strategy_10 EV activation sequence for %s:\n"
+                            "  state=controlled\n"
+                            "  continuation=True\n"
+                            "  previous_consecutive_slots=%d\n"
+                            "  max_consecutive_slots=%d\n"
+                            "  cooldown_slots_after_max_activation=%d\n"
+                            "  cooldown_until_slot_start=%s\n"
+                            "  decision=skipped: maximum consecutive activation slots "
+                            "reached; restoring and entering cooldown",
+                            asset_id, prev_count, max_slots, cooldown_slots,
+                            cooldown_until_str,
+                        )
+                        newly_blocked_cooldown[asset_id] = {
+                            "state": "cooldown",
+                            "asset_type": asset_type,
+                            "cooldown_reason": "max_consecutive_activation_slots",
+                            "cooldown_started_slot": current_slot_start_str,
+                            "cooldown_until_slot_start": cooldown_until_str,
+                            "cooldown_slots_after_max_activation": cooldown_slots,
+                            "last_control_sequence_start": last_seq_start,
+                            "last_consecutive_activation_slots": prev_count,
+                            "strategy_id": strategy_info.get("id") if strategy_info else None,
+                        }
+                        summary["control_results"][asset_id] = self._build_ev_skip_result(
+                            asset_id, asset_config, mod_type, curtailment_kw,
+                            bid_reference_power_kw, bid_reference_source, reason,
+                        )
+                        # Not added to current_curtailed -> existing restore logic
+                        # restores this controlled asset exactly once; the cooldown
+                        # entry then suppresses further restores.
+                        continue
+
+                    # Activation allowed (new activation or continuation below cap).
+                    if is_continuation and prev_count >= 1:
+                        new_count = prev_count + 1
+                        control_sequence_start = prev_meta.get(
+                            "control_sequence_start",
+                            prev_meta.get("slot_start", current_slot_start_str),
+                        )
+                        decision_label = "continuation allowed"
+                    else:
+                        new_count = 1
+                        control_sequence_start = current_slot_start_str
+                        decision_label = "activation allowed"
+
+                    self.logger.info(
+                        "Strategy_10 EV activation sequence for %s:\n"
+                        "  state=controlled\n"
+                        "  continuation=%s\n"
+                        "  previous_consecutive_slots=%d\n"
+                        "  max_consecutive_slots=%d\n"
+                        "  cooldown_slots_after_max_activation=%d\n"
+                        "  new_consecutive_slots=%d\n"
+                        "  control_sequence_start=%s\n"
+                        "  decision=%s",
+                        asset_id, is_continuation, prev_count, max_slots,
+                        cooldown_slots, new_count, control_sequence_start,
+                        decision_label,
+                    )
+
                     skip_reason = self._resolve_recent_profile_activation_current(
                         asset_id=asset_id,
                         curtailment_kw=curtailment_kw,
@@ -4412,27 +4669,17 @@ class FlexibilityManager:
                         is_continuation=is_continuation,
                     )
                     if isinstance(skip_reason, str):
-                        result = {
-                            "asset_id": asset_id,
-                            "description": asset_config.get("description", asset_id),
-                            "asset_type": asset_type,
-                            "modulation_type": mod_type,
-                            "requested_curtailment_kw": curtailment_kw,
-                            "actual_curtailment_kw": 0.0,
-                            "target_power_kw": None,
-                            "computed_target_power_kw": None,
-                            "reference_power_kw": bid_reference_power_kw,
-                            "reference_power_source": bid_reference_source,
-                            "status": "skipped",
-                            "skip_activation": True,
-                            "skip_reason": skip_reason,
-                            "message": skip_reason,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                        }
-                        summary["control_results"][asset_id] = result
+                        summary["control_results"][asset_id] = self._build_ev_skip_result(
+                            asset_id, asset_config, mod_type, curtailment_kw,
+                            bid_reference_power_kw, bid_reference_source, skip_reason,
+                        )
                         continue
                     else:
                         activation_current_power_kw = skip_reason
+                        ev_activation_meta[asset_id] = {
+                            "consecutive_activation_slots": new_count,
+                            "control_sequence_start": control_sequence_start,
+                        }
             elif mod_type != "discrete" and bid_reference_source and bid_reference_source != "recent_profile_baseline":
                 self.logger.info(
                     "Continuous activation reference decision for %s:\n"
@@ -4499,12 +4746,13 @@ class FlexibilityManager:
             summary["forwarder_dry_run"] = dry_run
             self.logger.info("Published %d commands to RabbitMQ", published)
 
-        # Persist currently curtailed assets for next run
+        # Persist next controlled/cooldown state for the next run.
         new_state = {}
         for asset_id in current_curtailed:
             ac = self.asset_mapping.get(asset_id, {})
             cr = summary["control_results"].get(asset_id, {})
-            new_state[asset_id] = {
+            controlled_entry = {
+                "state": "controlled",
                 "asset_type": ac.get("type", "unknown"),
                 "slot_start": _format_aem_utc(slot_start),
                 "slot_end": _format_aem_utc(slot_end),
@@ -4514,6 +4762,32 @@ class FlexibilityManager:
                 "reference_power_source": cr.get("reference_power_source"),
                 "strategy_id": strategy_info.get("id") if strategy_info else None,
             }
+            ev_meta = ev_activation_meta.get(asset_id)
+            if ev_meta:
+                controlled_entry["consecutive_activation_slots"] = ev_meta[
+                    "consecutive_activation_slots"
+                ]
+                controlled_entry["control_sequence_start"] = ev_meta[
+                    "control_sequence_start"
+                ]
+            new_state[asset_id] = controlled_entry
+
+        # Cooldown entries created this slot (assets blocked by the comfort cap).
+        for asset_id, cd_entry in newly_blocked_cooldown.items():
+            new_state[asset_id] = cd_entry
+
+        # Carry over cooldown entries that are still within their cooldown window
+        # so the cooldown persists across its M slots without repeated restores.
+        # Expired cooldown entries are intentionally dropped (pruned).
+        for asset_id, meta in previous_state.items():
+            if not isinstance(meta, dict) or meta.get("state") != "cooldown":
+                continue
+            if asset_id in new_state:
+                continue
+            cooldown_until = _parse_aem_utc(meta.get("cooldown_until_slot_start"))
+            if cooldown_until is not None and slot_start < cooldown_until:
+                new_state[asset_id] = meta
+
         self._save_controlled_state(new_state)
         
         # Step 5: Save activation records to database
