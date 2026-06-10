@@ -112,24 +112,20 @@ def _log_rabbitmq_messages(
     slot_info: Optional[dict],
     logger: logging.Logger,
 ) -> None:
-    """Log the RabbitMQ JSON body strings that will be published."""
+    """Log the RabbitMQ JSON body strings that will be published.
+
+    The batch_start header is not published for manual actuator commands, so
+    slot_info is logged once for traceability but not as a per-destination
+    RabbitMQ message.
+    """
+    if slot_info:
+        logger.info("Slot info (log-only, not published): %s", json.dumps(slot_info))
+
     grouped_commands = _group_commands_by_rabbitmq_destination(commands)
 
     for (exchange, queue, routing_key), destination_commands in grouped_commands.items():
         if not exchange or not queue or not routing_key:
             continue
-
-        if slot_info:
-            batch_body = json.dumps(
-                _build_rabbitmq_batch_header(slot_info, len(destination_commands))
-            )
-            logger.info(
-                "RabbitMQ batch header JSON (exchange=%s, queue=%s, routing_key=%s): %s",
-                exchange,
-                queue,
-                routing_key,
-                batch_body,
-            )
 
         command_body = json.dumps(_build_rabbitmq_command_envelopes(destination_commands))
         logger.info(
@@ -972,9 +968,17 @@ def _publish_commands(
     logger: logging.Logger,
     verbose: bool = False,
 ) -> int:
-    """Publish already-prepared commands to RabbitMQ."""
+    """Publish already-prepared commands to RabbitMQ.
+
+    The batch_start header is intentionally not published for manual actuator
+    commands.  It is only meaningful for scheduled manager batches.  The
+    slot_info metadata is still logged for traceability but not sent to
+    RabbitMQ, so consumers only receive actual command messages.
+    """
     logger.info("Publishing %d commands to RabbitMQ (dry_run=%s)...", len(commands), dry_run)
-    return publisher.publish_batch_commands(commands, slot_info=slot_info, verbose=verbose)
+    if verbose and slot_info:
+        logger.info("Slot info (log-only, not published): %s", json.dumps(slot_info))
+    return publisher.publish_batch_commands(commands, slot_info=None, verbose=verbose)
 
 
 def main():
