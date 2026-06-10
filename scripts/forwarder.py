@@ -1298,6 +1298,48 @@ class RabbitMQSource:
 _RABBITMQ_SOURCE_FIELDS = ("exchange", "queue", "routingKey")
 
 
+class MalformedMessageError(Exception):
+    """Raised when a RabbitMQ message is not a supported forwarder payload."""
+
+
+def _safe_message_preview(value: Any, limit: int = 300) -> str:
+    """Return a bounded, single-line preview that is safe for logs."""
+    if isinstance(value, bytes):
+        preview = value.decode("utf-8", errors="replace")
+    else:
+        try:
+            preview = json.dumps(value, ensure_ascii=True, default=str)
+        except (TypeError, ValueError):
+            preview = repr(value)
+
+    preview = preview.replace("\n", "\\n").replace("\r", "\\r")
+    if len(preview) > limit:
+        return f"{preview[:limit]}..."
+    return preview
+
+
+def _validate_payload(payload: Any) -> dict:
+    """Validate the decoded top-level RabbitMQ payload."""
+    if not isinstance(payload, dict):
+        raise MalformedMessageError(
+            f"Unsupported payload type: {type(payload).__name__}; expected dict"
+        )
+    return payload
+
+
+def _validate_dict_field(message: dict, field_name: str, message_type: str) -> None:
+    """Validate optional nested objects before handlers use dict methods on them."""
+    if field_name not in message:
+        return
+
+    value = message[field_name]
+    if not isinstance(value, dict):
+        raise MalformedMessageError(
+            f"Unsupported {message_type}.{field_name} type: "
+            f"{type(value).__name__}; expected dict"
+        )
+
+
 def _parse_rabbitmq_sections(
     requested_sections: Optional[Union[str, Iterable[str]]]
 ) -> Optional[List[str]]:
@@ -1524,22 +1566,33 @@ class RabbitMQConsumer:
         :param properties: Message properties
         :param body: Message body
         """
+        consumer_tag = getattr(method, "consumer_tag", None)
+        source = self._consumer_tag_sources.get(consumer_tag)
+        queue_name = source.queue if source else "unknown"
+        exchange_name = source.exchange if source else getattr(method, "exchange", "unknown")
+        section = source.section if source else "unknown"
+        routing_key = getattr(method, "routing_key", None)
+        delivery_tag = method.delivery_tag
+        decoded_payload: Any = None
+
         try:
-            consumer_tag = getattr(method, "consumer_tag", None)
-            source = self._consumer_tag_sources.get(consumer_tag)
-            queue_name = source.queue if source else "unknown"
-            section = source.section if source else "unknown"
             self.logger.debug(
-                "Received RabbitMQ message: queue=%s section=%s delivery_tag=%s routing_key=%s",
+                "Received RabbitMQ message: queue=%s exchange=%s section=%s delivery_tag=%s routing_key=%s",
                 queue_name,
+                exchange_name,
                 section,
-                getattr(method, "delivery_tag", None),
-                getattr(method, "routing_key", None),
+                delivery_tag,
+                routing_key,
             )
 
-            message = json.loads(body.decode('utf-8'))
+            decoded_payload = json.loads(body.decode("utf-8"))
+            message = _validate_payload(decoded_payload)
             message_type = message.get("message_type", "unknown")
             asset_type = message.get("asset_type", "")
+            if message_type == "command":
+                _validate_dict_field(message, "payload", message_type)
+            elif message_type == "batch_start":
+                _validate_dict_field(message, "slot_info", message_type)
             
             # Apply asset type filter
             if self.asset_types_filter and asset_type:
@@ -1548,7 +1601,7 @@ class RabbitMQConsumer:
                         "Skipping message for asset type '%s' (not in filter)",
                         asset_type
                     )
-                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    ch.basic_ack(delivery_tag=delivery_tag)
                     return
             
             # Dispatch to appropriate handler
@@ -1584,19 +1637,36 @@ class RabbitMQConsumer:
             
             # Acknowledge message
             if handled:
-                ch.basic_ack(delivery_tag=method.delivery_tag)
+                ch.basic_ack(delivery_tag=delivery_tag)
                 self._messages_processed += 1
             else:
                 # Negative acknowledge - requeue message
-                ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+                ch.basic_nack(delivery_tag=delivery_tag, requeue=True)
                 self.logger.warning("Message not handled, requeueing")
             
-        except json.JSONDecodeError as e:
-            self.logger.error("Invalid JSON in message: %s", str(e))
-            ch.basic_ack(delivery_tag=method.delivery_tag)  # Ack to avoid infinite loop
+        except (UnicodeDecodeError, json.JSONDecodeError, MalformedMessageError) as e:
+            self.logger.warning(
+                "Rejecting malformed RabbitMQ message: reason=%s payload_type=%s "
+                "queue=%s exchange=%s routing_key=%s delivery_tag=%s preview=%s",
+                str(e),
+                type(decoded_payload).__name__ if decoded_payload is not None else type(body).__name__,
+                queue_name,
+                exchange_name,
+                routing_key,
+                delivery_tag,
+                _safe_message_preview(body),
+            )
+            ch.basic_ack(delivery_tag=delivery_tag)
         except Exception as e:
-            self.logger.error("Error processing message: %s", str(e))
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
+            self.logger.exception(
+                "Error processing RabbitMQ message: queue=%s exchange=%s routing_key=%s "
+                "delivery_tag=%s; requeueing according to retry policy",
+                queue_name,
+                exchange_name,
+                routing_key,
+                delivery_tag,
+            )
+            ch.basic_nack(delivery_tag=delivery_tag, requeue=True)
     
     def start_consuming(self):
         """
