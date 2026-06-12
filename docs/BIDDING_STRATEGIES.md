@@ -1,6 +1,6 @@
 # Bidding Strategies for Flexibility Market
 
-This document explains the bidding strategies configured for the FSP (Flexibility Service Provider) to participate in the flexibility market. It reflects the current `conf/test_fm01_aem.json` configuration, including strategies `strategy_1` through `strategy_10`.
+This document explains the bidding strategies configured for the FSP (Flexibility Service Provider) to participate in the flexibility market. It reflects the current `conf/test_fm01_aem.json` configuration, including strategies `strategy_1` through `strategy_11`.
 
 ## Overview
 
@@ -12,8 +12,8 @@ The flexibility market allows FSPs to sell load reduction capabilities to the DS
 | ECM97.1 | Heat Pump | 15 kW | HP Cinema 1 |
 | ECM97.2 | Heat Pump | 15 kW | HP Cinema 2 |
 | ECM97.3 | Heat Pump | 30 kW | HP Cinema aggregate |
-| ECM63.1 | EV Charger | 11 kW | EV Charger 1 |
-| ECM63.2 | EV Charger | 11 kW | EV Charger 2 |
+| ECM63.1 | EV Charger | 11 kW | EV Charger 1 — discrete OCPP states (6.24–11.0 kW) |
+| ECM63.2 | EV Charger | 11 kW | EV Charger 2 — discrete OCPP states (6.24–11.0 kW) |
 
 The active FSP portfolio in `conf/test_fm01_aem.json` currently lists `ECM96.2`, `ECM97.3`, `ECM63.1`, and `ECM63.2`. Some strategies refer to all assets by type, so the final allowed set is the intersection of the strategy filter, asset mapping, and active FSP portfolio.
 
@@ -38,7 +38,7 @@ Baseline persistence and bidding strategy persistence are separate concepts:
 - `baseline.dbSettings.strategy = "slot_persistence"` affects baseline generation/uploading.
 - `flexibility_method: "persistence"` inside a bidding strategy affects trader bidding flexibility for the selected strategy.
 
-In the current configuration, `strategy_8` and `strategy_9` are the persistence bidding strategies, and `strategy_10` is the recent-profile bidding strategy. `strategy_4` is historical/legacy.
+In the current configuration, `strategy_8` and `strategy_9` are the persistence bidding strategies, `strategy_10` is the recent-profile bidding strategy for continuous EVs, and `strategy_11` is the recent-profile bidding strategy for discrete OCPP-controlled EVs. `strategy_4` is historical/legacy.
 
 ## Current Strategy Summary
 
@@ -53,7 +53,8 @@ In the current configuration, `strategy_8` and `strategy_9` are the persistence 
 | `strategy_7` | Double Pre-heating | Heat pumps | `ECM96.2` | Historical/legacy | Morning and evening preheat/peak cycle | Intent is taken from config preheat fields. |
 | `strategy_8` | Persistence HP Strategy | Heat pumps | `ECM96.2`, `ECM97.3` | Persistence | Safer HP-only persistence bidding | Excludes EV chargers. |
 | `strategy_9` | Persistence HP + EV Strategy | HP + EV | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | Persistence | Persistence bidding including EV chargers | Monitor EV telemetry carefully. |
-| `strategy_10` | Recent-profile Short-term Flexibility (EV) | EV (HP-capable) | `ECM63.1`, `ECM63.2` | Recent profile | EV-only short-term profile bidding | HPs excluded by `assets_filter`; warm-season deployment. |
+| `strategy_10` | Recent-profile Short-term Flexibility (EV) | EV (HP-capable) | `ECM63.1`, `ECM63.2` | Recent profile | EV-only short-term profile bidding (continuous) | HPs excluded by `assets_filter`; warm-season deployment. Treats EVs as continuous. |
+| `strategy_11` | Recent-profile discrete EV current-step flexibility | EV | `ECM63.1`, `ECM63.2` | Recent profile | Discrete OCPP current-step EV bidding | Maps flexibility to feasible OCPP power states; overdelivery-tolerant. |
 
 ---
 
@@ -473,22 +474,156 @@ They are **not** global `flexibility.recentProfileSettings` anymore. For backwar
 
 ---
 
+## Strategy 11: Recent-profile Discrete EV Current-step Flexibility
+
+### Description
+EV-only strategy that combines recent-profile reference power estimation with discrete OCPP current-step power states. Unlike `strategy_10`, which treats EV chargers as continuously modulated assets, `strategy_11` models them as multi-level discrete assets whose power can only be set to one of 8 predefined OCPP current steps.
+
+**Flexibility method:** recent profile via `flexibility_method: "recent_profile"`.
+
+### Why It Was Introduced
+- Real OCPP chargers accept integer current limits, not arbitrary kW setpoints.
+- Sending low-power commands (below ~6 kW) caused unstable charger behavior.
+- A continuous curtailment value (e.g. 5.3 kW) cannot be sent; the nearest valid OCPP state must be selected.
+- Overdelivery (sending slightly more curtailment than requested) is preferred over underdelivery to meet market obligations.
+
+### Assets Used
+- ✅ ECM63.1 (EV Charger 1) — `modulation_type: "discrete"`, 8 OCPP states
+- ✅ ECM63.2 (EV Charger 2) — `modulation_type: "discrete"`, 8 OCPP states
+- ❌ Heat pumps excluded (EV-only strategy)
+
+### EV Charger Discrete States
+
+Both chargers are configured with 8 feasible OCPP power states (kW):
+
+```
+6.24  6.93  7.62  8.31  9.01  9.70  10.39  11.0
+```
+
+Key constraints:
+- **No 0 kW state**: normal flexibility activation never commands the charger to stop entirely.
+- **No states below 6 kW**: low-current OCPP commands caused unstable charger behavior in testing.
+- **Maximum state is 11.0 kW**: full charger capacity.
+
+### Bidding Logic
+
+Strategy_11 reuses the same recent-profile reference pipeline as strategy_10, then adds a discrete mapping step:
+
+1. **Collect recent measurements** over the lookback window (45 minutes).
+2. **Apply the current-power activity gate:** if the latest measurement is at or below `activeThresholdW` (6000 W), the asset contributes 0 flexibility.
+3. **Estimate expected power** as q25 of recent samples, capped at nominal.
+4. **Compute raw desired flexibility:** `discreteFactor × expected_power` (factor: 0.5).
+5. **Map to discrete curtailment** using the overdelivery-tolerant selection policy.
+
+### Overdelivery-tolerant Selection Policy
+
+Given the reference power and desired flexibility, the algorithm selects which OCPP state to target:
+
+1. Compute feasible curtailments: `curtailment = reference_power - state` for each state below the reference.
+2. Choose the **smallest feasible curtailment ≥ desired** (minimizes overdelivery).
+3. If no feasible curtailment ≥ desired exists, choose the **largest feasible curtailment below desired** (maximum reachable).
+
+Example with reference = 11.0 kW:
+
+| Target State | Feasible Curtailment |
+|-------------|---------------------|
+| 10.39 kW | 0.61 kW |
+| 9.70 kW | 1.30 kW |
+| 9.01 kW | 1.99 kW |
+| 8.31 kW | 2.69 kW |
+| 7.62 kW | 3.38 kW |
+| 6.93 kW | 4.07 kW |
+| 6.24 kW | 4.76 kW |
+
+| Desired Flexibility | Selected Target | Actual Curtailment | Reason |
+|--------------------|-----------------|-------------------|--------|
+| 2.0 kW | 8.31 kW | 2.69 kW | Smallest curtailment ≥ 2.0 |
+| 1.0 kW | 9.70 kW | 1.30 kW | Smallest curtailment ≥ 1.0 |
+| 5.5 kW | 6.24 kW | 4.76 kW | No curtailment ≥ 5.5; maximum reachable |
+
+The bid's `available_flexibility_kw` is the **actual discrete curtailment**, not the raw continuous desired value.
+
+### Difference vs Strategy_10
+
+| Aspect | `strategy_10` | `strategy_11` |
+|--------|---------------|---------------|
+| EV modulation type | `continuous` | `discrete` |
+| Control command | Arbitrary kW setpoint | One of 8 OCPP states |
+| Flexibility quantity | Raw `factor × expected` | Mapped to nearest feasible discrete curtailment |
+| Minimum power | 0 kW | 6.24 kW (OCPP stability floor) |
+| Overdelivery | Disallowed in bidding | Tolerated in activation (preferred over underdelivery) |
+| Active threshold | 5000 W | 6000 W |
+| Lookback | 90 min (adaptive) | 45 min |
+
+### Activation Behaviour
+
+At activation time, `flexi_manager.py` detects a discrete EV charger (asset type `ev_charger` with `modulation_type: "discrete"` and more than 2 states) and uses the EV-specific discrete activation path instead of the HP ON/OFF path:
+
+1. Resolve the activation reference (activation-current measurement for new activations; bid reference for continuations).
+2. Select the best discrete OCPP state using the same overdelivery-tolerant policy.
+3. Send **only** a power value from `discrete_states_kw` — never an arbitrary continuous value, never 0.0.
+
+### Comfort Cooldown Guard
+
+The same EV comfort guard as strategy_10 applies to strategy_11:
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `maxConsecutiveActivationSlots` | 4 | Maximum consecutive 15-min slots under control |
+| `cooldownSlotsAfterMaxActivation` | 2 | Slots released after reaching the cap |
+
+After 4 consecutive activation slots, the charger is restored and enters a 2-slot cooldown. This prevents indefinite curtailment of EV charging sessions. The guard does **not** apply to heat pumps.
+
+### Strategy-owned Settings
+
+```text
+bidding_strategies.strategy_11.recentProfileSettings
+bidding_strategies.strategy_11.discreteEvSettings
+```
+
+| Setting | Value | Purpose |
+|---------|-------|---------|
+| `lookbackMinutes` | 45 | Recent measurement window |
+| `quantile` | 0.25 | Conservative expected-power estimate (q25) |
+| `discreteFactor` | 0.5 | Flexibility fraction for discrete EV assets |
+| `activeThresholdW` | 6000 | Current-power activity gate (above OCPP floor) |
+| `minSamples` | 2 | Minimum recent samples required |
+| `selection_policy` | `smallest_overdelivery` | Prefer minimal overdelivery |
+| `allow_zero_state` | `false` | Never command 0 kW |
+| `min_target_power_kw` | 6.24 | Minimum OCPP target (stability floor) |
+
+### When to Use
+- When controlling real EV chargers through OCPP integer current limits
+- When the chargers cannot accept arbitrary continuous power setpoints
+- When low-current commands (below 6 kW) must be avoided for stability
+- After validating EV telemetry and OCPP state transitions on `ECM63.1` and `ECM63.2`
+
+### Caution
+- Start with `--dry-run` and verify that selected target states match expected OCPP behaviour.
+- The 8-state configuration assumes a specific charger model and voltage; adjust `discrete_states_kw` if the charger hardware or site voltage differs.
+- `strategy_10` remains available as the continuous approximation for EVs and can be used as a fallback.
+
+---
+
 ## Strategy Comparison
 
 | Strategy | Forecasting logic | Asset types | Control |
 |----------|-------------------|-------------|---------|
 | `strategy_8` | Persistence (lagged baseline) | HP | ON/OFF |
 | `strategy_9` | Persistence (lagged baseline) | HP + EV | Mixed |
-| `strategy_10` | Recent profile q25 | EV (currently) | Modulated |
+| `strategy_10` | Recent profile q25 | EV (currently) | Continuous modulated |
+| `strategy_11` | Recent profile q25 + discrete mapping | EV (discrete) | OCPP current-step |
 
-| Metric | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 |
-|--------|----|----|----|----|----|----|----|----|----|-----|
-| Flexibility method | Historical | Historical | Historical | Historical | Historical | Historical | Historical | Persistence | Persistence | Recent profile |
-| Uses EV chargers | No | Yes | No | No | Yes | No | No | No | Yes | Yes |
-| Explicit asset filter | No | No | `ECM97.3` | `ECM96.2`, `ECM97.3` | No | No | `ECM96.2` | `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2` |
-| Preheat fields | No | No | No | No | No | Yes | Yes | No | No | No |
-| Gated current-state method | No | No | No | No | No | No | No | Yes | Yes | Yes |
-| Strategy-owned forecast settings | No | No | No | No | No | No | No | No | No | `recentProfileSettings` |
+| Metric | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 | S11 |
+|--------|----|----|----|----|----|----|----|----|----|-----|-----|
+| Flexibility method | Historical | Historical | Historical | Historical | Historical | Historical | Historical | Persistence | Persistence | Recent profile | Recent profile |
+| Uses EV chargers | No | Yes | No | No | Yes | No | No | No | Yes | Yes | Yes |
+| EV modulation | — | — | — | — | — | — | — | — | Continuous | Continuous | Discrete (OCPP) |
+| Explicit asset filter | No | No | `ECM97.3` | `ECM96.2`, `ECM97.3` | No | No | `ECM96.2` | `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2` | `ECM63.1`, `ECM63.2` |
+| Preheat fields | No | No | No | No | No | Yes | Yes | No | No | No | No |
+| Gated current-state method | No | No | No | No | No | No | No | Yes | Yes | Yes | Yes |
+| Discrete state mapping | No | No | No | No | No | No | No | No | No | No | Yes |
+| Strategy-owned forecast settings | No | No | No | No | No | No | No | No | No | `recentProfileSettings` | `recentProfileSettings`, `discreteEvSettings` |
 
 ---
 
@@ -498,8 +633,9 @@ They are **not** global `flexibility.recentProfileSettings` anymore. For backwar
 Each strategy defines which assets can participate:
 - Heat pumps only: `strategy_1`, `strategy_3`, `strategy_4`, `strategy_6`, `strategy_7`, `strategy_8`
 - Heat pumps plus EV chargers: `strategy_2`, `strategy_5`, `strategy_9`
-- EV chargers only (current deployment): `strategy_10`
-- Specific asset filters: `strategy_3`, `strategy_4`, `strategy_7`, `strategy_8`, `strategy_9`, `strategy_10`
+- EV chargers only (continuous): `strategy_10`
+- EV chargers only (discrete OCPP): `strategy_11`
+- Specific asset filters: `strategy_3`, `strategy_4`, `strategy_7`, `strategy_8`, `strategy_9`, `strategy_10`, `strategy_11`
 
 ### 2. Time-Based Pricing
 Each strategy defines minimum acceptable prices for different time periods:
@@ -583,6 +719,32 @@ Recent-profile strategies include strategy-owned forecast settings:
 }
 ```
 
+Discrete EV strategies add a `discreteEvSettings` block:
+
+```json
+"strategy_11": {
+  "name": "Recent-profile discrete EV current-step flexibility",
+  "asset_types": ["ev_charger"],
+  "assets_filter": ["ECM63.1", "ECM63.2"],
+  "flexibility_method": "recent_profile",
+  "recentProfileSettings": {
+    "lookbackMinutes": 45,
+    "quantile": 0.25,
+    "discreteFactor": 0.5,
+    "activeThresholdW": 6000,
+    "minSamples": 2,
+    "maxConsecutiveActivationSlots": 4,
+    "cooldownSlotsAfterMaxActivation": 2
+  },
+  "discreteEvSettings": {
+    "selection_policy": "smallest_overdelivery",
+    "allow_zero_state": false,
+    "min_target_power_kw": 6.24
+  },
+  "time_slots": [...]
+}
+```
+
 Settings resolution order for `recentProfileSettings`:
 1. `bidding_strategies.<strategy_id>.recentProfileSettings` (preferred)
 2. legacy global `flexibility.recentProfileSettings` (warning fallback)
@@ -613,11 +775,18 @@ python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
     --fsp supsi01 --strategy strategy_8 --dry-run
 ```
 
-Recent-profile dry run:
+Recent-profile dry run (continuous EV):
 
 ```bash
 python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
     --fsp supsi01 --strategy strategy_10 --dry-run
+```
+
+Discrete EV dry run:
+
+```bash
+python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
+    --fsp supsi01 --strategy strategy_11 --dry-run
 ```
 
 From the `scripts/` directory:
@@ -646,9 +815,10 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 1. **Use `strategy_4`** when you want the configured recommended historical/legacy HP hybrid.
 2. **Use `strategy_8`** when validating persistence bidding with the safer HP-only asset set.
 3. **Use `strategy_9`** only after validating EV telemetry quality, because it includes EV chargers.
-4. **Use `strategy_10`** when testing recent-profile EV bidding on `ECM63.1` and `ECM63.2`; start with dry-run.
-5. **Use `strategy_6` or `strategy_7`** when specifically testing the configured preheat schedules.
-6. **Use dry-run first** before enabling live bidding for any strategy.
+4. **Use `strategy_10`** when testing recent-profile EV bidding with continuous modulation (legacy approximation).
+5. **Use `strategy_11`** for real OCPP EV chargers with discrete current-step states; this is the preferred strategy for production EV activation on `ECM63.1` and `ECM63.2`.
+6. **Use `strategy_6` or `strategy_7`** when specifically testing the configured preheat schedules.
+7. **Use dry-run first** before enabling live bidding for any strategy.
 
 ---
 
@@ -669,3 +839,7 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 | **Recent profile** | Short-term flexibility method using a lower quantile of recent measurements |
 | **Persistence current-state gate** | Rule that assets below `activeThresholdW` contribute zero flexibility |
 | **Gated flexibility method** | Real-time method (`persistence`, `recent_profile`) that gates bids on current measurements and reuses the persistence activation path |
+| **Discrete states** | Finite set of power levels an asset can be commanded to; for OCPP EVs these correspond to integer current limits |
+| **OCPP current-step** | A specific integer current limit sent to the charger via OCPP; each step maps to a fixed kW power level |
+| **Overdelivery-tolerant selection** | Policy that prefers slightly more curtailment than requested over less, when exact discrete match is unavailable |
+| **Comfort cooldown guard** | Mechanism limiting consecutive EV activation slots and enforcing a cooldown period to protect user charging sessions |
