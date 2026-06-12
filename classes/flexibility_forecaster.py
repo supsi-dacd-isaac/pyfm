@@ -235,6 +235,116 @@ def format_recent_profile_asset_log_lines(asset_id: str, info: Dict) -> List[str
     return lines
 
 
+# ---------------------------------------------------------------------------
+# EV discrete-state helpers (strategy_11)
+# ---------------------------------------------------------------------------
+
+def _get_discrete_ev_states(
+    asset_cfg: dict,
+    strategy_cfg: Optional[dict] = None,
+) -> List[float]:
+    """Return sorted, validated OCPP power states for a discrete EV charger.
+
+    Filtering rules:
+    * Non-numeric and negative values are dropped.
+    * 0.0 is dropped unless *discreteEvSettings.allow_zero_state* is True.
+    * States below *min_target_power_kw* (from strategy or asset) are dropped.
+    * States above *capacity_kw* are dropped (with 0.01 kW tolerance for
+      rounding).
+    * Duplicates are removed and the list is returned in ascending order.
+    """
+    raw = list(asset_cfg.get("discrete_states_kw", []))
+    capacity_kw = float(asset_cfg.get("capacity_kw", 0) or 0)
+
+    ev_settings = (strategy_cfg or {}).get("discreteEvSettings", {})
+    allow_zero = bool(ev_settings.get("allow_zero_state", False))
+    min_target = float(
+        ev_settings.get(
+            "min_target_power_kw",
+            asset_cfg.get("min_power_kw", 0.0),
+        )
+    )
+
+    valid: List[float] = []
+    for v in raw:
+        try:
+            s = float(v)
+        except (TypeError, ValueError):
+            continue
+        if s < 0:
+            continue
+        if s == 0.0 and not allow_zero:
+            continue
+        if s < min_target - 1e-9:
+            continue
+        if s > capacity_kw + 0.01:
+            continue
+        valid.append(round(s, 4))
+
+    return sorted(set(valid))
+
+
+def _compute_discrete_ev_curtailment_options(
+    reference_power_kw: float,
+    states_kw: List[float],
+) -> List[Dict]:
+    """Compute feasible curtailment options for discrete EV states.
+
+    For each state strictly below the reference power, compute
+    ``curtailment_kw = reference_power_kw - state_kw``.  Only positive
+    curtailments are returned, sorted ascending by *curtailment_kw*.
+    """
+    options: List[Dict] = []
+    for s in sorted(states_kw):
+        curt = reference_power_kw - s
+        if curt > 1e-9 and s < reference_power_kw - 1e-9:
+            options.append({
+                "target_power_kw": round(s, 4),
+                "curtailment_kw": round(curt, 4),
+            })
+    options.sort(key=lambda o: o["curtailment_kw"])
+    return options
+
+
+def _select_discrete_ev_target_for_curtailment(
+    reference_power_kw: float,
+    allocated_or_desired_curtailment_kw: float,
+    states_kw: List[float],
+    policy: str = "smallest_overdelivery",
+) -> Optional[Dict]:
+    """Select the best discrete EV target for a given curtailment request.
+
+    Policy ``"smallest_overdelivery"``
+      1. Choose the smallest feasible curtailment >= requested.
+      2. If none exists, choose the largest feasible curtailment below
+         requested (maximum reachable).
+
+    Returns ``None`` when no valid option exists (e.g. empty states or
+    reference is at/below all states).
+
+    Return dict keys: *target_power_kw*, *actual_curtailment_kw*.
+    """
+    options = _compute_discrete_ev_curtailment_options(reference_power_kw, states_kw)
+    if not options:
+        return None
+
+    if policy != "smallest_overdelivery":
+        raise ValueError(f"Unsupported discrete EV selection policy: {policy}")
+
+    req = allocated_or_desired_curtailment_kw
+
+    over = [o for o in options if o["curtailment_kw"] >= req - 1e-9]
+    if over:
+        best = min(over, key=lambda o: o["curtailment_kw"])
+    else:
+        best = max(options, key=lambda o: o["curtailment_kw"])
+
+    return {
+        "target_power_kw": best["target_power_kw"],
+        "actual_curtailment_kw": best["curtailment_kw"],
+    }
+
+
 class FlexibilityForecaster:
     """
     Forecasts flexibility available from FSP assets for flexibility market bidding.
@@ -311,6 +421,8 @@ class FlexibilityForecaster:
         self.max_current_measurement_age_minutes = int(
             persistence_cfg.get("maxCurrentMeasurementAgeMinutes", 30)
         )
+
+        self._strategy_config = strategy_config or {}
 
         # Recent-profile settings are strategy-owned (strategy_10+). They are
         # loaded only when the active method is recent_profile.
@@ -1919,6 +2031,51 @@ class FlexibilityForecaster:
                 )
                 skip_reason = None
 
+            # --- Strategy_11 discrete EV state mapping ---
+            # For discrete EV chargers with discrete_states_kw, map the raw
+            # continuous desired flexibility to the nearest feasible discrete
+            # curtailment using the overdelivery-tolerant selection policy.
+            discrete_ev_target_kw = None
+            discrete_ev_actual_curtailment_kw = None
+            ev_states_kw = mapping.get("discrete_states_kw")
+            if (
+                skip_reason is None
+                and asset_type == "ev_charger"
+                and modulation_type == "discrete"
+                and ev_states_kw
+                and expected_power_w is not None
+                and expected_power_w > 0
+            ):
+                strategy_cfg = getattr(self, "_strategy_config", None) or {}
+                valid_states = _get_discrete_ev_states(mapping, strategy_cfg)
+                reference_kw = expected_power_w / 1000
+                desired_flex_kw = available_flexibility_w / 1000
+
+                selection = _select_discrete_ev_target_for_curtailment(
+                    reference_power_kw=reference_kw,
+                    allocated_or_desired_curtailment_kw=desired_flex_kw,
+                    states_kw=valid_states,
+                )
+                if selection is not None:
+                    discrete_ev_target_kw = selection["target_power_kw"]
+                    discrete_ev_actual_curtailment_kw = selection["actual_curtailment_kw"]
+                    available_flexibility_w = discrete_ev_actual_curtailment_kw * 1000
+                    self.logger.info(
+                        "Discrete EV mapping for %s: desired_flex=%.2f kW, "
+                        "selected_target=%.2f kW, actual_curtailment=%.2f kW "
+                        "(reference=%.2f kW, states=%s)",
+                        asset_id, desired_flex_kw, discrete_ev_target_kw,
+                        discrete_ev_actual_curtailment_kw, reference_kw,
+                        valid_states,
+                    )
+                else:
+                    available_flexibility_w = 0.0
+                    self.logger.info(
+                        "Discrete EV mapping for %s: no feasible target "
+                        "(desired_flex=%.2f kW, reference=%.2f kW, states=%s)",
+                        asset_id, desired_flex_kw, reference_kw, valid_states,
+                    )
+
             recent_summary = {
                 "count": sample_count,
                 "min_w": float(recent_values.min()) if sample_count else None,
@@ -2018,6 +2175,8 @@ class FlexibilityForecaster:
                     (expected_power_w or 0.0) / 1000
                 ),
                 "recent_profile_available_flex_explanation": available_flex_explanation,
+                "discrete_ev_target_kw": discrete_ev_target_kw,
+                "discrete_ev_actual_curtailment_kw": discrete_ev_actual_curtailment_kw,
                 "is_available_for_flexibility": bool(
                     is_currently_active and available_flexibility_w > 0
                 ),

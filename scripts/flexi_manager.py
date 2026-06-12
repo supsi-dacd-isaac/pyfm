@@ -47,6 +47,10 @@ from classes.postgresql_interface import PostgreSQLInterface
 from classes.bid_record_repository import BidRecordRepository
 from classes.demand_record_repository import DemandRecordRepository
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
+from classes.flexibility_forecaster import (
+    _get_discrete_ev_states,
+    _select_discrete_ev_target_for_curtailment,
+)
 
 # For statistics
 import statistics
@@ -1044,7 +1048,69 @@ class AssetController:
             "skip_activation": False,
             "skip_reason": None,
         }
-    
+
+    def _calculate_discrete_ev_target_power(
+        self,
+        asset_id: str,
+        asset_config: dict,
+        allocated_curtailment_kw: float,
+        reference_power_kw: Optional[float] = None,
+        reference_power_source: Optional[str] = None,
+        activation_current_power_kw: Optional[float] = None,
+    ) -> Tuple[float, float]:
+        """Select a valid discrete OCPP power state for an EV charger.
+
+        Uses the overdelivery-tolerant policy: pick the smallest feasible
+        curtailment >= requested; fall back to maximum below requested.
+
+        Returns (target_power_kw, actual_curtailment_kw).
+        """
+        capacity_kw = float(asset_config.get("capacity_kw", 0) or 0)
+
+        ref_kw = _coerce_optional_float(reference_power_kw)
+        act_kw = _coerce_optional_float(activation_current_power_kw)
+        if act_kw is not None and math.isfinite(act_kw) and act_kw > 0:
+            selected_ref = act_kw
+        elif ref_kw is not None and math.isfinite(ref_kw) and ref_kw > 0:
+            selected_ref = ref_kw
+        else:
+            selected_ref = capacity_kw
+
+        valid_states = _get_discrete_ev_states(asset_config)
+
+        selection = _select_discrete_ev_target_for_curtailment(
+            reference_power_kw=selected_ref,
+            allocated_or_desired_curtailment_kw=allocated_curtailment_kw,
+            states_kw=valid_states,
+        )
+
+        if selection is not None:
+            target = selection["target_power_kw"]
+            actual = selection["actual_curtailment_kw"]
+        else:
+            target = max(valid_states) if valid_states else capacity_kw
+            actual = max(selected_ref - target, 0.0)
+
+        self.logger.info(
+            "Discrete EV activation for %s:\n"
+            "  reference_power=%.3f kW (source=%s)\n"
+            "  activation_current=%.3f kW\n"
+            "  selected_reference=%.3f kW\n"
+            "  allocated_curtailment=%.3f kW\n"
+            "  selected_target=%.3f kW\n"
+            "  actual_curtailment=%.3f kW\n"
+            "  valid_states=%s",
+            asset_id,
+            ref_kw or 0.0, reference_power_source,
+            act_kw or 0.0,
+            selected_ref,
+            allocated_curtailment_kw,
+            target, actual,
+            valid_states,
+        )
+
+        return target, actual
+
     def curtail_asset(
         self, 
         asset_id: str, 
@@ -1083,13 +1149,30 @@ class AssetController:
         
         # For discrete assets, determine the actual state to set
         if modulation_type == "discrete":
-            if force_discrete_off and curtailment_kw > 0:
+            is_discrete_ev = (
+                asset_type == "ev_charger"
+                and len(asset_config.get("discrete_states_kw", [])) > 2
+            )
+            if is_discrete_ev:
+                target_power_kw, actual_curtailment_kw = (
+                    self._calculate_discrete_ev_target_power(
+                        asset_id=asset_id,
+                        asset_config=asset_config,
+                        allocated_curtailment_kw=curtailment_kw,
+                        reference_power_kw=reference_power_kw,
+                        reference_power_source=reference_power_source,
+                        activation_current_power_kw=activation_current_power_kw,
+                    )
+                )
+                state_name = f"LIMIT_{target_power_kw:.2f}kW"
+            elif force_discrete_off and curtailment_kw > 0:
                 discrete_states = asset_config.get("discrete_states_kw", [0.0, capacity_kw])
                 target_power_kw = min(discrete_states)
                 state_name = "OFF"
             else:
                 state_name, target_power_kw = self._determine_discrete_state(asset_config, curtailment_kw)
-            actual_curtailment_kw = capacity_kw - target_power_kw
+            if not is_discrete_ev:
+                actual_curtailment_kw = capacity_kw - target_power_kw
         else:
             state_name = None
             target_calculation = self._calculate_continuous_target_power(
@@ -4483,7 +4566,7 @@ class FlexibilityManager:
         ev_activation_meta = {}      # controlled EV -> {consecutive_activation_slots, control_sequence_start}
         newly_blocked_cooldown = {}  # EV blocked by the cap this slot -> cooldown state entry
         self.logger.info(
-            "Strategy_10 EV comfort guard config: "
+            "EV comfort guard config: "
             "max_consecutive_activation_slots=%d, cooldown_slots_after_max_activation=%d",
             ev_comfort_cfg["max_consecutive_activation_slots"],
             ev_comfort_cfg["cooldown_slots_after_max_activation"],
@@ -4503,12 +4586,27 @@ class FlexibilityManager:
 
             activation_current_power_kw = None
 
-            if (
-                mod_type != "discrete"
-                and bid_reference_source == "recent_profile_baseline"
-            ):
-                asset_config = self.asset_mapping.get(asset_id, {})
-                asset_type = asset_config.get("type", "unknown")
+            asset_config = self.asset_mapping.get(asset_id, {})
+            asset_type = asset_config.get("type", "unknown")
+
+            is_discrete_ev = (
+                asset_type == "ev_charger"
+                and mod_type == "discrete"
+                and len(asset_config.get("discrete_states_kw", [])) > 2
+            )
+
+            # Discrete HP assets skip the comfort guard path entirely (ON/OFF).
+            # Discrete EV chargers (strategy_11) and continuous EVs
+            # (strategy_10) both use the recent-profile comfort guard.
+            enters_ev_comfort_guard = (
+                bid_reference_source == "recent_profile_baseline"
+                and (mod_type != "discrete" or is_discrete_ev)
+            )
+
+            if is_discrete_ev:
+                force_discrete_off = False
+
+            if enters_ev_comfort_guard:
                 if asset_type == "ev_charger":
                     prev_meta = previous_state.get(asset_id, {})
                     if not isinstance(prev_meta, dict):
@@ -4535,7 +4633,7 @@ class FlexibilityManager:
                                 f"{prev_meta.get('cooldown_until_slot_start')}"
                             )
                             self.logger.info(
-                                "Strategy_10 EV activation sequence for %s:\n"
+                                "EV activation sequence for %s:\n"
                                 "  state=cooldown\n"
                                 "  cooldown_until_slot_start=%s\n"
                                 "  current_slot_start=%s\n"
@@ -4551,7 +4649,7 @@ class FlexibilityManager:
                             continue
                         # Cooldown expired -> treat as a brand new activation.
                         self.logger.info(
-                            "Strategy_10 EV activation sequence for %s:\n"
+                            "EV activation sequence for %s:\n"
                             "  state=cooldown\n"
                             "  cooldown_until_slot_start=%s\n"
                             "  current_slot_start=%s\n"
@@ -4600,7 +4698,7 @@ class FlexibilityManager:
                             f"and entering cooldown until {cooldown_until_str}"
                         )
                         self.logger.warning(
-                            "Strategy_10 EV activation sequence for %s:\n"
+                            "EV activation sequence for %s:\n"
                             "  state=controlled\n"
                             "  continuation=True\n"
                             "  previous_consecutive_slots=%d\n"
@@ -4646,7 +4744,7 @@ class FlexibilityManager:
                         decision_label = "activation allowed"
 
                     self.logger.info(
-                        "Strategy_10 EV activation sequence for %s:\n"
+                        "EV activation sequence for %s:\n"
                         "  state=controlled\n"
                         "  continuation=%s\n"
                         "  previous_consecutive_slots=%d\n"
@@ -4680,7 +4778,7 @@ class FlexibilityManager:
                             "consecutive_activation_slots": new_count,
                             "control_sequence_start": control_sequence_start,
                         }
-            elif mod_type != "discrete" and bid_reference_source and bid_reference_source != "recent_profile_baseline":
+            elif not is_discrete_ev and mod_type != "discrete" and bid_reference_source and bid_reference_source != "recent_profile_baseline":
                 self.logger.info(
                     "Continuous activation reference decision for %s:\n"
                     "  allocated_curtailment_kw=%.3f\n"
