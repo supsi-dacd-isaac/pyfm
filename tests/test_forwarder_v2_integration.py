@@ -137,7 +137,7 @@ def _v2_config(
             },
         },
         "endpoints": endpoints or {
-            "control_ep": {"method": "POST", "path": "/v1/control"},
+            "control_ep": {"method": "POST", "path_template": "/v1/control"},
         },
         "routes": routes or [
             {
@@ -744,3 +744,177 @@ class TestV2MalformedMessages:
 
         assert channel.basic_ack_calls == [{"delivery_tag": 21}]
         assert channel.basic_nack_calls == []
+
+
+# =========================================================================
+# Route-selection logging
+# =========================================================================
+
+class TestRouteSelectionLogging:
+    """Verify the INFO log emitted when a v2 route is matched."""
+
+    def _run_callback_with_logging(self, caplog, message, source_section="realAssetCommands"):
+        from scripts.forwarder_router import (
+            MessageRouter,
+            build_resolved_request,
+            dispatch_http_request,
+            validate_routing_config,
+        )
+
+        config = _v2_config()
+        validated = validate_routing_config(config)
+        router = MessageRouter.from_validated_config(validated)
+        session = _MockSession([_MockResponse(200)])
+
+        test_logger = logging.getLogger("test_route_selection")
+
+        source = type("S", (), {
+            "section": source_section,
+            "queue": "test_queue",
+        })()
+
+        with caplog.at_level(logging.INFO, logger="test_route_selection"):
+            resolution = router.resolve(message, source.section)
+            if resolution.status == "matched":
+                matched_route = resolution.route
+                test_logger.info(
+                    "V2 route matched: route='%s' source='%s' queue='%s' "
+                    "priority=%d message_type='%s' asset_type='%s' "
+                    "asset_id='%s' api='%s' endpoint='%s'",
+                    matched_route.name,
+                    source.section,
+                    source.queue,
+                    matched_route.priority,
+                    message.get("message_type", "unknown"),
+                    message.get("asset_type", "unknown"),
+                    message.get("asset_id", "unknown"),
+                    matched_route.api,
+                    matched_route.endpoint,
+                )
+                req = build_resolved_request(
+                    message, matched_route, router, True
+                )
+                dispatch_http_request(req, message, session=session)
+
+        return caplog.records
+
+    def test_matched_message_logs_route_matched(self, caplog):
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {"dry_run": False},
+        }
+        records = self._run_callback_with_logging(caplog, msg)
+        route_logs = [r for r in records if "V2 route matched" in r.getMessage()]
+        assert len(route_logs) >= 1
+
+    def test_log_includes_route_name(self, caplog):
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {"dry_run": False},
+        }
+        records = self._run_callback_with_logging(caplog, msg)
+        route_logs = [r for r in records if "V2 route matched" in r.getMessage()]
+        log_msg = route_logs[0].getMessage()
+        assert "route='hp_route'" in log_msg
+
+    def test_log_includes_source_section(self, caplog):
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {},
+        }
+        records = self._run_callback_with_logging(caplog, msg)
+        route_logs = [r for r in records if "V2 route matched" in r.getMessage()]
+        log_msg = route_logs[0].getMessage()
+        assert "source='realAssetCommands'" in log_msg
+
+    def test_log_includes_queue_name(self, caplog):
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {},
+        }
+        records = self._run_callback_with_logging(caplog, msg)
+        route_logs = [r for r in records if "V2 route matched" in r.getMessage()]
+        log_msg = route_logs[0].getMessage()
+        assert "queue='test_queue'" in log_msg
+
+    def test_log_includes_asset_fields(self, caplog):
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {},
+        }
+        records = self._run_callback_with_logging(caplog, msg)
+        route_logs = [r for r in records if "V2 route matched" in r.getMessage()]
+        log_msg = route_logs[0].getMessage()
+        assert "asset_id='HP-01'" in log_msg
+        assert "asset_type='heat_pump'" in log_msg
+        assert "message_type='command'" in log_msg
+
+    def test_log_includes_api_and_endpoint(self, caplog):
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {},
+        }
+        records = self._run_callback_with_logging(caplog, msg)
+        route_logs = [r for r in records if "V2 route matched" in r.getMessage()]
+        log_msg = route_logs[0].getMessage()
+        assert "api='local_api'" in log_msg
+        assert "endpoint='control_ep'" in log_msg
+
+    def test_log_does_not_include_password(self, caplog):
+        from scripts.forwarder_router import (
+            MessageRouter,
+            validate_routing_config,
+        )
+        config = _v2_config()
+        validated = validate_routing_config(config)
+        router = MessageRouter.from_validated_config(validated)
+        router.apis["local_api"].user = "testuser"
+        router.apis["local_api"].password = "s3cr3t_p@ssw0rd"
+
+        msg = {
+            "message_type": "command",
+            "asset_type": "heat_pump",
+            "asset_id": "HP-01",
+            "payload": {},
+        }
+
+        test_logger = logging.getLogger("test_no_secret")
+        source = type("S", (), {
+            "section": "realAssetCommands",
+            "queue": "q",
+        })()
+
+        with caplog.at_level(logging.INFO, logger="test_no_secret"):
+            resolution = router.resolve(msg, source.section)
+            if resolution.status == "matched":
+                matched_route = resolution.route
+                test_logger.info(
+                    "V2 route matched: route='%s' source='%s' queue='%s' "
+                    "priority=%d message_type='%s' asset_type='%s' "
+                    "asset_id='%s' api='%s' endpoint='%s'",
+                    matched_route.name,
+                    source.section,
+                    source.queue,
+                    matched_route.priority,
+                    msg.get("message_type", "unknown"),
+                    msg.get("asset_type", "unknown"),
+                    msg.get("asset_id", "unknown"),
+                    matched_route.api,
+                    matched_route.endpoint,
+                )
+
+        all_log_text = " ".join(r.getMessage() for r in caplog.records)
+        assert "s3cr3t_p@ssw0rd" not in all_log_text
+        assert "testuser" not in all_log_text

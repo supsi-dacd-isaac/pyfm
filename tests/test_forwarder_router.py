@@ -1738,3 +1738,87 @@ class TestDispatchSafety:
         assert result.success is False
         assert result.attempts == 1
         assert len(session.calls) == 1
+
+
+# ============================================================================
+# Unknown-field validation
+# ============================================================================
+
+class TestUnknownFieldValidation:
+    """Verify that validate_routing_config rejects unknown/mistyped fields."""
+
+    def _base_config(self):
+        return {
+            "version": 2,
+            "sources": {"src": {"section": "realAssetCommands"}},
+            "message_profiles": {"mp": {"message_type": "command"}},
+            "apis": {"api1": {"base_url": "http://example.com"}},
+            "endpoints": {"ep1": {"path_template": "/test", "method": "POST"}},
+            "routes": [{
+                "name": "r1", "source": "src",
+                "message_profile": "mp", "api": "api1", "endpoint": "ep1",
+            }],
+        }
+
+    def test_endpoint_unknown_field_raises(self):
+        cfg = self._base_config()
+        cfg["endpoints"]["ep1"]["bogus_field"] = True
+        with pytest.raises(RoutingConfigError, match="Unknown endpoint field 'bogus_field'"):
+            validate_routing_config(cfg)
+
+    def test_endpoint_path_raises_with_suggestion(self):
+        cfg = self._base_config()
+        cfg["endpoints"]["ep1"]["path"] = "/wrong"
+        with pytest.raises(RoutingConfigError, match="Did you mean 'path_template'"):
+            validate_routing_config(cfg)
+
+    def test_route_unknown_field_raises(self):
+        cfg = self._base_config()
+        cfg["routes"][0]["bogus"] = "x"
+        with pytest.raises(RoutingConfigError, match="Unknown route field 'bogus'"):
+            validate_routing_config(cfg)
+
+    def test_api_unknown_field_raises(self):
+        cfg = self._base_config()
+        cfg["apis"]["api1"]["bogus"] = True
+        with pytest.raises(RoutingConfigError, match="Unknown api field 'bogus'"):
+            validate_routing_config(cfg)
+
+    def test_message_profile_unknown_field_raises(self):
+        cfg = self._base_config()
+        cfg["message_profiles"]["mp"]["bogus"] = True
+        with pytest.raises(RoutingConfigError, match="Unknown message_profile field 'bogus'"):
+            validate_routing_config(cfg)
+
+    def test_source_unknown_field_raises(self):
+        cfg = self._base_config()
+        cfg["sources"]["src"]["bogus"] = True
+        with pytest.raises(RoutingConfigError, match="Unknown source field 'bogus'"):
+            validate_routing_config(cfg)
+
+    def test_defaults_unknown_field_raises(self):
+        cfg = self._base_config()
+        cfg["defaults"] = {"missing_message_dry_run_default": True, "bogus": 1}
+        with pytest.raises(RoutingConfigError, match="Unknown defaults field 'bogus'"):
+            validate_routing_config(cfg)
+
+    def test_comment_field_is_allowed_everywhere(self):
+        cfg = self._base_config()
+        cfg["sources"]["src"]["comment"] = "test"
+        cfg["message_profiles"]["mp"]["comment"] = "test"
+        cfg["apis"]["api1"]["comment"] = "test"
+        cfg["endpoints"]["ep1"]["comment"] = "test"
+        cfg["routes"][0]["comment"] = "test"
+        cfg["defaults"] = {"missing_message_dry_run_default": True, "comment": "test"}
+        result = validate_routing_config(cfg)
+        assert "routes" in result
+
+    def test_production_config_still_validates(self):
+        import json
+        cfg_path = os.path.join(
+            os.path.dirname(__file__), "..", "conf", "forwarder_routes.json"
+        )
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        result = validate_routing_config(cfg)
+        assert len(result["routes"]) > 0

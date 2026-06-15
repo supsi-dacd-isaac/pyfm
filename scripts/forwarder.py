@@ -2167,14 +2167,30 @@ Examples:
                 )
                 return True
 
+            matched_route = resolution.route
+            logger.info(
+                "V2 route matched: route='%s' source='%s' queue='%s' "
+                "priority=%d message_type='%s' asset_type='%s' "
+                "asset_id='%s' api='%s' endpoint='%s'",
+                matched_route.name,
+                source.section,
+                source.queue,
+                matched_route.priority,
+                message.get("message_type", "unknown"),
+                message.get("asset_type", "unknown"),
+                message.get("asset_id", "unknown"),
+                matched_route.api,
+                matched_route.endpoint,
+            )
+
             try:
                 resolved_req = build_resolved_request(
-                    message, resolution.route, _v2_router, _v2_dry_run
+                    message, matched_route, _v2_router, _v2_dry_run
                 )
             except Exception as exc:
                 logger.error(
                     "V2 request build failed for route '%s': %s",
-                    resolution.route.name,
+                    matched_route.name,
                     str(exc),
                 )
                 return True

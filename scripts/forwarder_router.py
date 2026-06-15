@@ -300,6 +300,67 @@ def detect_config_mode(config: dict) -> str:
 # Config validation (v2 only)
 # ---------------------------------------------------------------------------
 
+_KNOWN_TOP_LEVEL_KEYS = frozenset({
+    "version", "sources", "message_profiles", "apis", "endpoints",
+    "routes", "on_no_match", "on_ambiguous_match", "on_http_failure",
+    "defaults", "comment",
+})
+
+_KNOWN_SOURCE_KEYS = frozenset({"section", "comment"})
+
+_KNOWN_PROFILE_KEYS = frozenset({
+    "message_type", "asset_types", "asset_ids", "command_types", "comment",
+})
+
+_KNOWN_API_KEYS = frozenset({
+    "base_url", "reference_api", "user", "password",
+    "timeout", "retries", "verify_ssl", "comment",
+})
+
+_KNOWN_ENDPOINT_KEYS = frozenset({
+    "path_template", "method", "body_mode", "body_template",
+    "headers", "success_status_codes", "comment",
+})
+
+_KNOWN_ROUTE_KEYS = frozenset({
+    "name", "source", "message_profile", "api", "endpoint",
+    "priority", "enabled", "dry_run", "comment",
+})
+
+_KNOWN_DEFAULTS_KEYS = frozenset({
+    "on_no_match", "on_ambiguous_match", "on_http_failure",
+    "missing_message_dry_run_default", "comment",
+})
+
+_ENDPOINT_FIELD_SUGGESTIONS: Dict[str, str] = {
+    "path": "path_template",
+    "url": "path_template",
+    "template": "path_template",
+    "status_codes": "success_status_codes",
+    "body": "body_template",
+}
+
+
+def _check_unknown_fields(
+    data: dict,
+    allowed: frozenset,
+    section_type: str,
+    item_name: str,
+    errors: List[str],
+    suggestions: Optional[Dict[str, str]] = None,
+) -> None:
+    """Append errors for any keys in *data* not in *allowed*."""
+    for key in data:
+        if key not in allowed:
+            hint = ""
+            if suggestions and key in suggestions:
+                hint = f". Did you mean '{suggestions[key]}'?"
+            errors.append(
+                f"Unknown {section_type} field '{key}' "
+                f"in {section_type} '{item_name}'{hint}"
+            )
+
+
 def validate_routing_config(config: dict) -> dict:
     """Validate a v2 routing configuration.
 
@@ -313,6 +374,10 @@ def validate_routing_config(config: dict) -> dict:
 
     # -- defaults / policies -------------------------------------------------
     defaults_data = config.get("defaults", {})
+    if isinstance(defaults_data, dict):
+        _check_unknown_fields(
+            defaults_data, _KNOWN_DEFAULTS_KEYS, "defaults", "defaults", errors
+        )
     defaults = RoutingDefaults.from_dict(defaults_data)
 
     if defaults.on_no_match not in VALID_NO_MATCH_POLICIES:
@@ -336,11 +401,24 @@ def validate_routing_config(config: dict) -> dict:
     if not isinstance(sources, dict):
         errors.append("'sources' must be an object")
         sources = {}
+    else:
+        for src_name, src_data in sources.items():
+            if isinstance(src_data, dict):
+                _check_unknown_fields(
+                    src_data, _KNOWN_SOURCE_KEYS, "source", src_name, errors
+                )
 
     profiles_data = config.get("message_profiles", {})
     if not isinstance(profiles_data, dict):
         errors.append("'message_profiles' must be an object")
         profiles_data = {}
+    else:
+        for prof_name, prof_data in profiles_data.items():
+            if isinstance(prof_data, dict):
+                _check_unknown_fields(
+                    prof_data, _KNOWN_PROFILE_KEYS,
+                    "message_profile", prof_name, errors,
+                )
     profiles = {
         name: MessageProfile.from_dict(name, pdata)
         for name, pdata in profiles_data.items()
@@ -350,6 +428,12 @@ def validate_routing_config(config: dict) -> dict:
     if not isinstance(apis_data, dict):
         errors.append("'apis' must be an object")
         apis_data = {}
+    else:
+        for api_name, api_data in apis_data.items():
+            if isinstance(api_data, dict):
+                _check_unknown_fields(
+                    api_data, _KNOWN_API_KEYS, "api", api_name, errors
+                )
     apis = {
         name: ApiConfig.from_dict(name, adata) for name, adata in apis_data.items()
     }
@@ -358,6 +442,14 @@ def validate_routing_config(config: dict) -> dict:
     if not isinstance(endpoints_data, dict):
         errors.append("'endpoints' must be an object")
         endpoints_data = {}
+    else:
+        for ep_name, ep_data in endpoints_data.items():
+            if isinstance(ep_data, dict):
+                _check_unknown_fields(
+                    ep_data, _KNOWN_ENDPOINT_KEYS,
+                    "endpoint", ep_name, errors,
+                    suggestions=_ENDPOINT_FIELD_SUGGESTIONS,
+                )
     endpoints = {
         name: EndpointConfig.from_dict(name, edata)
         for name, edata in endpoints_data.items()
@@ -376,6 +468,11 @@ def validate_routing_config(config: dict) -> dict:
         if not isinstance(rdata, dict):
             errors.append(f"Route at index {idx} must be an object")
             continue
+
+        route_label = rdata.get("name", f"index {idx}")
+        _check_unknown_fields(
+            rdata, _KNOWN_ROUTE_KEYS, "route", route_label, errors
+        )
 
         for req_field in ("name", "source", "message_profile", "api", "endpoint"):
             if req_field not in rdata:
