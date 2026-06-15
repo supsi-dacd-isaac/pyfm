@@ -32,7 +32,7 @@ logger = logging.getLogger("forwarder")
 # Valid policy values (only the defaults implemented in Step 1)
 # ---------------------------------------------------------------------------
 
-VALID_NO_MATCH_POLICIES = frozenset({"ack_warn_no_forward"})
+VALID_NO_MATCH_POLICIES = frozenset({"ack_warn_no_forward", "ack_silent_no_forward"})
 VALID_AMBIGUOUS_MATCH_POLICIES = frozenset({"ack_error_no_forward"})
 VALID_HTTP_FAILURE_POLICIES = frozenset({"ack_error_no_requeue"})
 
