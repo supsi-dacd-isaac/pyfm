@@ -88,6 +88,32 @@ except ImportError:
     sys.exit(1)
 
 
+# V2 configurable routing support
+try:
+    from scripts.forwarder_router import (
+        RoutingConfigError,
+        detect_config_mode,
+        validate_routing_config,
+        MessageRouter,
+        build_resolved_request,
+        dispatch_http_request,
+    )
+    V2_ROUTING_AVAILABLE = True
+except ImportError:
+    try:
+        from forwarder_router import (
+            RoutingConfigError,
+            detect_config_mode,
+            validate_routing_config,
+            MessageRouter,
+            build_resolved_request,
+            dispatch_http_request,
+        )
+        V2_ROUTING_AVAILABLE = True
+    except ImportError:
+        V2_ROUTING_AVAILABLE = False
+
+
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
@@ -1459,7 +1485,8 @@ class RabbitMQConsumer:
         logger: logging.Logger = None,
         command_handler: Callable = None,
         measurement_handler: Callable = None,
-        asset_types_filter: List[str] = None
+        asset_types_filter: List[str] = None,
+        message_callback: Optional[Callable[[dict, "RabbitMQSource"], bool]] = None,
     ):
         """
         Initialize RabbitMQ consumer.
@@ -1475,6 +1502,8 @@ class RabbitMQConsumer:
         :param command_handler: Callback function for command messages
         :param measurement_handler: Callback function for measurement messages
         :param asset_types_filter: List of asset types to process (None = all)
+        :param message_callback: V2 routing callback — receives (message, source)
+            and returns True to ack.  When set, overrides legacy handler dispatch.
         """
         if not sources:
             raise ValueError("RabbitMQConsumer requires at least one RabbitMQSource")
@@ -1491,6 +1520,7 @@ class RabbitMQConsumer:
         self.command_handler = command_handler
         self.measurement_handler = measurement_handler
         self.asset_types_filter = asset_types_filter
+        self.message_callback = message_callback
         
         self.connection = None
         self.channel = None
@@ -1603,8 +1633,24 @@ class RabbitMQConsumer:
                     )
                     ch.basic_ack(delivery_tag=delivery_tag)
                     return
-            
-            # Dispatch to appropriate handler
+
+            # V2 routing callback path — always ack, never requeue
+            if self.message_callback is not None:
+                try:
+                    self.message_callback(message, source)
+                except Exception:
+                    self.logger.exception(
+                        "V2 message callback error: queue=%s source=%s "
+                        "delivery_tag=%s; acking to prevent requeue",
+                        queue_name,
+                        section,
+                        delivery_tag,
+                    )
+                ch.basic_ack(delivery_tag=delivery_tag)
+                self._messages_processed += 1
+                return
+
+            # Dispatch to appropriate handler (legacy path)
             handled = False
             
             if message_type == "command":
@@ -1908,15 +1954,123 @@ Examples:
     target_handler.set_conns_lookup(args.conns, [config_dir], conns_config, [fallback_conns_path])
     rabbitmq_cfg = conns_config.get("rabbitMQ", {})
 
-    try:
-        rabbitmq_sources = resolve_rabbitmq_sources(
-            rabbitmq_cfg,
-            requested_sections=args.rabbit_sections,
-            logger=logger,
+    # -- Load forwarder config to detect routing mode -----------------------
+    config_data = {}
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, "r") as f:
+                config_data = json.load(f)
+        except Exception as e:
+            logger.error("Failed to load config from %s: %s", config_path, str(e))
+            sys.exit(1)
+    else:
+        logger.warning("Config file not found: %s", config_path)
+
+    config_mode = "legacy"
+    v2_router = None
+    if V2_ROUTING_AVAILABLE:
+        try:
+            config_mode = detect_config_mode(config_data)
+        except RoutingConfigError as e:
+            logger.error("Invalid configuration: %s", str(e))
+            sys.exit(1)
+    elif config_data.get("routes"):
+        logger.error(
+            "Config contains v2 routes but forwarder_router module is not available"
         )
-    except ValueError as exc:
-        logger.error("Invalid RabbitMQ source configuration: %s", str(exc))
         sys.exit(1)
+
+    logger.info("Config mode: %s (from %s)", config_mode, config_path)
+
+    # -- Resolve RabbitMQ sources -------------------------------------------
+    if config_mode == "v2":
+        try:
+            validated_config = validate_routing_config(config_data)
+        except RoutingConfigError as e:
+            logger.error("Invalid v2 routing configuration: %s", str(e))
+            sys.exit(1)
+
+        v2_router = MessageRouter.from_validated_config(validated_config)
+
+        # Resolve reference_api for v2 APIs from conns.json
+        for api_name, api_cfg in v2_router.apis.items():
+            if api_cfg.reference_api:
+                ref_cfg = conns_config.get(api_cfg.reference_api, {})
+                if ref_cfg:
+                    if not api_cfg.base_url:
+                        ctrl = (
+                            ref_cfg.get("controlUrl")
+                            or ref_cfg.get("controlURL")
+                        )
+                        api_cfg.base_url = (
+                            _normalize_control_url(ctrl, ref_cfg.get("port"))
+                            or ""
+                        )
+                    if not api_cfg.user:
+                        api_cfg.user = ref_cfg.get("user")
+                    if not api_cfg.password:
+                        api_cfg.password = ref_cfg.get("password")
+                    logger.info(
+                        "V2 API '%s' reference_api '%s' resolved: "
+                        "base_url='%s' user='%s'",
+                        api_name,
+                        api_cfg.reference_api,
+                        api_cfg.base_url or "",
+                        api_cfg.user or "",
+                    )
+                else:
+                    logger.warning(
+                        "V2 API '%s' references unknown '%s' in conns.json",
+                        api_name,
+                        api_cfg.reference_api,
+                    )
+
+        active_source_names = {r.source for r in v2_router.routes if r.enabled}
+        v2_sections: set = set()
+        for src_name in active_source_names:
+            src_def = v2_router.sources.get(src_name, {})
+            sec = src_def.get("section")
+            if sec:
+                v2_sections.add(sec)
+
+        if args.rabbit_sections:
+            whitelist = {
+                s.strip()
+                for s in args.rabbit_sections.split(",")
+                if s.strip()
+            }
+            for dropped in sorted(v2_sections - whitelist):
+                logger.warning(
+                    "V2 source section '%s' not in FORWARDER_RABBIT_SECTIONS; "
+                    "routes using it will be skipped",
+                    dropped,
+                )
+            v2_sections &= whitelist
+
+        if not v2_sections:
+            logger.error(
+                "No active RabbitMQ sections for v2 routing after filtering"
+            )
+            sys.exit(1)
+
+        try:
+            rabbitmq_sources = [
+                _rabbitmq_source_from_section(sec, rabbitmq_cfg.get(sec))
+                for sec in sorted(v2_sections)
+            ]
+        except ValueError as exc:
+            logger.error("Invalid v2 RabbitMQ source: %s", str(exc))
+            sys.exit(1)
+    else:
+        try:
+            rabbitmq_sources = resolve_rabbitmq_sources(
+                rabbitmq_cfg,
+                requested_sections=args.rabbit_sections,
+                logger=logger,
+            )
+        except ValueError as exc:
+            logger.error("Invalid RabbitMQ source configuration: %s", str(exc))
+            sys.exit(1)
 
     rabbitmq_host = (
         args.rabbitmq_host
@@ -1963,113 +2117,220 @@ Examples:
             source.routing_key,
         )
 
-    # Load targets from config file
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                targets_config = json.load(f)
+    # -- Mode-specific setup: v2 routing OR legacy targets --------------------
+    handler = None  # only set for legacy mode (used by signal handler)
 
-            default_request_timeout_seconds = _coerce_request_timeout_seconds(
-                targets_config.get("request_timeout_seconds")
-                if targets_config.get("request_timeout_seconds") is not None
-                else targets_config.get("default_timeout"),
-                DEFAULT_REQUEST_TIMEOUT_SECONDS,
-            )
-            default_request_retries = _coerce_request_retries(
-                targets_config.get("request_retries")
-                if targets_config.get("request_retries") is not None
-                else targets_config.get("max_retries"),
-                DEFAULT_REQUEST_RETRIES,
-            )
+    if config_mode == "v2":
+        # V2 routing — create message callback
+        v2_http_session = None
+        if REQUESTS_AVAILABLE:
+            v2_http_session = requests.Session()
 
-            for target_data in targets_config.get("targets", []):
-                target_config = TargetConfig.from_dict(
-                    target_data,
-                    default_request_timeout_seconds=default_request_timeout_seconds,
-                    default_request_retries=default_request_retries,
+        _v2_router = v2_router
+        _v2_dry_run = force_dry_run
+
+        def _v2_message_callback(message: dict, source: RabbitMQSource) -> bool:
+            resolution = _v2_router.resolve(message, source.section)
+
+            if resolution.status == "no_match":
+                if _v2_router.defaults.on_no_match == "ack_warn_no_forward":
+                    logger.warning(
+                        "V2 no route matched: source=%s queue=%s "
+                        "message_type=%s asset_type=%s asset_id=%s",
+                        source.section,
+                        source.queue,
+                        message.get("message_type", "unknown"),
+                        message.get("asset_type", "unknown"),
+                        message.get("asset_id", "unknown"),
+                    )
+                return True
+
+            if resolution.status == "ambiguous":
+                route_names = [r.name for r in resolution.matching_routes]
+                priorities = list(
+                    {r.priority for r in resolution.matching_routes}
                 )
-                reference_api = target_config.reference_api
-                if reference_api:
-                    api_config = conns_config.get(reference_api)
-                    if not api_config and not fallback_conns_loaded and os.path.exists(fallback_conns_path):
-                        logger.info("Attempting fallback conns.json at: %s", fallback_conns_path)
-                        conns_config = _load_conns_config(fallback_conns_path, logger)
-                        target_handler.set_conns_lookup(fallback_conns_path, [config_dir], conns_config, [fallback_conns_path])
-                        fallback_conns_loaded = True
-                        api_config = conns_config.get(reference_api)
-                    if api_config:
-                        target_config.apply_api_config(api_config)
-                        logger.info(
-                            "Target '%s' reference_api '%s' resolved controlUrl '%s' (user: %s)",
-                            target_config.name,
-                            reference_api,
-                            target_config.url or "",
-                            target_config.auth_user or ""
-                        )
-                    else:
-                        logger.warning(
-                            "Target '%s' references unknown API '%s' in conns.json",
-                            target_config.name, reference_api
-                        )
-                else:
-                    logger.debug("Target '%s' has no reference_api configured", target_config.name)
-                target_handler.add_target(target_config)
+                profiles = list(
+                    {r.message_profile for r in resolution.matching_routes}
+                )
+                logger.error(
+                    "V2 ambiguous route match: routes=%s priorities=%s "
+                    "profiles=%s source=%s message_type=%s "
+                    "asset_type=%s asset_id=%s",
+                    route_names,
+                    priorities,
+                    profiles,
+                    source.section,
+                    message.get("message_type", "unknown"),
+                    message.get("asset_type", "unknown"),
+                    message.get("asset_id", "unknown"),
+                )
+                return True
 
-            logger.info("Loaded %d target(s) from config file: %s",
-                       len(target_handler.targets), config_path)
-        except Exception as e:
-            logger.error("Failed to load targets config from %s: %s", config_path, str(e))
+            matched_route = resolution.route
+            logger.info(
+                "V2 route matched: route='%s' source='%s' queue='%s' "
+                "priority=%d message_type='%s' asset_type='%s' "
+                "asset_id='%s' api='%s' endpoint='%s'",
+                matched_route.name,
+                source.section,
+                source.queue,
+                matched_route.priority,
+                message.get("message_type", "unknown"),
+                message.get("asset_type", "unknown"),
+                message.get("asset_id", "unknown"),
+                matched_route.api,
+                matched_route.endpoint,
+            )
+
+            try:
+                resolved_req = build_resolved_request(
+                    message, matched_route, _v2_router, _v2_dry_run
+                )
+            except Exception as exc:
+                logger.error(
+                    "V2 request build failed for route '%s': %s",
+                    matched_route.name,
+                    str(exc),
+                )
+                return True
+
+            dispatch_http_request(
+                resolved_req,
+                message,
+                policy=_v2_router.defaults.on_http_failure,
+                session=v2_http_session,
+            )
+            return True
+
+        logger.info(
+            "V2 routing active: %d route(s), %d source(s)",
+            len([r for r in _v2_router.routes if r.enabled]),
+            len(rabbitmq_sources),
+        )
+
+        consumer = RabbitMQConsumer(
+            sources=rabbitmq_sources,
+            host=rabbitmq_host,
+            port=rabbitmq_port,
+            username=rabbitmq_user,
+            password=rabbitmq_password,
+            virtual_host=rabbitmq_vhost,
+            logger=logger,
+            message_callback=_v2_message_callback,
+            asset_types_filter=asset_types_filter,
+        )
+
     else:
-        logger.warning("Config file not found: %s", config_path)
-        logger.info("No forwarding targets configured - commands will only be logged")
+        # Legacy targets path
+        targets_config = config_data
 
-    if target_handler.targets:
-        logger.info("-" * 60)
-        logger.info("Configured forwarding targets:")
-        for name, target in target_handler.targets.items():
-            logger.info("  - %s: %s (auth: %s)",
-                       name, target.url,
-                       "enabled" if target.get_auth() else "disabled")
-        logger.info("-" * 60)
+        if targets_config:
+            try:
+                default_request_timeout_seconds = _coerce_request_timeout_seconds(
+                    targets_config.get("request_timeout_seconds")
+                    if targets_config.get("request_timeout_seconds") is not None
+                    else targets_config.get("default_timeout"),
+                    DEFAULT_REQUEST_TIMEOUT_SECONDS,
+                )
+                default_request_retries = _coerce_request_retries(
+                    targets_config.get("request_retries")
+                    if targets_config.get("request_retries") is not None
+                    else targets_config.get("max_retries"),
+                    DEFAULT_REQUEST_RETRIES,
+                )
 
-    # Create handler
-    handler = CommandHandler(logger, force_dry_run=force_dry_run, target_handler=target_handler)
+                for target_data in targets_config.get("targets", []):
+                    target_config = TargetConfig.from_dict(
+                        target_data,
+                        default_request_timeout_seconds=default_request_timeout_seconds,
+                        default_request_retries=default_request_retries,
+                    )
+                    reference_api = target_config.reference_api
+                    if reference_api:
+                        api_config = conns_config.get(reference_api)
+                        if not api_config and not fallback_conns_loaded and os.path.exists(fallback_conns_path):
+                            logger.info("Attempting fallback conns.json at: %s", fallback_conns_path)
+                            conns_config = _load_conns_config(fallback_conns_path, logger)
+                            target_handler.set_conns_lookup(fallback_conns_path, [config_dir], conns_config, [fallback_conns_path])
+                            fallback_conns_loaded = True
+                            api_config = conns_config.get(reference_api)
+                        if api_config:
+                            target_config.apply_api_config(api_config)
+                            logger.info(
+                                "Target '%s' reference_api '%s' resolved controlUrl '%s' (user: %s)",
+                                target_config.name,
+                                reference_api,
+                                target_config.url or "",
+                                target_config.auth_user or ""
+                            )
+                        else:
+                            logger.warning(
+                                "Target '%s' references unknown API '%s' in conns.json",
+                                target_config.name, reference_api
+                            )
+                    else:
+                        logger.debug("Target '%s' has no reference_api configured", target_config.name)
+                    target_handler.add_target(target_config)
 
-    # Create consumer
-    consumer = RabbitMQConsumer(
-        sources=rabbitmq_sources,
-        host=rabbitmq_host,
-        port=rabbitmq_port,
-        username=rabbitmq_user,
-        password=rabbitmq_password,
-        virtual_host=rabbitmq_vhost,
-        logger=logger,
-        command_handler=handler.handle_command,
-        measurement_handler=handler.handle_measurement,
-        asset_types_filter=asset_types_filter
-    )
+                logger.info("Loaded %d target(s) from config file: %s",
+                           len(target_handler.targets), config_path)
+            except Exception as e:
+                logger.error("Failed to load targets config from %s: %s", config_path, str(e))
+        else:
+            logger.info("No forwarding targets configured - commands will only be logged")
+
+        if target_handler.targets:
+            logger.info("-" * 60)
+            logger.info("Configured forwarding targets:")
+            for name, target in target_handler.targets.items():
+                logger.info("  - %s: %s (auth: %s)",
+                           name, target.url,
+                           "enabled" if target.get_auth() else "disabled")
+            logger.info("-" * 60)
+
+        handler = CommandHandler(logger, force_dry_run=force_dry_run, target_handler=target_handler)
+
+        consumer = RabbitMQConsumer(
+            sources=rabbitmq_sources,
+            host=rabbitmq_host,
+            port=rabbitmq_port,
+            username=rabbitmq_user,
+            password=rabbitmq_password,
+            virtual_host=rabbitmq_vhost,
+            logger=logger,
+            command_handler=handler.handle_command,
+            measurement_handler=handler.handle_measurement,
+            asset_types_filter=asset_types_filter,
+        )
     
     # Setup signal handlers for graceful shutdown
     def signal_handler(signum, frame):
         logger.info("Received signal %d, shutting down...", signum)
         consumer.disconnect()
-        
-        # Print statistics
-        stats = handler.get_statistics()
+
         logger.info("=" * 60)
         logger.info("FORWARDER SHUTDOWN - Statistics")
         logger.info("=" * 60)
-        logger.info("Total commands processed: %d", stats["total_commands"])
-        if stats["by_type"]:
-            logger.info("Commands by type:")
-            for cmd_type, count in stats["by_type"].items():
-                logger.info("  %s: %d", cmd_type, count)
-        if stats["by_asset"]:
-            logger.info("Commands by asset:")
-            for asset_id, count in stats["by_asset"].items():
-                logger.info("  %s: %d", asset_id, count)
+
+        if handler is not None:
+            stats = handler.get_statistics()
+            logger.info("Total commands processed: %d", stats["total_commands"])
+            if stats["by_type"]:
+                logger.info("Commands by type:")
+                for cmd_type, count in stats["by_type"].items():
+                    logger.info("  %s: %d", cmd_type, count)
+            if stats["by_asset"]:
+                logger.info("Commands by asset:")
+                for asset_id, count in stats["by_asset"].items():
+                    logger.info("  %s: %d", asset_id, count)
+        else:
+            logger.info(
+                "V2 routing — messages processed: %d",
+                consumer.get_messages_processed(),
+            )
+
         logger.info("=" * 60)
-        
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
