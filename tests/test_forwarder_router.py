@@ -1,12 +1,13 @@
 """Tests for the forwarder configurable routing core (scripts/forwarder_router.py).
 
 Covers:
-  - MessageProfile matching
-  - Route resolution (priority, ambiguity, no-match, disabled, source)
-  - Config mode detection and validation
-  - Dry-run resolution helper
+  Step 1 — MessageProfile matching, route resolution, config detection/validation,
+           dry-run resolution helper.
+  Step 2 — URL/path resolution, body building (templates, body_mode, passthrough),
+           ResolvedRequest construction, request-level dry-run.
 """
 
+import copy
 import os
 import sys
 import pytest
@@ -18,11 +19,14 @@ from forwarder_router import (
     EndpointConfig,
     MessageProfile,
     MessageRouter,
+    ResolvedRequest,
     RouteConfig,
     RouteResolutionResult,
     RoutingConfigError,
     RoutingDefaults,
+    build_resolved_request,
     detect_config_mode,
+    extract_message_dry_run,
     resolve_effective_dry_run,
     validate_routing_config,
 )
@@ -658,3 +662,715 @@ class TestDataclassConstruction:
     def test_routing_defaults_from_none(self):
         d = RoutingDefaults.from_dict(None)
         assert d.missing_message_dry_run_default is True
+
+
+# ========================================================================
+# Step 2 — Helpers for request-building tests
+# ========================================================================
+
+def _request_building_config(**overrides):
+    """Return a v2 config tailored for request-building tests."""
+    cfg = {
+        "version": 2,
+        "defaults": {
+            "on_no_match": "ack_warn_no_forward",
+            "on_ambiguous_match": "ack_error_no_forward",
+            "on_http_failure": "ack_error_no_requeue",
+            "missing_message_dry_run_default": True,
+        },
+        "sources": {
+            "src_cmd": {"section": "realAssetCommands"},
+        },
+        "message_profiles": {
+            "hp_commands": {
+                "message_type": "command",
+                "asset_types": ["heat_pump"],
+            },
+            "ev_commands": {
+                "message_type": "command",
+                "asset_types": ["ev_charger"],
+            },
+            "all_commands": {
+                "message_type": "command",
+            },
+        },
+        "apis": {
+            "aem_api": {
+                "base_url": "https://aem.example.com",
+                "user": "admin",
+                "password": "secret",
+                "timeout": 15.0,
+                "retries": 2,
+                "verify_ssl": True,
+            },
+            "bare_api": {
+                "base_url": "https://bare.example.com",
+            },
+        },
+        "endpoints": {
+            "hp_control": {
+                "method": "POST",
+                "path_template": "/api/v1/assets/{asset_id}/control",
+            },
+            "ev_power": {
+                "method": "POST",
+                "path_template": "/api/v1/ev/{asset_id}/power",
+                "body_mode": "ev_power_timeseries",
+            },
+            "hp_mode": {
+                "method": "POST",
+                "path_template": "/api/v1/hp/{asset_id}/control",
+                "body_mode": "hp_control",
+            },
+            "nested_path": {
+                "method": "POST",
+                "path_template": "/api/v1/{asset_type}/{payload.pod}/cmd",
+            },
+            "absolute_ep": {
+                "method": "PUT",
+                "path_template": "https://other.example.com/override/{asset_id}",
+                "headers": {"X-Custom": "value"},
+                "success_status_codes": [200, 204],
+            },
+            "template_body_ep": {
+                "method": "POST",
+                "path_template": "/api/cmd",
+                "body_template": {
+                    "cmd": {"$map": "command_type"},
+                    "asset": {"$map": "asset_id"},
+                    "power": {"$map": "payload.target_power_kw"},
+                },
+            },
+            "map_list_fallback_ep": {
+                "method": "POST",
+                "path_template": "/api/cmd",
+                "body_template": {
+                    "ts": {
+                        "$map": ["payload.slot_start", "timestamp"],
+                    },
+                },
+            },
+            "both_mode_and_template_ep": {
+                "method": "POST",
+                "path_template": "/api/both",
+                "body_mode": "hp_control",
+                "body_template": {"should_be": "ignored"},
+            },
+            "passthrough_ep": {
+                "method": "POST",
+                "path_template": "/api/pass",
+            },
+            "missing_placeholder_ep": {
+                "method": "POST",
+                "path_template": "/api/{nonexistent_field}/control",
+            },
+        },
+        "routes": [
+            {
+                "name": "hp_to_aem",
+                "source": "src_cmd",
+                "message_profile": "hp_commands",
+                "api": "aem_api",
+                "endpoint": "hp_control",
+                "priority": 100,
+                "enabled": True,
+            },
+            {
+                "name": "ev_to_aem",
+                "source": "src_cmd",
+                "message_profile": "ev_commands",
+                "api": "aem_api",
+                "endpoint": "ev_power",
+                "priority": 100,
+                "enabled": True,
+            },
+        ],
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _build_request_router(config=None):
+    """Validate config and return a MessageRouter for request tests."""
+    cfg = config or _request_building_config()
+    validated = validate_routing_config(cfg)
+    return MessageRouter.from_validated_config(validated)
+
+
+def _hp_message(**overrides):
+    """A standard heat-pump command message."""
+    msg = {
+        "message_type": "command",
+        "asset_type": "heat_pump",
+        "asset_id": "HP-01",
+        "command_type": "curtail",
+        "timestamp": "2026-06-15T12:00:00",
+        "payload": {
+            "target_power_kw": 2.5,
+            "slot_start": "2026-06-15T12:00:00",
+            "slot_end": "2026-06-15T12:15:00",
+            "dry_run": False,
+        },
+    }
+    msg.update(overrides)
+    return msg
+
+
+def _ev_message(**overrides):
+    """A standard EV charger command message."""
+    msg = {
+        "message_type": "command",
+        "asset_type": "ev_charger",
+        "asset_id": "EV-01",
+        "command_type": "curtail",
+        "timestamp": "2026-06-15T12:00:00",
+        "payload": {
+            "power_kw": 7.4,
+            "slot_start": "2026-06-15T12:00:00",
+            "slot_end": "2026-06-15T12:15:00",
+            "dry_run": False,
+        },
+    }
+    msg.update(overrides)
+    return msg
+
+
+# ========================================================================
+# URL / path resolution
+# ========================================================================
+
+class TestUrlResolution:
+
+    def test_relative_path_appended_to_base_url(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]  # hp_to_aem
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.url == "https://aem.example.com/api/v1/assets/HP-01/control"
+
+    def test_absolute_path_used_as_is(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "hp_abs",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "absolute_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "hp_abs"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.url == "https://other.example.com/override/HP-01"
+
+    def test_duplicate_slashes_handled(self):
+        cfg = _request_building_config()
+        cfg["apis"]["slash_api"] = {"base_url": "https://example.com/"}
+        cfg["endpoints"]["slash_ep"] = {
+            "method": "POST",
+            "path_template": "/api/{asset_id}",
+        }
+        cfg["routes"].append({
+            "name": "slash_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "slash_api",
+            "endpoint": "slash_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "slash_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.url == "https://example.com/api/HP-01"
+        assert "//" not in req.url.split("://", 1)[1]
+
+    def test_top_level_placeholder_resolves(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert "HP-01" in req.url
+
+    def test_nested_placeholder_resolves(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "nested_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "nested_path",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        msg["payload"]["pod"] = "POD-42"
+        route = [r for r in router.routes if r.name == "nested_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.url == "https://aem.example.com/api/v1/heat_pump/POD-42/cmd"
+
+    def test_missing_placeholder_raises(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "bad_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "missing_placeholder_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "bad_route"][0]
+
+        with pytest.raises(ValueError, match="Unresolved template placeholder"):
+            build_resolved_request(msg, route, router, forwarder_dry_run=True)
+
+    def test_api_fields_resolve_in_path(self):
+        cfg = _request_building_config()
+        cfg["endpoints"]["api_ref_ep"] = {
+            "method": "POST",
+            "path_template": "{api.base_url}/custom/{asset_id}",
+        }
+        cfg["routes"].append({
+            "name": "api_ref_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "api_ref_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "api_ref_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.url == "https://aem.example.com/custom/HP-01"
+
+    def test_missing_base_url_for_relative_path_raises(self):
+        cfg = _request_building_config()
+        cfg["apis"]["no_url_api"] = {"base_url": ""}
+        cfg["routes"].append({
+            "name": "no_url_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "no_url_api",
+            "endpoint": "hp_control",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "no_url_route"][0]
+
+        with pytest.raises(ValueError, match="no base_url"):
+            build_resolved_request(msg, route, router, forwarder_dry_run=True)
+
+
+# ========================================================================
+# Body building
+# ========================================================================
+
+class TestBodyBuilding:
+
+    def test_body_template_maps_top_level_fields(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "tmpl_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "template_body_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "tmpl_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.body["cmd"] == "curtail"
+        assert req.body["asset"] == "HP-01"
+
+    def test_body_template_maps_nested_payload_fields(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "tmpl_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "template_body_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "tmpl_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.body["power"] == 2.5
+
+    def test_map_with_list_fallback(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "fallback_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "map_list_fallback_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "fallback_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.body["ts"] == "2026-06-15T12:00:00"
+
+    def test_map_list_falls_through_to_second(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "fallback_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "map_list_fallback_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        del msg["payload"]["slot_start"]
+        route = [r for r in router.routes if r.name == "fallback_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.body["ts"] == "2026-06-15T12:00:00"
+
+    def test_body_mode_hp_control(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "hp_mode_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "hp_mode",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "hp_mode_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.body["command"] == "curtail"
+        assert req.body["asset_id"] == "HP-01"
+        assert req.body["asset_type"] == "heat_pump"
+        assert req.body["timestamp"] == "2026-06-15T12:00:00"
+        assert "payload" in req.body
+
+    def test_body_mode_ev_power_timeseries(self):
+        router = _build_request_router()
+        msg = _ev_message()
+        route = router.routes[1]  # ev_to_aem
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert isinstance(req.body, dict)
+        assert len(req.body) == 1
+        ts_key = list(req.body.keys())[0]
+        assert "2026-06-15" in ts_key
+        assert req.body[ts_key] == 7.4
+
+    def test_body_mode_takes_precedence_over_body_template(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "both_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "both_mode_and_template_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "both_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert "command" in req.body
+        assert "should_be" not in req.body
+
+    def test_passthrough_body_when_no_mode_or_template(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "pass_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "passthrough_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "pass_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.body["message_type"] == "command"
+        assert req.body["asset_id"] == "HP-01"
+        assert req.body["payload"]["target_power_kw"] == 2.5
+
+    def test_input_message_is_not_mutated(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "tmpl_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "template_body_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        original = copy.deepcopy(msg)
+        route = [r for r in router.routes if r.name == "tmpl_route"][0]
+
+        build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert msg == original
+
+    def test_passthrough_body_is_independent_copy(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "pass_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "passthrough_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "pass_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        req.body["payload"]["target_power_kw"] = 999.0
+        assert msg["payload"]["target_power_kw"] == 2.5
+
+
+# ========================================================================
+# Request object
+# ========================================================================
+
+class TestResolvedRequest:
+
+    def test_method_defaults_to_post(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.method == "POST"
+
+    def test_custom_method_is_respected(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "put_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "absolute_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "put_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.method == "PUT"
+
+    def test_headers_are_included(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "hdr_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "absolute_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "hdr_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.headers == {"X-Custom": "value"}
+
+    def test_success_status_codes_default(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.success_status_codes == [200, 201, 202, 204]
+
+    def test_custom_success_status_codes(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "code_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "aem_api",
+            "endpoint": "absolute_ep",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "code_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.success_status_codes == [200, 204]
+
+    def test_api_timeout_retries_verify_ssl(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.timeout_seconds == 15.0
+        assert req.request_retries == 2
+        assert req.verify_ssl is True
+
+    def test_api_defaults_for_bare_api(self):
+        cfg = _request_building_config()
+        cfg["routes"].append({
+            "name": "bare_route",
+            "source": "src_cmd",
+            "message_profile": "hp_commands",
+            "api": "bare_api",
+            "endpoint": "hp_control",
+            "priority": 200,
+        })
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = [r for r in router.routes if r.name == "bare_route"][0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.timeout_seconds == 10.0
+        assert req.request_retries == 3
+        assert req.verify_ssl is False
+        assert req.auth is None
+
+    def test_auth_from_api_config(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.auth == ("admin", "secret")
+
+    def test_diagnostic_names_preserved(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.route_name == "hp_to_aem"
+        assert req.api_name == "aem_api"
+        assert req.endpoint_name == "hp_control"
+
+
+# ========================================================================
+# Dry-run in request building
+# ========================================================================
+
+class TestRequestDryRun:
+
+    def test_forwarder_dry_run_prevents_live(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=True)
+        assert req.effective_dry_run is True
+
+    def test_route_dry_run_prevents_live(self):
+        cfg = _request_building_config()
+        cfg["routes"][0]["dry_run"] = True
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=False)
+        assert req.effective_dry_run is True
+
+    def test_message_dry_run_prevents_live(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        msg["payload"]["dry_run"] = True
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=False)
+        assert req.effective_dry_run is True
+
+    def test_all_false_means_live(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        msg["payload"]["dry_run"] = False
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=False)
+        assert req.effective_dry_run is False
+
+    def test_missing_message_dry_run_default_true(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        del msg["payload"]["dry_run"]
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=False)
+        assert req.effective_dry_run is True
+
+    def test_missing_message_dry_run_default_false(self):
+        cfg = _request_building_config()
+        cfg["defaults"]["missing_message_dry_run_default"] = False
+        router = _build_request_router(cfg)
+        msg = _hp_message()
+        del msg["payload"]["dry_run"]
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=False)
+        assert req.effective_dry_run is False
+
+    def test_slot_info_dry_run_extracted(self):
+        router = _build_request_router()
+        msg = _hp_message()
+        del msg["payload"]["dry_run"]
+        msg["slot_info"] = {"dry_run": True}
+        route = router.routes[0]
+
+        req = build_resolved_request(msg, route, router, forwarder_dry_run=False)
+        assert req.effective_dry_run is True
+
+
+# ========================================================================
+# extract_message_dry_run helper
+# ========================================================================
+
+class TestExtractMessageDryRun:
+
+    def test_reads_payload_dry_run(self):
+        msg = {"payload": {"dry_run": True}}
+        assert extract_message_dry_run(msg) is True
+
+    def test_reads_slot_info_dry_run(self):
+        msg = {"slot_info": {"dry_run": False}}
+        assert extract_message_dry_run(msg) is False
+
+    def test_payload_takes_precedence_over_slot_info(self):
+        msg = {"payload": {"dry_run": False}, "slot_info": {"dry_run": True}}
+        assert extract_message_dry_run(msg) is False
+
+    def test_returns_none_when_absent(self):
+        msg = {"payload": {"power_kw": 3.0}}
+        assert extract_message_dry_run(msg) is None
+
+    def test_returns_none_for_empty_message(self):
+        assert extract_message_dry_run({}) is None

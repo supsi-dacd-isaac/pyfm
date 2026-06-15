@@ -16,10 +16,13 @@ Design constraints:
   - Routes are evaluated by descending priority.
 """
 
+import copy
 import json
 import logging
+import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger("forwarder")
@@ -151,6 +154,7 @@ class EndpointConfig:
     method: str = "POST"
     path_template: str = ""
     body_template: Optional[Any] = None
+    body_mode: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
     success_status_codes: Optional[List[int]] = None
 
@@ -161,6 +165,7 @@ class EndpointConfig:
             method=data.get("method", "POST"),
             path_template=data.get("path_template", ""),
             body_template=data.get("body_template"),
+            body_mode=data.get("body_mode"),
             headers=data.get("headers"),
             success_status_codes=data.get("success_status_codes"),
         )
@@ -547,3 +552,514 @@ def load_routing_config(path: str) -> dict:
     """
     with open(path, "r") as f:
         return json.load(f)
+
+
+# ---------------------------------------------------------------------------
+# Template and body-building helpers
+#
+# These are intentionally duplicated from forwarder.py because that module
+# calls ``sys.exit(1)`` at import time when pika is not installed, making
+# it unsafe to import in test or library contexts.  Only the minimal pure
+# functions needed for template rendering and body construction are
+# reproduced here.
+# ---------------------------------------------------------------------------
+
+DEFAULT_SUCCESS_STATUS_CODES: List[int] = [200, 201, 202, 204]
+
+_VALID_BODY_MODES = frozenset({"hp_control", "ev_power_timeseries"})
+
+
+def _get_by_path(data: dict, path: str) -> Any:
+    """Resolve a dotted path like ``'payload.slot_start'`` inside a dict."""
+    if not path:
+        return None
+    value = data
+    for part in path.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return value
+
+
+def _first_by_paths(data: dict, paths: List[str]) -> Any:
+    """Return the first non-None value found for the given dotted paths."""
+    for path in paths:
+        value = _get_by_path(data, path)
+        if value is not None:
+            return value
+    return None
+
+
+def _render_template(
+    template: str, context: dict, *, strict: bool = False
+) -> str:
+    """Render a template string with ``{path}`` placeholders.
+
+    When *strict* is True, an unresolvable placeholder raises
+    :class:`ValueError` instead of being silently replaced with ``""``.
+    """
+    unresolved: List[str] = []
+
+    def _replace(match):
+        path = match.group(1)
+        value = _get_by_path(context, path)
+        if value is None:
+            if strict:
+                unresolved.append(path)
+            return ""
+        return str(value)
+
+    result = re.sub(r"\{([^}]+)\}", _replace, template)
+    if strict and unresolved:
+        raise ValueError(
+            "Unresolved template placeholder(s): "
+            + ", ".join(f"'{p}'" for p in unresolved)
+        )
+    return result
+
+
+# -- type coercion helpers used by _apply_template --------------------------
+
+def _to_bool(value: Any) -> Optional[bool]:
+    """Convert common string/number representations to bool."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "on", "yes"}:
+            return True
+        if lowered in {"false", "0", "off", "no"}:
+            return False
+    return None
+
+
+def _to_on_off(value: Any) -> Optional[bool]:
+    """Convert ON/OFF string values to bool."""
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "on":
+            return True
+        if lowered == "off":
+            return False
+    return None
+
+
+def _coerce_datetime_utc_naive(value: Any) -> Optional[datetime]:
+    """Parse an ISO-like datetime and return a naive UTC datetime."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _format_datetime_utc(value: Any) -> Optional[str]:
+    """Parse an ISO-like datetime and return a UTC naive ISO string."""
+    dt = _coerce_datetime_utc_naive(value)
+    if dt is None:
+        return None
+    return dt.isoformat()
+
+
+def _utc_now_naive() -> datetime:
+    """Return current UTC time as a naive datetime."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _format_datetime_utc_future_minute(
+    value: Any, now: Optional[datetime] = None
+) -> Optional[str]:
+    """Return the later of the mapped time and the upcoming UTC minute."""
+    dt = _coerce_datetime_utc_naive(value)
+    if dt is None:
+        return None
+
+    reference_now = now if now is not None else _utc_now_naive()
+    if reference_now.tzinfo is not None:
+        reference_now = (
+            reference_now.astimezone(timezone.utc).replace(tzinfo=None)
+        )
+
+    next_minute = reference_now.replace(second=0, microsecond=0) + timedelta(
+        minutes=1
+    )
+    return max(dt, next_minute).isoformat(timespec="seconds")
+
+
+def _coerce_float(value: Any, field_name: str) -> float:
+    """Convert a value to float or raise a clear ValueError."""
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field_name} value {value!r} is not a valid float"
+        ) from exc
+
+
+def _apply_template(template: Any, context: dict) -> Any:
+    """Apply a body template to the context data.
+
+    Supports ``$map`` directives with optional ``type`` coercions
+    (``bool``, ``on_off``, ``datetime_utc``, ``datetime_utc_future_minute``).
+    """
+    if isinstance(template, dict):
+        if "$map" in template:
+            map_spec = template.get("$map", "")
+            if isinstance(map_spec, list):
+                value = None
+                for path in map_spec:
+                    value = _get_by_path(context, path)
+                    if value is not None:
+                        break
+            else:
+                value = _get_by_path(context, map_spec)
+            value_type = template.get("type")
+            if value_type == "bool":
+                converted = _to_bool(value)
+                return converted if converted is not None else value
+            if value_type == "on_off":
+                converted = _to_on_off(value)
+                return converted if converted is not None else value
+            if value_type == "datetime_utc":
+                converted = _format_datetime_utc(value)
+                return converted if converted is not None else value
+            if value_type == "datetime_utc_future_minute":
+                converted = _format_datetime_utc_future_minute(value)
+                return converted if converted is not None else value
+            return value
+        return {k: _apply_template(v, context) for k, v in template.items()}
+    if isinstance(template, list):
+        return [_apply_template(item, context) for item in template]
+    if isinstance(template, str):
+        return _render_template(template, context)
+    return template
+
+
+# -- body-mode builders -----------------------------------------------------
+
+def _build_ev_power_timeseries_body(context: dict) -> dict:
+    """Build the AEM EV request body from a single step or schedule."""
+    payload = context.get("payload") or {}
+    schedule = payload.get("schedule")
+
+    if schedule is not None:
+        if isinstance(schedule, list):
+            if not schedule:
+                raise ValueError("EV schedule is empty")
+
+            body: dict = {}
+            for index, entry in enumerate(schedule):
+                if not isinstance(entry, dict):
+                    raise ValueError(
+                        f"EV schedule entry at index {index} must be an object"
+                    )
+
+                timestamp = None
+                for key in ["time", "slot_start", "timestamp"]:
+                    if entry.get(key) is not None:
+                        timestamp = entry.get(key)
+                        break
+                if timestamp is None:
+                    raise ValueError(
+                        f"EV schedule entry at index {index} is missing "
+                        "timestamp (time/slot_start/timestamp)"
+                    )
+
+                formatted_time = _format_datetime_utc(timestamp)
+                if formatted_time is None:
+                    raise ValueError(
+                        f"EV schedule entry at index {index} has invalid "
+                        f"timestamp {timestamp!r}"
+                    )
+
+                power_value = None
+                for key in ["power_kw", "target_power_kw", "kw", "power"]:
+                    if entry.get(key) is not None:
+                        power_value = entry.get(key)
+                        break
+                if power_value is None:
+                    raise ValueError(
+                        f"EV schedule entry at index {index} is missing "
+                        "power (power_kw/target_power_kw/kw/power)"
+                    )
+
+                body[formatted_time] = _coerce_float(
+                    power_value,
+                    f"EV schedule entry at index {index} power",
+                )
+
+            return body
+
+        if isinstance(schedule, dict):
+            if not schedule:
+                raise ValueError("EV schedule is empty")
+
+            body = {}
+            for ts_key, power_value in schedule.items():
+                formatted_time = _format_datetime_utc(ts_key)
+                if formatted_time is None:
+                    raise ValueError(
+                        f"EV schedule entry timestamp {ts_key!r} is invalid"
+                    )
+                body[formatted_time] = _coerce_float(
+                    power_value,
+                    f"EV schedule entry for {formatted_time} power",
+                )
+
+            return body
+
+        raise ValueError("EV schedule must be a list or object")
+
+    timestamp = _first_by_paths(
+        context,
+        [
+            "payload.slot_start",
+            "payload.time",
+            "payload.timestamp",
+            "timestamp",
+        ],
+    )
+    if timestamp is None:
+        raise ValueError(
+            "EV request is missing timestamp "
+            "(payload.slot_start/payload.time/payload.timestamp/timestamp)"
+        )
+
+    formatted_time = _format_datetime_utc(timestamp)
+    if formatted_time is None:
+        raise ValueError(f"EV request timestamp {timestamp!r} is invalid")
+
+    power_value = _first_by_paths(
+        context,
+        [
+            "payload.power_kw",
+            "payload.target_power_kw",
+            "payload.kw",
+            "payload.power",
+        ],
+    )
+    if power_value is None:
+        raise ValueError(
+            "EV request is missing power "
+            "(payload.power_kw/payload.target_power_kw/payload.kw/"
+            "payload.power)"
+        )
+
+    return {formatted_time: _coerce_float(power_value, "EV request power")}
+
+
+def _build_hp_control_body(message: dict) -> dict:
+    """Build the standard HP control request body."""
+    command_type = (
+        message.get("command_type") or message.get("command") or "unknown"
+    )
+    return {
+        "command": command_type,
+        "asset_id": message.get("asset_id"),
+        "asset_type": message.get("asset_type"),
+        "timestamp": message.get("timestamp"),
+        "payload": message.get("payload", {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Resolved request
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResolvedRequest:
+    """A fully resolved HTTP request ready to be dispatched (or dry-run
+    logged).  Built from a matched route, its API and endpoint configs,
+    and the incoming message."""
+
+    route_name: str
+    api_name: str
+    endpoint_name: str
+    method: str
+    url: str
+    headers: Optional[Dict[str, str]]
+    body: Any
+    auth: Optional[Tuple[str, str]]
+    timeout_seconds: float
+    verify_ssl: bool
+    request_retries: int
+    success_status_codes: List[int]
+    effective_dry_run: bool
+
+
+# ---------------------------------------------------------------------------
+# Message-level dry-run extraction
+# ---------------------------------------------------------------------------
+
+def extract_message_dry_run(message: dict) -> Optional[bool]:
+    """Extract the dry-run flag from a message's payload or slot_info.
+
+    Returns ``None`` when the message does not carry a dry-run flag.
+    """
+    for section in ("payload", "slot_info"):
+        data = message.get(section, {})
+        if isinstance(data, dict) and "dry_run" in data:
+            return data["dry_run"]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Request building
+# ---------------------------------------------------------------------------
+
+def _build_request_context(
+    message: dict, api_config: ApiConfig
+) -> dict:
+    """Build the template rendering context from a message and API config.
+
+    The context is a **shallow copy** of the message with an ``api`` key
+    added.  The original message dict is never mutated.
+    """
+    context = dict(message)
+    context["api"] = {
+        "base_url": api_config.base_url,
+        "controlUrl": api_config.base_url,
+        "url": api_config.base_url,
+        "user": api_config.user,
+        "name": api_config.name,
+    }
+    return context
+
+
+def _resolve_url(
+    api_config: ApiConfig,
+    endpoint_config: EndpointConfig,
+    context: dict,
+) -> str:
+    """Build the full request URL from the API base URL and endpoint path.
+
+    * If the rendered path is an absolute URL, it is used as-is.
+    * Otherwise, it is appended to the API's ``base_url``.
+
+    Raises :class:`ValueError` when a required placeholder cannot be
+    resolved or the base URL is missing for a relative path.
+    """
+    rendered_path = _render_template(
+        endpoint_config.path_template, context, strict=True
+    )
+
+    if rendered_path.startswith("http://") or rendered_path.startswith(
+        "https://"
+    ):
+        return rendered_path
+
+    base = api_config.base_url.rstrip("/")
+    if not base:
+        raise ValueError(
+            f"Endpoint '{endpoint_config.name}' has a relative path "
+            f"template but API '{api_config.name}' has no base_url"
+        )
+
+    return f"{base}/{rendered_path.lstrip('/')}"
+
+
+def _build_body(
+    endpoint_config: EndpointConfig,
+    message: dict,
+    context: dict,
+) -> Any:
+    """Build the request body according to the endpoint configuration.
+
+    Priority: ``body_mode`` > ``body_template`` > passthrough (deep-copy
+    of the original message).
+    """
+    if endpoint_config.body_mode is not None:
+        if endpoint_config.body_mode == "hp_control":
+            return _build_hp_control_body(message)
+        if endpoint_config.body_mode == "ev_power_timeseries":
+            return _build_ev_power_timeseries_body(context)
+        raise ValueError(
+            f"Unsupported body_mode '{endpoint_config.body_mode}'"
+        )
+
+    if endpoint_config.body_template is not None:
+        return _apply_template(endpoint_config.body_template, context)
+
+    return copy.deepcopy(message)
+
+
+def build_resolved_request(
+    message: dict,
+    route: RouteConfig,
+    router: MessageRouter,
+    forwarder_dry_run: bool,
+) -> ResolvedRequest:
+    """Build a :class:`ResolvedRequest` from a matched route and message.
+
+    This function does **not** send any HTTP request.  It resolves the
+    URL, body, auth, dry-run, and all metadata needed for the dispatcher
+    (implemented in a later step).
+
+    The input *message* is never mutated.
+
+    Raises :class:`ValueError` when required configuration pieces
+    (base_url, placeholders, body_mode) cannot be resolved.
+    """
+    api_config = router.apis.get(route.api)
+    if api_config is None:
+        raise ValueError(
+            f"Route '{route.name}' references unknown API '{route.api}'"
+        )
+
+    endpoint_config = router.endpoints.get(route.endpoint)
+    if endpoint_config is None:
+        raise ValueError(
+            f"Route '{route.name}' references unknown endpoint "
+            f"'{route.endpoint}'"
+        )
+
+    context = _build_request_context(message, api_config)
+
+    url = _resolve_url(api_config, endpoint_config, context)
+    body = _build_body(endpoint_config, message, context)
+
+    auth: Optional[Tuple[str, str]] = None
+    if api_config.user and api_config.password:
+        auth = (api_config.user, api_config.password)
+
+    message_dry_run = extract_message_dry_run(message)
+    effective_dry_run = resolve_effective_dry_run(
+        forwarder_dry_run=forwarder_dry_run,
+        route_dry_run=route.dry_run,
+        message_dry_run=message_dry_run,
+        missing_message_dry_run_default=(
+            router.defaults.missing_message_dry_run_default
+        ),
+    )
+
+    success_codes = endpoint_config.success_status_codes
+    if success_codes is None:
+        success_codes = list(DEFAULT_SUCCESS_STATUS_CODES)
+
+    return ResolvedRequest(
+        route_name=route.name,
+        api_name=api_config.name,
+        endpoint_name=endpoint_config.name,
+        method=endpoint_config.method,
+        url=url,
+        headers=endpoint_config.headers,
+        body=body,
+        auth=auth,
+        timeout_seconds=api_config.timeout,
+        verify_ssl=api_config.verify_ssl,
+        request_retries=api_config.retries,
+        success_status_codes=success_codes,
+        effective_dry_run=effective_dry_run,
+    )
