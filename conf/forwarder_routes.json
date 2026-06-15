@@ -48,27 +48,27 @@
   "endpoints": {
     "hp_ecm96_2": {
       "method": "POST",
-      "path": "/ECM/ECM96/hp",
+      "path_template": "/ECM/ECM96/hp",
       "body_mode": "hp_control"
     },
     "hp_ecm97_3": {
       "method": "POST",
-      "path": "/ECM/ECM97/hp",
+      "path_template": "/ECM/ECM97/hp",
       "body_mode": "hp_control"
     },
     "ev_ecm63_1": {
       "method": "POST",
-      "path": "/ECM/ECM63/charge_point_ev_1",
+      "path_template": "/ECM/ECM63/charge_point_ev_1",
       "body_mode": "ev_power_timeseries"
     },
     "ev_ecm63_2": {
       "method": "POST",
-      "path": "/ECM/ECM63/charge_point_ev_2",
+      "path_template": "/ECM/ECM63/charge_point_ev_2",
       "body_mode": "ev_power_timeseries"
     },
     "default_aem_command": {
       "method": "POST",
-      "path": "/{payload.community}/{payload.site_id}/{payload.asset_id}",
+      "path_template": "/{payload.community}/{payload.site_id}/{payload.asset_id}",
       "body_template": {
         "power": {
           "$map": ["payload.discrete_state", "payload.target_state", "target_state"],
