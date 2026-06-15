@@ -20,9 +20,10 @@ import copy
 import json
 import logging
 import re
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 logger = logging.getLogger("forwarder")
@@ -1062,4 +1063,246 @@ def build_resolved_request(
         request_retries=api_config.retries,
         success_status_codes=success_codes,
         effective_dry_run=effective_dry_run,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP dispatch
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_STATUS_CODES = frozenset({429})
+
+try:
+    from urllib3.exceptions import InsecureRequestWarning
+except ImportError:
+    InsecureRequestWarning = type(
+        "InsecureRequestWarning", (UserWarning,), {}
+    )
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    """Return True for status codes that should trigger a retry."""
+    return status_code >= 500 or status_code in _RETRYABLE_STATUS_CODES
+
+
+def _format_body_preview(body: Any, limit: int = 200) -> str:
+    """Serialize a request body to a bounded preview string for logging."""
+    try:
+        text = json.dumps(body, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        text = str(body)
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+@dataclass
+class HttpDispatchResult:
+    """Result of dispatching a single HTTP request (or dry-run skip)."""
+
+    success: bool
+    dry_run: bool
+    status_code: Optional[int] = None
+    error: Optional[str] = None
+    attempts: int = 0
+    policy: str = DEFAULT_HTTP_FAILURE_POLICY
+    route_name: str = ""
+    api_name: str = ""
+    endpoint_name: str = ""
+
+
+def dispatch_http_request(
+    request: ResolvedRequest,
+    message: dict,
+    policy: str = DEFAULT_HTTP_FAILURE_POLICY,
+    session: Any = None,
+    _logger: Optional[logging.Logger] = None,
+) -> HttpDispatchResult:
+    """Dispatch (or dry-run log) an HTTP request built from a matched route.
+
+    Parameters
+    ----------
+    request:
+        The fully resolved request produced by :func:`build_resolved_request`.
+    message:
+        The original RabbitMQ message dict — used only for logging context
+        (``asset_id``, ``asset_type``, ``message_type``).  Never mutated.
+    policy:
+        The failure policy to record in the result (default:
+        ``ack_error_no_requeue``).  This step does not perform RabbitMQ
+        ack/nack; the policy is informational for the caller.
+    session:
+        An injectable HTTP session (must support
+        ``session.request(method, url, **kwargs)``).  When ``None``, a
+        ``requests.Session`` is created lazily.  Inject a mock in tests.
+    _logger:
+        Optional override logger.
+
+    Returns
+    -------
+    HttpDispatchResult
+        Indicates success/failure, dry-run, status code, attempts, etc.
+
+    Retry semantics
+    ---------------
+    ``total_attempts = request.request_retries + 1`` (matching the existing
+    ``TargetHandler`` convention where ``retries`` means *additional*
+    attempts after the first).  Minimum 1 attempt.
+
+    Retryable conditions: 5xx, 429, timeout/connection exceptions.
+    Non-retryable: 4xx (except 429).
+    """
+    log = _logger or logger
+
+    result_kwargs = dict(
+        route_name=request.route_name,
+        api_name=request.api_name,
+        endpoint_name=request.endpoint_name,
+        policy=policy,
+    )
+
+    # -- dry-run -------------------------------------------------------------
+    if request.effective_dry_run:
+        log.info(
+            "[DRY-RUN] %s %s route='%s' api='%s' endpoint='%s' body=%s",
+            request.method,
+            request.url,
+            request.route_name,
+            request.api_name,
+            request.endpoint_name,
+            _format_body_preview(request.body),
+        )
+        return HttpDispatchResult(
+            success=True, dry_run=True, attempts=0, **result_kwargs
+        )
+
+    # -- live dispatch -------------------------------------------------------
+    if session is None:
+        try:
+            import requests as _requests_lib  # noqa: F811
+        except ImportError:
+            log.error(
+                "Cannot dispatch route '%s': 'requests' library not "
+                "installed",
+                request.route_name,
+            )
+            return HttpDispatchResult(
+                success=False,
+                dry_run=False,
+                error="requests library not installed",
+                attempts=0,
+                **result_kwargs,
+            )
+        session = _requests_lib.Session()
+
+    total_attempts = max(1, request.request_retries + 1)
+    last_error: str = "unknown error"
+    last_status: Optional[int] = None
+    attempt = 0
+
+    for attempt in range(1, total_attempts + 1):
+        try:
+            request_kwargs: Dict[str, Any] = {
+                "json": request.body,
+                "headers": request.headers,
+                "timeout": request.timeout_seconds,
+                "verify": request.verify_ssl,
+            }
+            if request.auth is not None:
+                request_kwargs["auth"] = request.auth
+
+            if request.verify_ssl:
+                response = session.request(
+                    request.method, request.url, **request_kwargs
+                )
+            else:
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore", category=InsecureRequestWarning
+                    )
+                    response = session.request(
+                        request.method, request.url, **request_kwargs
+                    )
+
+        except Exception as exc:
+            last_error = str(exc)
+            last_status = None
+            if attempt < total_attempts:
+                log.warning(
+                    "Route '%s' attempt %d/%d failed: %s; retrying",
+                    request.route_name,
+                    attempt,
+                    total_attempts,
+                    last_error,
+                )
+                continue
+            break
+
+        last_status = response.status_code
+
+        # -- success ---------------------------------------------------------
+        if response.status_code in request.success_status_codes:
+            if attempt > 1:
+                log.info(
+                    "Route '%s' request succeeded on attempt %d/%d",
+                    request.route_name,
+                    attempt,
+                    total_attempts,
+                )
+            return HttpDispatchResult(
+                success=True,
+                dry_run=False,
+                status_code=response.status_code,
+                attempts=attempt,
+                **result_kwargs,
+            )
+
+        # -- retryable failure -----------------------------------------------
+        if _is_retryable_status(response.status_code):
+            last_error = f"HTTP {response.status_code}"
+            if attempt < total_attempts:
+                log.warning(
+                    "Route '%s' attempt %d/%d returned %d; retrying",
+                    request.route_name,
+                    attempt,
+                    total_attempts,
+                    response.status_code,
+                )
+                continue
+            break
+
+        # -- non-retryable failure -------------------------------------------
+        last_error = f"HTTP {response.status_code}"
+        break
+
+    # -- all attempts exhausted or non-retryable error -----------------------
+    asset_id = message.get("asset_id", "unknown")
+    asset_type = message.get("asset_type", "unknown")
+    message_type = message.get("message_type", "unknown")
+
+    log.error(
+        "Route '%s' HTTP dispatch failed after %d attempt(s): "
+        "api='%s' endpoint='%s' url='%s' status=%s error='%s' "
+        "asset_id='%s' asset_type='%s' message_type='%s' "
+        "policy='%s'",
+        request.route_name,
+        attempt,
+        request.api_name,
+        request.endpoint_name,
+        request.url,
+        last_status,
+        last_error,
+        asset_id,
+        asset_type,
+        message_type,
+        policy,
+    )
+
+    return HttpDispatchResult(
+        success=False,
+        dry_run=False,
+        status_code=last_status,
+        error=last_error,
+        attempts=attempt,
+        **result_kwargs,
     )

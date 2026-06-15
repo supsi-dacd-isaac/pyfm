@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 from forwarder_router import (
     ApiConfig,
     EndpointConfig,
+    HttpDispatchResult,
     MessageProfile,
     MessageRouter,
     ResolvedRequest,
@@ -26,6 +27,7 @@ from forwarder_router import (
     RoutingDefaults,
     build_resolved_request,
     detect_config_mode,
+    dispatch_http_request,
     extract_message_dry_run,
     resolve_effective_dry_run,
     validate_routing_config,
@@ -1374,3 +1376,365 @@ class TestExtractMessageDryRun:
 
     def test_returns_none_for_empty_message(self):
         assert extract_message_dry_run({}) is None
+
+
+# ========================================================================
+# Step 3 — HTTP dispatch helpers
+# ========================================================================
+
+class _MockResponse:
+    """Minimal mock for an HTTP response."""
+
+    def __init__(self, status_code: int, text: str = ""):
+        self.status_code = status_code
+        self.text = text
+
+
+class _MockSession:
+    """Injectable mock session that records calls and returns pre-set
+    responses (or raises pre-set exceptions)."""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls: list = []
+
+    def request(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, **kwargs})
+        item = self._responses.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _make_resolved_request(
+    dry_run: bool = False,
+    retries: int = 2,
+    success_codes=None,
+    **overrides,
+) -> ResolvedRequest:
+    """Build a ResolvedRequest with sensible defaults for dispatch tests."""
+    defaults = dict(
+        route_name="test_route",
+        api_name="test_api",
+        endpoint_name="test_ep",
+        method="POST",
+        url="https://api.example.com/v1/control",
+        headers=None,
+        body={"command": "curtail", "asset_id": "HP-01"},
+        auth=("admin", "secret"),
+        timeout_seconds=10.0,
+        verify_ssl=True,
+        request_retries=retries,
+        success_status_codes=success_codes or [200, 201, 202, 204],
+        effective_dry_run=dry_run,
+    )
+    defaults.update(overrides)
+    return ResolvedRequest(**defaults)
+
+
+def _simple_message(**overrides):
+    """A minimal message dict for dispatch logging context."""
+    msg = {
+        "message_type": "command",
+        "asset_type": "heat_pump",
+        "asset_id": "HP-01",
+    }
+    msg.update(overrides)
+    return msg
+
+
+# ========================================================================
+# Dry-run dispatch
+# ========================================================================
+
+class TestDryRunDispatch:
+
+    def test_dry_run_does_not_call_http_client(self):
+        session = _MockSession([])
+        req = _make_resolved_request(dry_run=True)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert len(session.calls) == 0
+
+    def test_dry_run_returns_success_true_and_dry_run_true(self):
+        req = _make_resolved_request(dry_run=True)
+        result = dispatch_http_request(
+            req, _simple_message(), session=_MockSession([])
+        )
+        assert result.success is True
+        assert result.dry_run is True
+
+    def test_dry_run_logs_marker(self, caplog):
+        req = _make_resolved_request(dry_run=True)
+        with caplog.at_level("INFO", logger="forwarder"):
+            dispatch_http_request(
+                req, _simple_message(), session=_MockSession([])
+            )
+        assert any("[DRY-RUN]" in r.message for r in caplog.records)
+
+    def test_dry_run_log_includes_route_api_endpoint_method_url(self, caplog):
+        req = _make_resolved_request(dry_run=True)
+        with caplog.at_level("INFO", logger="forwarder"):
+            dispatch_http_request(
+                req, _simple_message(), session=_MockSession([])
+            )
+        log_text = " ".join(r.message for r in caplog.records)
+        assert "test_route" in log_text
+        assert "test_api" in log_text
+        assert "test_ep" in log_text
+        assert "POST" in log_text
+        assert "https://api.example.com/v1/control" in log_text
+
+
+# ========================================================================
+# Successful HTTP dispatch
+# ========================================================================
+
+class TestSuccessfulDispatch:
+
+    def test_post_success_200(self):
+        session = _MockSession([_MockResponse(200)])
+        req = _make_resolved_request()
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.dry_run is False
+        assert result.status_code == 200
+
+    def test_status_202_in_success_codes(self):
+        session = _MockSession([_MockResponse(202)])
+        req = _make_resolved_request()
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.status_code == 202
+
+    def test_custom_method_headers_auth_timeout_verify_passed(self):
+        session = _MockSession([_MockResponse(200)])
+        req = _make_resolved_request(
+            method="PUT",
+            headers={"X-Token": "abc"},
+            auth=("user", "pass"),
+            timeout_seconds=30.0,
+            verify_ssl=False,
+        )
+
+        dispatch_http_request(req, _simple_message(), session=session)
+
+        call = session.calls[0]
+        assert call["method"] == "PUT"
+        assert call["headers"] == {"X-Token": "abc"}
+        assert call["auth"] == ("user", "pass")
+        assert call["timeout"] == 30.0
+        assert call["verify"] is False
+
+    def test_custom_success_status_codes(self):
+        session = _MockSession([_MockResponse(206)])
+        req = _make_resolved_request(success_codes=[200, 206])
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.status_code == 206
+
+    def test_success_on_retry(self):
+        session = _MockSession([
+            _MockResponse(500),
+            _MockResponse(200),
+        ])
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.attempts == 2
+
+
+# ========================================================================
+# HTTP failure policy
+# ========================================================================
+
+class TestHttpFailurePolicy:
+
+    def test_500_after_retries_returns_failure(self):
+        session = _MockSession([
+            _MockResponse(500),
+            _MockResponse(500),
+            _MockResponse(500),
+        ])
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.status_code == 500
+
+    def test_failure_result_has_ack_error_no_requeue(self):
+        session = _MockSession([_MockResponse(500)] * 3)
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.policy == "ack_error_no_requeue"
+
+    def test_failure_logs_error_with_diagnostics(self, caplog):
+        session = _MockSession([_MockResponse(500)] * 3)
+        req = _make_resolved_request(retries=2)
+
+        with caplog.at_level("ERROR", logger="forwarder"):
+            dispatch_http_request(req, _simple_message(), session=session)
+
+        error_msgs = [
+            r.message for r in caplog.records if r.levelname == "ERROR"
+        ]
+        assert len(error_msgs) >= 1
+        text = error_msgs[-1]
+        assert "test_route" in text
+        assert "test_api" in text
+        assert "test_ep" in text
+        assert "https://api.example.com/v1/control" in text
+        assert "500" in text
+        assert "HP-01" in text
+        assert "heat_pump" in text
+        assert "command" in text
+        assert "ack_error_no_requeue" in text
+
+    def test_failure_records_number_of_attempts(self):
+        session = _MockSession([_MockResponse(500)] * 3)
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.attempts == 3
+
+    def test_failure_result_names(self):
+        session = _MockSession([_MockResponse(400)])
+        req = _make_resolved_request(retries=0)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.route_name == "test_route"
+        assert result.api_name == "test_api"
+        assert result.endpoint_name == "test_ep"
+
+
+# ========================================================================
+# Retry behavior
+# ========================================================================
+
+class TestRetryBehavior:
+
+    def test_500_is_retried(self):
+        session = _MockSession([_MockResponse(500), _MockResponse(200)])
+        req = _make_resolved_request(retries=1)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.attempts == 2
+        assert len(session.calls) == 2
+
+    def test_503_is_retried(self):
+        session = _MockSession([_MockResponse(503), _MockResponse(200)])
+        req = _make_resolved_request(retries=1)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.attempts == 2
+
+    def test_timeout_exception_is_retried(self):
+        session = _MockSession([
+            ConnectionError("connection refused"),
+            _MockResponse(200),
+        ])
+        req = _make_resolved_request(retries=1)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.attempts == 2
+
+    def test_429_is_retried(self):
+        session = _MockSession([_MockResponse(429), _MockResponse(200)])
+        req = _make_resolved_request(retries=1)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is True
+        assert result.attempts == 2
+
+    def test_400_is_not_retried(self):
+        session = _MockSession([_MockResponse(400), _MockResponse(200)])
+        req = _make_resolved_request(retries=1)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.attempts == 1
+        assert len(session.calls) == 1
+
+    def test_401_is_not_retried(self):
+        session = _MockSession([_MockResponse(401), _MockResponse(200)])
+        req = _make_resolved_request(retries=1)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.attempts == 1
+
+    def test_404_is_not_retried(self):
+        session = _MockSession([_MockResponse(404)])
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.attempts == 1
+
+    def test_422_is_not_retried(self):
+        session = _MockSession([_MockResponse(422)])
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.attempts == 1
+
+    def test_connection_error_exhausts_retries(self):
+        session = _MockSession([
+            OSError("network unreachable"),
+            OSError("network unreachable"),
+            OSError("network unreachable"),
+        ])
+        req = _make_resolved_request(retries=2)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.attempts == 3
+        assert result.status_code is None
+        assert "network unreachable" in result.error
+
+
+# ========================================================================
+# Safety
+# ========================================================================
+
+class TestDispatchSafety:
+
+    def test_resolved_request_not_mutated(self):
+        session = _MockSession([_MockResponse(200)])
+        req = _make_resolved_request()
+        original_url = req.url
+        original_body = copy.deepcopy(req.body)
+
+        dispatch_http_request(req, _simple_message(), session=session)
+
+        assert req.url == original_url
+        assert req.body == original_body
+        assert req.effective_dry_run is False
+        assert req.method == "POST"
+
+    def test_message_not_mutated(self):
+        session = _MockSession([_MockResponse(200)])
+        req = _make_resolved_request()
+        msg = _simple_message()
+        original = copy.deepcopy(msg)
+
+        dispatch_http_request(req, msg, session=session)
+        assert msg == original
+
+    def test_zero_retries_means_one_attempt(self):
+        session = _MockSession([_MockResponse(500)])
+        req = _make_resolved_request(retries=0)
+
+        result = dispatch_http_request(req, _simple_message(), session=session)
+        assert result.success is False
+        assert result.attempts == 1
+        assert len(session.calls) == 1
