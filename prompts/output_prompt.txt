@@ -1,1 +1,277 @@
+# Step 3 — Forwarder Configurable Routing: HTTP Dispatcher Report
 
+## 1. Summary
+
+Implemented an isolated HTTP dispatch layer for the new routing system. The
+dispatcher takes a `ResolvedRequest` (produced by Step 2's
+`build_resolved_request`) and either:
+
+1. Logs it with `[DRY-RUN]` without sending if `effective_dry_run=True`; or
+2. Sends it via HTTP with configurable retries if `effective_dry_run=False`.
+
+The dispatcher returns an `HttpDispatchResult` that records success/failure,
+status code, attempt count, error details, and the applicable failure policy
+(`ack_error_no_requeue`). It does not perform any RabbitMQ ack/nack — that
+will be integrated in Step 4.
+
+The dispatcher is fully testable via an injectable mock session parameter,
+with no dependency on RabbitMQ, live HTTP, or modifications to `forwarder.py`.
+
+## 2. Files changed
+
+| File | Action | Purpose |
+|------|--------|---------|
+| `scripts/forwarder_router.py` | **Modified** | Added `HttpDispatchResult`, `dispatch_http_request()`, retry helpers, body preview, `InsecureRequestWarning` handling |
+| `tests/test_forwarder_router.py` | **Modified** | Added 26 new tests for dry-run dispatch, HTTP success, failure policy, retry behavior, and safety |
+| `prompts/output_prompt.txt` | **Overwritten** | This report |
+
+No other files were added, modified, or deleted. `scripts/forwarder.py` was not touched.
+
+## 3. New classes/functions
+
+### Data classes
+
+| Class | Responsibility |
+|-------|---------------|
+| `HttpDispatchResult` | Result of a dispatch operation. Fields: `success`, `dry_run`, `status_code`, `error`, `attempts`, `policy`, `route_name`, `api_name`, `endpoint_name`. |
+
+### Functions
+
+| Function | Responsibility |
+|----------|---------------|
+| `dispatch_http_request()` | Main dispatcher — accepts `ResolvedRequest`, message (for logging context), injectable session. Handles dry-run logging, live HTTP with retries, success/failure result. |
+| `_is_retryable_status()` | Returns True for 5xx and 429 status codes. |
+| `_format_body_preview()` | Bounded JSON serialisation of body for logging. |
+
+### Constants / imports
+
+| Item | Purpose |
+|------|---------|
+| `_RETRYABLE_STATUS_CODES` | `frozenset({429})` — status codes retried alongside 5xx. |
+| `InsecureRequestWarning` | Imported from urllib3 when available; synthesized stub otherwise. Used to suppress warnings when `verify_ssl=False`. |
+
+## 4. HTTP dispatch behavior implemented
+
+### Dry-run behavior
+
+When `request.effective_dry_run is True`:
+- No HTTP call is made (session is not invoked).
+- An INFO log is emitted containing `[DRY-RUN]`, the HTTP method, URL, route
+  name, API name, endpoint name, and a bounded body preview.
+- Returns `HttpDispatchResult(success=True, dry_run=True, attempts=0)`.
+
+### HTTP success behavior
+
+When the HTTP response status code is in `request.success_status_codes`
+(default `[200, 201, 202, 204]`):
+- Returns `HttpDispatchResult(success=True, dry_run=False, status_code=N,
+  attempts=K)`.
+- If the success occurred on a retry (attempt > 1), an INFO log notes this.
+
+### HTTP failure behavior
+
+When all attempts are exhausted or a non-retryable error is encountered:
+- Returns `HttpDispatchResult(success=False, dry_run=False, status_code=N,
+  error="...", attempts=K, policy="ack_error_no_requeue")`.
+- An ERROR log is emitted with: route name, API name, endpoint name, URL,
+  status code, error description, asset_id, asset_type, message_type, and
+  policy.
+
+### Retry behavior
+
+Retry semantics follow the existing `TargetHandler` convention:
+
+```
+total_attempts = max(1, request.request_retries + 1)
+```
+
+Where `request_retries` means *additional* attempts after the first.
+So `retries=0` → 1 attempt, `retries=2` → 3 attempts.
+
+**Retried conditions:**
+- Status 5xx (500, 502, 503, etc.)
+- Status 429 (rate limited)
+- Connection/timeout exceptions (`Exception` subclasses)
+
+**Not retried (immediate failure):**
+- Status 400 (Bad Request)
+- Status 401 (Unauthorized)
+- Status 403 (Forbidden)
+- Status 404 (Not Found)
+- Status 405 (Method Not Allowed)
+- Status 409 (Conflict)
+- Status 422 (Unprocessable Entity)
+- Any other non-5xx, non-429 failure
+
+This differs from the legacy `TargetHandler` which retries *all* non-success
+responses. The new v2 dispatcher is more selective — non-retryable 4xx errors
+fail immediately without wasting retry attempts.
+
+### Non-retryable status handling
+
+When a 4xx response (other than 429) is received, the dispatcher breaks out of
+the retry loop immediately with `attempts=1` and returns failure. This avoids
+futile retries against deterministic errors.
+
+### Failure policy handling
+
+The policy string (`ack_error_no_requeue`) is attached to every
+`HttpDispatchResult`. In Step 3, no RabbitMQ ack/nack is performed — the
+policy is purely informational for the caller (to be acted upon in Step 4).
+
+### Logging
+
+| Event | Level | Content |
+|-------|-------|---------|
+| Dry-run | INFO | `[DRY-RUN] METHOD URL route api endpoint body_preview` |
+| Retry warning | WARNING | `Route 'name' attempt N/M failed: reason; retrying` |
+| Success on retry | INFO | `Route 'name' request succeeded on attempt N/M` |
+| Final failure | ERROR | Route, API, endpoint, URL, status, error, asset_id, asset_type, message_type, policy |
+
+### Result object
+
+`HttpDispatchResult` captures all dispatch outcomes in a single, immutable-style
+dataclass that the caller can inspect without parsing logs.
+
+## 5. Tests added
+
+### `tests/test_forwarder_router.py` — 26 new tests (117 total)
+
+**Dry-run dispatch (4 tests)**
+
+| Test | Description |
+|------|-------------|
+| `test_dry_run_does_not_call_http_client` | Session not invoked |
+| `test_dry_run_returns_success_true_and_dry_run_true` | Result flags correct |
+| `test_dry_run_logs_marker` | `[DRY-RUN]` in log output |
+| `test_dry_run_log_includes_route_api_endpoint_method_url` | All diagnostics present |
+
+**Successful HTTP dispatch (5 tests)**
+
+| Test | Description |
+|------|-------------|
+| `test_post_success_200` | 200 → success |
+| `test_status_202_in_success_codes` | 202 → success |
+| `test_custom_method_headers_auth_timeout_verify_passed` | All request params forwarded |
+| `test_custom_success_status_codes` | 206 accepted when configured |
+| `test_success_on_retry` | 500 then 200 → success on attempt 2 |
+
+**HTTP failure policy (5 tests)**
+
+| Test | Description |
+|------|-------------|
+| `test_500_after_retries_returns_failure` | Exhausted retries → failure |
+| `test_failure_result_has_ack_error_no_requeue` | Policy field correct |
+| `test_failure_logs_error_with_diagnostics` | ERROR log contains all required fields |
+| `test_failure_records_number_of_attempts` | `attempts=3` for retries=2 |
+| `test_failure_result_names` | route/api/endpoint names in result |
+
+**Retry behavior (9 tests)**
+
+| Test | Description |
+|------|-------------|
+| `test_500_is_retried` | 500 → retry → 200 success |
+| `test_503_is_retried` | 503 → retry → 200 success |
+| `test_timeout_exception_is_retried` | ConnectionError → retry → 200 success |
+| `test_429_is_retried` | 429 → retry → 200 success |
+| `test_400_is_not_retried` | 400 → immediate failure, 1 attempt |
+| `test_401_is_not_retried` | 401 → immediate failure, 1 attempt |
+| `test_404_is_not_retried` | 404 → immediate failure, 1 attempt |
+| `test_422_is_not_retried` | 422 → immediate failure, 1 attempt |
+| `test_connection_error_exhausts_retries` | 3 connection errors → failure after 3 attempts |
+
+**Safety (3 tests)**
+
+| Test | Description |
+|------|-------------|
+| `test_resolved_request_not_mutated` | Request unchanged after dispatch |
+| `test_message_not_mutated` | Message unchanged after dispatch |
+| `test_zero_retries_means_one_attempt` | retries=0 → exactly 1 attempt |
+
+## 6. Tests run
+
+### Routing tests (Steps 1 + 2 + 3)
+
+```bash
+PYTHONPATH=... pytest tests/test_forwarder_router.py -v
+```
+
+Result: **117 passed in 0.75s** (52 Step 1 + 39 Step 2 + 26 Step 3)
+
+### Baseline tests (run individually)
+
+```bash
+PYTHONPATH=... pytest tests/test_forwarder_rabbitmq_sources.py -v
+```
+
+Result: **10 passed in 0.19s**
+
+```bash
+PYTHONPATH=... pytest tests/test_flexi_actuator_rabbitmq_overrides.py -v
+```
+
+Result: **3 passed in 0.04s**
+
+```bash
+PYTHONPATH=... pytest tests/test_flexi_actuator_command_list.py -v
+```
+
+Result: **7 passed in 0.14s**
+
+**Total: 137 tests passed (117 routing + 20 baseline). No regressions.**
+
+## 7. Backward compatibility
+
+- `scripts/forwarder.py` was **not modified** in any way.
+- `TargetHandler`, `CommandHandler`, `RabbitMQConsumer`, and all legacy classes
+  remain untouched.
+- All 91 Step 1+2 routing tests continue to pass unchanged.
+- All 20 baseline tests pass when run individually.
+- The dispatcher does not import or interact with any RabbitMQ code.
+- No Docker Compose files were changed.
+- No production config files were changed.
+
+## 8. Issues, assumptions, or risks
+
+1. **Retry semantics differ from legacy TargetHandler**: The new dispatcher only
+   retries on 5xx, 429, and connection/timeout exceptions. The legacy
+   `TargetHandler._send_to_target` retries on *all* non-success responses. This
+   is an intentional improvement for the v2 path — non-retryable 4xx errors fail
+   fast instead of wasting retries.
+
+2. **No backoff between retries**: The current implementation retries immediately
+   without delay. For production use, especially with 429 (rate limit) or 503
+   (service unavailable), a backoff strategy may be desirable. This can be added
+   in a later step without changing the interface.
+
+3. **`InsecureRequestWarning` fallback**: When `urllib3` is not installed, a
+   synthetic `InsecureRequestWarning` class is created as a `UserWarning`
+   subclass. This ensures the `warnings.catch_warnings()` block works correctly
+   even without urllib3.
+
+4. **Session lifecycle**: The dispatcher creates a new `requests.Session()` per
+   call if none is injected. For production integration (Step 4), a shared session
+   should be created once and reused across dispatches for connection pooling.
+
+5. **No RabbitMQ ack/nack**: As designed, the dispatcher returns a result object
+   and the caller is responsible for RabbitMQ acknowledgment based on the result
+   and policy. This will be wired in Step 4.
+
+## 9. Recommendation for next step
+
+```
+Proceed to Step 4: yes
+```
+
+The HTTP dispatch layer is complete and fully tested. Step 4 should integrate
+the full v2 routing pipeline into `forwarder.py`:
+
+- Detect v2 config in `main()` and instantiate the `MessageRouter`.
+- In `_process_message`, when v2 config is active:
+  1. Call `router.resolve(message, source_section)`.
+  2. Apply `on_no_match` / `on_ambiguous_match` policies.
+  3. Call `build_resolved_request()` for matched routes.
+  4. Call `dispatch_http_request()`.
+  5. Apply `on_http_failure` policy for ack/nack.
+- Maintain backward compatibility: when legacy config is detected, use
+  existing `TargetHandler` / `CommandHandler` path unchanged.
