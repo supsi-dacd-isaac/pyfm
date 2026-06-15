@@ -1992,6 +1992,39 @@ Examples:
 
         v2_router = MessageRouter.from_validated_config(validated_config)
 
+        # Resolve reference_api for v2 APIs from conns.json
+        for api_name, api_cfg in v2_router.apis.items():
+            if api_cfg.reference_api:
+                ref_cfg = conns_config.get(api_cfg.reference_api, {})
+                if ref_cfg:
+                    if not api_cfg.base_url:
+                        ctrl = (
+                            ref_cfg.get("controlUrl")
+                            or ref_cfg.get("controlURL")
+                        )
+                        api_cfg.base_url = (
+                            _normalize_control_url(ctrl, ref_cfg.get("port"))
+                            or ""
+                        )
+                    if not api_cfg.user:
+                        api_cfg.user = ref_cfg.get("user")
+                    if not api_cfg.password:
+                        api_cfg.password = ref_cfg.get("password")
+                    logger.info(
+                        "V2 API '%s' reference_api '%s' resolved: "
+                        "base_url='%s' user='%s'",
+                        api_name,
+                        api_cfg.reference_api,
+                        api_cfg.base_url or "",
+                        api_cfg.user or "",
+                    )
+                else:
+                    logger.warning(
+                        "V2 API '%s' references unknown '%s' in conns.json",
+                        api_name,
+                        api_cfg.reference_api,
+                    )
+
         active_source_names = {r.source for r in v2_router.routes if r.enabled}
         v2_sections: set = set()
         for src_name in active_source_names:

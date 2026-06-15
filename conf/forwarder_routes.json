@@ -1,0 +1,132 @@
+{
+  "version": 2,
+
+  "defaults": {
+    "on_no_match": "ack_warn_no_forward",
+    "on_ambiguous_match": "ack_error_no_forward",
+    "on_http_failure": "ack_error_no_requeue",
+    "missing_message_dry_run_default": true
+  },
+
+  "sources": {
+    "real_commands": {
+      "section": "realAssetCommands"
+    }
+  },
+
+  "message_profiles": {
+    "cmd_ecm96_2": {
+      "message_type": "command",
+      "asset_ids": ["ECM96.2"]
+    },
+    "cmd_ecm97_3": {
+      "message_type": "command",
+      "asset_ids": ["ECM97.3"]
+    },
+    "cmd_ecm63_1": {
+      "message_type": "command",
+      "asset_ids": ["ECM63.1"]
+    },
+    "cmd_ecm63_2": {
+      "message_type": "command",
+      "asset_ids": ["ECM63.2"]
+    },
+    "cmd_any_command": {
+      "message_type": "command"
+    }
+  },
+
+  "apis": {
+    "aem_api": {
+      "reference_api": "aemAPI",
+      "timeout": 5.0,
+      "retries": 3,
+      "verify_ssl": false
+    }
+  },
+
+  "endpoints": {
+    "hp_ecm96_2": {
+      "method": "POST",
+      "path": "/ECM/ECM96/hp",
+      "body_mode": "hp_control"
+    },
+    "hp_ecm97_3": {
+      "method": "POST",
+      "path": "/ECM/ECM97/hp",
+      "body_mode": "hp_control"
+    },
+    "ev_ecm63_1": {
+      "method": "POST",
+      "path": "/ECM/ECM63/charge_point_ev_1",
+      "body_mode": "ev_power_timeseries"
+    },
+    "ev_ecm63_2": {
+      "method": "POST",
+      "path": "/ECM/ECM63/charge_point_ev_2",
+      "body_mode": "ev_power_timeseries"
+    },
+    "default_aem_command": {
+      "method": "POST",
+      "path": "/{payload.community}/{payload.site_id}/{payload.asset_id}",
+      "body_template": {
+        "power": {
+          "$map": ["payload.discrete_state", "payload.target_state", "target_state"],
+          "type": "on_off"
+        },
+        "time": {
+          "$map": "payload.slot_start",
+          "type": "datetime_utc_future_minute"
+        }
+      }
+    }
+  },
+
+  "routes": [
+    {
+      "name": "ecm96_2_hp",
+      "source": "real_commands",
+      "message_profile": "cmd_ecm96_2",
+      "api": "aem_api",
+      "endpoint": "hp_ecm96_2",
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "name": "ecm97_3_hp",
+      "source": "real_commands",
+      "message_profile": "cmd_ecm97_3",
+      "api": "aem_api",
+      "endpoint": "hp_ecm97_3",
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "name": "ecm63_1_ev",
+      "source": "real_commands",
+      "message_profile": "cmd_ecm63_1",
+      "api": "aem_api",
+      "endpoint": "ev_ecm63_1",
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "name": "ecm63_2_ev",
+      "source": "real_commands",
+      "message_profile": "cmd_ecm63_2",
+      "api": "aem_api",
+      "endpoint": "ev_ecm63_2",
+      "priority": 100,
+      "enabled": true
+    },
+    {
+      "name": "fallback_aem_command",
+      "source": "real_commands",
+      "message_profile": "cmd_any_command",
+      "api": "aem_api",
+      "endpoint": "default_aem_command",
+      "priority": 0,
+      "enabled": true
+    }
+  ]
+}
