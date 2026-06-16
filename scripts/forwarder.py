@@ -2191,32 +2191,19 @@ Examples:
             return True
 
         def _v2_message_callback(message, source: RabbitMQSource) -> bool:
-            # List payload: find route by source and forward raw JSON
+            # List payload (e.g. from flexi_actuator): unpack and route
+            # each command individually through the standard profile-based
+            # path so body_template / body_mode transformations are applied.
             if isinstance(message, list):
-                source_name = None
-                for sname, sdef in _v2_router.sources.items():
-                    if sdef.get("section") == source.section:
-                        source_name = sname
-                        break
-                if source_name is None:
-                    logger.warning(
-                        "V2 list payload from unknown source section '%s'; acking",
-                        source.section,
-                    )
-                    return True
-
-                matching_routes = [
-                    r for r in _v2_router.routes
-                    if r.source == source_name and r.enabled
-                ]
-                if not matching_routes:
-                    logger.warning(
-                        "V2 list payload from '%s' has no enabled routes; acking",
-                        source.section,
-                    )
-                    return True
-
-                return _v2_forward_raw(message, matching_routes[0], source)
+                for index, item in enumerate(message):
+                    if isinstance(item, dict):
+                        _v2_message_callback(item, source)
+                    else:
+                        logger.warning(
+                            "V2 list entry %d is not a dict (type=%s); skipping",
+                            index, type(item).__name__,
+                        )
+                return True
 
             # Dict payload: standard profile-based routing
             if not isinstance(message, dict):

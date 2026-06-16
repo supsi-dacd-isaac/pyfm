@@ -937,3 +937,382 @@ class TestRouteSelectionLogging:
         all_log_text = " ".join(r.getMessage() for r in caplog.records)
         assert "s3cr3t_p@ssw0rd" not in all_log_text
         assert "testuser" not in all_log_text
+
+
+# =========================================================================
+# Actuator list payload → v2 routing (end-to-end body transformation)
+# =========================================================================
+
+class TestActuatorListPayloadRouting:
+    """Validate that a JSON list published by flexi_actuator.py is unpacked
+    and each item is routed through the standard v2 profile-matching and
+    body_template transformation path.
+
+    Uses the real conf/forwarder_routes.json to catch regressions.
+    """
+
+    @staticmethod
+    def _load_real_router():
+        """Load the production v2 config and return a ready router."""
+        import os
+        from scripts.forwarder_router import (
+            MessageRouter,
+            validate_routing_config,
+        )
+        config_path = os.path.join(
+            os.path.dirname(__file__), "..", "conf", "forwarder_routes.json"
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        router = MessageRouter.from_validated_config(
+            validate_routing_config(config)
+        )
+        router.apis["aem_api"].base_url = "http://aem.test:6000/control"
+        router.apis["aem_api"].user = "test"
+        router.apis["aem_api"].password = "test"
+        return router
+
+    @staticmethod
+    def _hp_command(asset_id, discrete_state="OFF", command_type="curtail"):
+        return {
+            "message_type": "command",
+            "asset_id": asset_id,
+            "asset_type": "heat_pump",
+            "command_type": command_type,
+            "payload": {
+                "community": "ECM",
+                "site_id": asset_id.split(".")[0],
+                "asset_id": asset_id,
+                "description": f"HP {asset_id}",
+                "asset_type": "heat_pump",
+                "modulation_type": "discrete",
+                "discrete_state": discrete_state,
+                "target_power_kw": 0.0 if discrete_state == "OFF" else 4.0,
+                "capacity_kw": 4.0,
+                "duration_minutes": 15,
+                "slot_start": "2026-06-16T14:00:00",
+                "slot_end": "2026-06-16T14:15:00",
+                "dry_run": True,
+                "requested_command": "force_off",
+            },
+            "timestamp": "2026-06-16T14:00:00+00:00",
+            "priority": 7,
+        }
+
+    @staticmethod
+    def _ev_command(asset_id, power_kw=0.0, command_type="curtail"):
+        return {
+            "message_type": "command",
+            "asset_id": asset_id,
+            "asset_type": "ev_charger",
+            "command_type": command_type,
+            "payload": {
+                "community": "ECM",
+                "site_id": asset_id.split(".")[0],
+                "asset_id": asset_id,
+                "description": f"EV {asset_id}",
+                "asset_type": "ev_charger",
+                "modulation_type": "continuous",
+                "target_power_kw": power_kw,
+                "power_kw": power_kw,
+                "capacity_kw": 11.0,
+                "duration_minutes": 15,
+                "slot_start": "2026-06-16T14:00:00",
+                "slot_end": "2026-06-16T14:15:00",
+                "schedule": {"2026-06-16T14:00:00": power_kw},
+                "dry_run": True,
+                "requested_command": "force_off",
+            },
+            "timestamp": "2026-06-16T14:00:00+00:00",
+            "priority": 7,
+        }
+
+    @staticmethod
+    def _hp_restore(asset_id):
+        return {
+            "message_type": "command",
+            "asset_id": asset_id,
+            "asset_type": "heat_pump",
+            "command_type": "restore",
+            "payload": {
+                "community": "ECM",
+                "site_id": asset_id.split(".")[0],
+                "asset_id": asset_id,
+                "description": f"HP {asset_id}",
+                "asset_type": "heat_pump",
+                "action": "restore",
+                "target_state": "ON",
+                "discrete_state": "ON",
+                "target_power_kw": 4.0,
+                "modulation_type": "discrete",
+                "capacity_kw": 4.0,
+                "duration_minutes": 15,
+                "slot_start": "2026-06-16T14:00:00",
+                "slot_end": "2026-06-16T14:15:00",
+                "dry_run": True,
+            },
+            "timestamp": "2026-06-16T14:00:00+00:00",
+            "priority": 5,
+        }
+
+    def _resolve_and_build(self, router, message):
+        from scripts.forwarder_router import build_resolved_request
+        resolution = router.resolve(message, "realAssetCommands")
+        assert resolution.status == "matched", (
+            f"No route matched for {message['asset_id']}: {resolution.reason}"
+        )
+        return build_resolved_request(message, resolution.route, router, True)
+
+    # -- HP force_off: body must be {"power": false, "time": "..."} ---------
+
+    def test_hp_force_off_ecm96_2_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._hp_command("ECM96.2", "OFF"))
+        assert req.body == {"power": False, "time": "2026-06-16T14:00:00"}
+        assert req.url == "http://aem.test:6000/control/ECM/ECM96/hp"
+        assert req.route_name == "ecm96_2_hp"
+
+    def test_hp_force_off_ecm97_3_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._hp_command("ECM97.3", "OFF"))
+        assert req.body == {"power": False, "time": "2026-06-16T14:00:00"}
+        assert req.url == "http://aem.test:6000/control/ECM/ECM97/hp"
+        assert req.route_name == "ecm97_3_hp"
+
+    # -- HP force_on: body must be {"power": true, "time": "..."} -----------
+
+    def test_hp_force_on_ecm96_2_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._hp_command("ECM96.2", "ON"))
+        assert req.body == {"power": True, "time": "2026-06-16T14:00:00"}
+
+    def test_hp_force_on_ecm97_3_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._hp_command("ECM97.3", "ON"))
+        assert req.body == {"power": True, "time": "2026-06-16T14:00:00"}
+
+    # -- HP restore: body must be {"power": true, "time": "..."} ------------
+
+    def test_hp_restore_ecm96_2_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._hp_restore("ECM96.2"))
+        assert req.body == {"power": True, "time": "2026-06-16T14:00:00"}
+
+    def test_hp_restore_ecm97_3_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._hp_restore("ECM97.3"))
+        assert req.body == {"power": True, "time": "2026-06-16T14:00:00"}
+
+    # -- EV force_off: body must be {timestamp: power_kw} timeseries --------
+
+    def test_ev_force_off_ecm63_1_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._ev_command("ECM63.1", 0.0))
+        assert req.body == {"2026-06-16T14:00:00": 0.0}
+        assert req.url == "http://aem.test:6000/control/ECM/ECM63/charge_point_ev_1"
+        assert req.route_name == "ecm63_1_ev"
+
+    def test_ev_force_off_ecm63_2_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._ev_command("ECM63.2", 0.0))
+        assert req.body == {"2026-06-16T14:00:00": 0.0}
+        assert req.url == "http://aem.test:6000/control/ECM/ECM63/charge_point_ev_2"
+        assert req.route_name == "ecm63_2_ev"
+
+    # -- EV restore: body must be {timestamp: power_kw} timeseries ----------
+
+    def test_ev_force_on_ecm63_1_body(self):
+        router = self._load_real_router()
+        req = self._resolve_and_build(router, self._ev_command("ECM63.1", 11.0))
+        assert req.body == {"2026-06-16T14:00:00": 11.0}
+
+    # -- Unknown asset falls back to default_aem_command --------------------
+
+    def test_unknown_hp_uses_fallback_route(self):
+        router = self._load_real_router()
+        msg = self._hp_command("HP-NEWSITE-01", "OFF")
+        msg["payload"]["site_id"] = "NEWSITE"
+        req = self._resolve_and_build(router, msg)
+        assert req.route_name == "fallback_aem_command"
+        assert req.body["power"] is False
+        assert "time" in req.body
+
+    # -- List unpacking via _process_message --------------------------------
+
+    def test_list_of_two_hp_commands_unpacked_and_routed(self):
+        """Simulate what RabbitMQConsumer._process_message does when
+        flexi_actuator publishes a JSON list of command envelopes."""
+        dispatched = []
+
+        def mock_callback(message, source):
+            if isinstance(message, list):
+                for item in message:
+                    if isinstance(item, dict):
+                        mock_callback(item, source)
+                return True
+            dispatched.append(message)
+            return True
+
+        source = _make_source()
+        payload = [
+            self._hp_command("ECM96.2", "OFF"),
+            self._hp_command("ECM97.3", "OFF"),
+        ]
+
+        consumer = fw.RabbitMQConsumer(
+            sources=[source],
+            logger=logging.getLogger("test_list_unpack"),
+            message_callback=mock_callback,
+        )
+        consumer._consumer_tag_sources["consumer-test_queue"] = source
+
+        channel = FakeChannel()
+        consumer._process_message(
+            channel,
+            _make_method(delivery_tag=99),
+            None,
+            json.dumps(payload).encode("utf-8"),
+        )
+
+        assert channel.basic_ack_calls == [{"delivery_tag": 99}]
+        assert len(dispatched) == 2
+        assert dispatched[0]["asset_id"] == "ECM96.2"
+        assert dispatched[1]["asset_id"] == "ECM97.3"
+
+    def test_list_with_mixed_hp_and_ev_unpacked(self):
+        dispatched = []
+
+        def mock_callback(message, source):
+            if isinstance(message, list):
+                for item in message:
+                    if isinstance(item, dict):
+                        mock_callback(item, source)
+                return True
+            dispatched.append(message)
+            return True
+
+        source = _make_source()
+        payload = [
+            self._hp_command("ECM96.2", "OFF"),
+            self._ev_command("ECM63.1", 0.0),
+        ]
+
+        consumer = fw.RabbitMQConsumer(
+            sources=[source],
+            logger=logging.getLogger("test_list_unpack"),
+            message_callback=mock_callback,
+        )
+        consumer._consumer_tag_sources["consumer-test_queue"] = source
+
+        channel = FakeChannel()
+        consumer._process_message(
+            channel,
+            _make_method(delivery_tag=100),
+            None,
+            json.dumps(payload).encode("utf-8"),
+        )
+
+        assert len(dispatched) == 2
+        assert dispatched[0]["asset_type"] == "heat_pump"
+        assert dispatched[1]["asset_type"] == "ev_charger"
+
+    def test_empty_list_acked_without_error(self):
+        called = []
+
+        def mock_callback(message, source):
+            if isinstance(message, list):
+                for item in message:
+                    if isinstance(item, dict):
+                        mock_callback(item, source)
+                return True
+            called.append(message)
+            return True
+
+        source = _make_source()
+        consumer = fw.RabbitMQConsumer(
+            sources=[source],
+            logger=logging.getLogger("test_list_unpack"),
+            message_callback=mock_callback,
+        )
+        consumer._consumer_tag_sources["consumer-test_queue"] = source
+
+        channel = FakeChannel()
+        consumer._process_message(
+            channel,
+            _make_method(delivery_tag=101),
+            None,
+            json.dumps([]).encode("utf-8"),
+        )
+
+        assert channel.basic_ack_calls == [{"delivery_tag": 101}]
+        assert called == []
+
+    def test_single_item_list_unpacked(self):
+        dispatched = []
+
+        def mock_callback(message, source):
+            if isinstance(message, list):
+                for item in message:
+                    if isinstance(item, dict):
+                        mock_callback(item, source)
+                return True
+            dispatched.append(message)
+            return True
+
+        source = _make_source()
+        consumer = fw.RabbitMQConsumer(
+            sources=[source],
+            logger=logging.getLogger("test_list_unpack"),
+            message_callback=mock_callback,
+        )
+        consumer._consumer_tag_sources["consumer-test_queue"] = source
+
+        channel = FakeChannel()
+        consumer._process_message(
+            channel,
+            _make_method(delivery_tag=102),
+            None,
+            json.dumps([self._hp_command("ECM96.2", "OFF")]).encode("utf-8"),
+        )
+
+        assert len(dispatched) == 1
+        assert dispatched[0]["asset_id"] == "ECM96.2"
+
+    def test_list_with_non_dict_entries_skipped(self, caplog):
+        dispatched = []
+
+        def mock_callback(message, source):
+            if isinstance(message, list):
+                for idx, item in enumerate(message):
+                    if isinstance(item, dict):
+                        mock_callback(item, source)
+                return True
+            dispatched.append(message)
+            return True
+
+        source = _make_source()
+        payload = [
+            self._hp_command("ECM96.2", "OFF"),
+            "not a dict",
+            42,
+            self._hp_command("ECM97.3", "OFF"),
+        ]
+
+        consumer = fw.RabbitMQConsumer(
+            sources=[source],
+            logger=logging.getLogger("test_list_unpack"),
+            message_callback=mock_callback,
+        )
+        consumer._consumer_tag_sources["consumer-test_queue"] = source
+
+        channel = FakeChannel()
+        consumer._process_message(
+            channel,
+            _make_method(delivery_tag=103),
+            None,
+            json.dumps(payload).encode("utf-8"),
+        )
+
+        assert len(dispatched) == 2
+        assert dispatched[0]["asset_id"] == "ECM96.2"
+        assert dispatched[1]["asset_id"] == "ECM97.3"
