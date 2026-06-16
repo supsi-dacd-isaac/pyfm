@@ -224,6 +224,25 @@ class TestV2SourceResolution:
 
         assert sections == {"realAssetCommands"}
 
+    def test_all_configured_sources_included(self):
+        """All sources in the config are included, even without routes."""
+        config = _v2_config(
+            sources={
+                "real_cmds": {"section": "realAssetCommands"},
+                "sim_measures": {"section": "simulatedAssetMeasures"},
+            },
+        )
+        validated = fw.validate_routing_config(config)
+        router = fw.MessageRouter.from_validated_config(validated)
+
+        all_sections = set()
+        for src_def in router.sources.values():
+            sec = src_def.get("section")
+            if sec:
+                all_sections.add(sec)
+
+        assert all_sections == {"realAssetCommands", "simulatedAssetMeasures"}
+
     def test_rabbit_sections_whitelist_filters_v2_sources(self):
         config = _v2_config(
             sources={

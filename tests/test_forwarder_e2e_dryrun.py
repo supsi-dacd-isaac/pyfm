@@ -173,6 +173,33 @@ class TestSourceDerivation:
         src = router_with_resolved_api.sources.get("real_commands", {})
         assert src.get("section") == "realAssetCommands"
 
+    def test_simulated_measures_source_configured(self, router_with_resolved_api):
+        assert "simulated_measures" in router_with_resolved_api.sources
+
+    def test_simulated_measures_maps_to_simulatedAssetMeasures(self, router_with_resolved_api):
+        src = router_with_resolved_api.sources.get("simulated_measures", {})
+        assert src.get("section") == "simulatedAssetMeasures"
+
+    def test_all_configured_sections(self, router_with_resolved_api):
+        sections = set()
+        for src_def in router_with_resolved_api.sources.values():
+            sec = src_def.get("section")
+            if sec:
+                sections.add(sec)
+        assert sections == {"realAssetCommands", "simulatedAssetMeasures"}
+
+    def test_measurement_on_simulated_measures_no_match(self, router_with_resolved_api):
+        """Measurements arrive but have no forwarding route — handled by on_no_match policy."""
+        msg = {
+            "message_type": "measurement",
+            "asset_type": "heat_pump",
+            "asset_id": "ECM68.3",
+            "measurement_type": "power",
+            "payload": {"power_kw": 2.5},
+        }
+        result = router_with_resolved_api.resolve(msg, "simulatedAssetMeasures")
+        assert result.status == "no_match"
+
 
 # =========================================================================
 # 4. Full pipeline per message — route + build + dry-run dispatch

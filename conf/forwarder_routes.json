@@ -11,6 +11,10 @@
   "sources": {
     "real_commands": {
       "section": "realAssetCommands"
+    },
+    "simulated_measures": {
+      "section": "simulatedAssetMeasures",
+      "comment": "Measurements from simulated assets; consumed and ack'd, not forwarded via HTTP"
     }
   },
 

@@ -2025,10 +2025,8 @@ Examples:
                         api_cfg.reference_api,
                     )
 
-        active_source_names = {r.source for r in v2_router.routes if r.enabled}
         v2_sections: set = set()
-        for src_name in active_source_names:
-            src_def = v2_router.sources.get(src_name, {})
+        for src_name, src_def in v2_router.sources.items():
             sec = src_def.get("section")
             if sec:
                 v2_sections.add(sec)

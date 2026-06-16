@@ -220,6 +220,53 @@ class TestRouteResolution:
         result = router.resolve(msg, "simulatedAssetCommands")
         assert result.status == "no_match"
 
+    def test_simulated_measure_no_match(self, router):
+        """Measurements from simulatedAssetMeasures have no route — ack'd per policy."""
+        msg = {
+            "message_type": "measurement",
+            "asset_type": "heat_pump",
+            "asset_id": "ECM68.3",
+            "measurement_type": "power",
+            "payload": {"power_kw": 2.5},
+        }
+        result = router.resolve(msg, "simulatedAssetMeasures")
+        assert result.status == "no_match"
+
+
+# =========================================================================
+# Source derivation
+# =========================================================================
+
+class TestSourceDerivation:
+
+    def test_config_contains_real_commands_source(self, validated):
+        assert "real_commands" in validated["sources"]
+
+    def test_config_contains_simulated_measures_source(self, validated):
+        assert "simulated_measures" in validated["sources"]
+
+    def test_simulated_measures_section_is_correct(self, validated):
+        src = validated["sources"]["simulated_measures"]
+        assert src.get("section") == "simulatedAssetMeasures"
+
+    def test_all_configured_sources_derive_two_sections(self, validated):
+        sections = set()
+        for src_def in validated["sources"].values():
+            sec = src_def.get("section")
+            if sec:
+                sections.add(sec)
+        assert sections == {"realAssetCommands", "simulatedAssetMeasures"}
+
+    def test_no_route_references_simulated_measures(self, router):
+        """simulated_measures is a consume-only source; no routes use it."""
+        for route in router.routes:
+            assert route.source != "simulated_measures"
+
+    def test_no_route_references_simulatedAssetCommands(self, router):
+        for route in router.routes:
+            src_def = router.sources.get(route.source, {})
+            assert src_def.get("section") != "simulatedAssetCommands"
+
 
 # =========================================================================
 # Policies and defaults
