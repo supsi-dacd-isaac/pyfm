@@ -269,10 +269,10 @@ class AEMRequestHandler(BaseHTTPRequestHandler):
         # Determine response based on path
         parsed = urlparse(self.path)
 
-        if parsed.path == "/control":
+        if parsed.path.startswith("/control"):
             response = {
                 "status": "ok",
-                "endpoint": "control",
+                "endpoint": parsed.path,
                 "message": "Control command received",
                 "command_received": body_data,
                 "timestamp": datetime.now().isoformat()
@@ -353,10 +353,11 @@ def run_server(host: str, port: int):
     logger.info("Server starting on http://%s:%d", host, port)
     logger.info("")
     logger.info("Available endpoints:")
-    logger.info("  GET  /sensors  - Simulated sensor data")
-    logger.info("  POST /control  - Control commands")
-    logger.info("  GET  /health   - Health check")
-    logger.info("  *    /*        - Any other path (logs request)")
+    logger.info("  GET  /sensors                          - Simulated sensor data")
+    logger.info("  POST /control/ECM/ECM00/virtual_assets - Simulated asset measures")
+    logger.info("  POST /control/ECM/{site}/{asset}       - Real asset control commands")
+    logger.info("  GET  /health                           - Health check")
+    logger.info("  *    /*                                - Any other path (logs request)")
     logger.info("")
     if _AUTH_CONFIG["user"]:
         logger.info("Authentication: ENABLED (user: %s)", _AUTH_CONFIG["user"])

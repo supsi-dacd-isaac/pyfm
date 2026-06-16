@@ -2288,12 +2288,33 @@ Examples:
                 json.dumps(resolved_req.body, default=str),
             )
 
-            dispatch_http_request(
+            result = dispatch_http_request(
                 resolved_req,
                 message,
                 policy=_v2_router.defaults.on_http_failure,
                 session=v2_http_session,
             )
+            if result.dry_run:
+                logger.info(
+                    "V2 result: route='%s' status=DRY_RUN (no HTTP call)",
+                    resolved_req.route_name,
+                )
+            elif result.success:
+                logger.info(
+                    "V2 result: route='%s' status=%s attempts=%d",
+                    resolved_req.route_name,
+                    result.status_code,
+                    result.attempts,
+                )
+            else:
+                logger.warning(
+                    "V2 result: route='%s' status=%s error='%s' "
+                    "attempts=%d",
+                    resolved_req.route_name,
+                    result.status_code,
+                    result.error,
+                    result.attempts,
+                )
             return True
 
         logger.info(
