@@ -1,71 +1,52 @@
 # =============================================================================
-  # Forwarder Service for PyFM
-  # =============================================================================
-  #
-  # Command forwarding service that receives commands from RabbitMQ and
-  # forwards them to actual devices.
-  #
-  # Prerequisites:
-  #   - RabbitMQ must be running (docker/rabbitmq)
-  #   - aem-server-simulator must be running (docker/aem-server-simulator)
-  #
-  # Usage:
-  #   docker-compose up -d         # Start forwarder
-  #   docker-compose logs -f       # View logs (console + file)
-  #   docker-compose down          # Stop forwarder
-  #   docker-compose up --build    # Rebuild and start
-  #
-  # Logs are written to: ./logs/forwarder.log
-  #
-  # Note: aem-server-simulator is managed separately in docker/aem-server-simulator/
-  #       Both services share the 'pyfm_network' for inter-container communication.
-  #
-  # =============================================================================
+# Forwarder Service for PyFM
+# =============================================================================
+#
+# Runtime configuration comes from .env (same directory as this file).
+# Do not duplicate .env variables under environment: below.
+#
+# To switch between legacy and v2 routing, edit .env:
+#   FORWARDER_CONFIG=/app/conf/forwarder_targets.json   # legacy
+#   FORWARDER_CONFIG=/app/conf/forwarder_routes.json    # v2
+#
+# Usage:
+#   docker compose up -d           # Start forwarder
+#   docker compose logs -f         # View logs
+#   docker compose down            # Stop forwarder
+#   docker compose up -d --build   # Rebuild and start
+#
+# =============================================================================
 
-  services:
-    forwarder:
-      build:
-        context: ../..
-        dockerfile: docker/Dockerfile.forwarder
-      image: pyfm-forwarder:latest
-      container_name: pyfm_forwarder
-      environment:
-        # Forwarder configuration
-        FORWARDER_MODE: ${FORWARDER_MODE:-live}             # dry-run or live
-        FORWARDER_LOG_LEVEL: ${FORWARDER_LOG_LEVEL:-INFO}   # DEBUG, INFO, WARNING, ERROR
-        FORWARDER_LOG_FILE: /app/logs/forwarder.log         # Log file inside container
-        FORWARDER_CONFIG: /app/conf/forwarder_targets.json  # Config file path
-        FORWARDER_CONNS: /app/conf/private/conns.json       # conns.json path
-        FORWARDER_RABBIT_SECTIONS: ${FORWARDER_RABBIT_SECTIONS:-realAssetCommands,simulatedAssetMeasures}
-        # FORWARDER_ASSET_TYPES: heat_pump,ev_charger       # Filter by asset types
+services:
+  forwarder:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile.forwarder
 
-        # RabbitMQ connection
-        RABBITMQ_HOST: ${RABBITMQ_HOST:-rabbitmq}
-        RABBITMQ_PORT: ${RABBITMQ_PORT:-5672}
-        RABBITMQ_USER: ${RABBITMQ_USER:-guest}
-        RABBITMQ_PASS: ${RABBITMQ_PASS:-guest}
-        RABBITMQ_VHOST: ${RABBITMQ_VHOST:-/}
+    image: pyfm-forwarder:latest
+    container_name: pyfm_forwarder
 
-        # Connection retry settings
-        RABBITMQ_CONNECT_RETRIES: ${RABBITMQ_CONNECT_RETRIES:-10}
-        RABBITMQ_CONNECT_RETRY_DELAY: ${RABBITMQ_CONNECT_RETRY_DELAY:-5}
+    env_file:
+      - .env
 
-      # Mount logs and config directories
-      volumes:
-        - ./logs:/app/logs
-        - ../../conf/forwarder_targets.json:/app/conf/forwarder_targets.json:ro
-        - ../../conf/private/conns.json:/app/conf/private/conns.json:ro
+    environment:
+      # Container-structural paths only — not present in .env
+      FORWARDER_LOG_FILE: /app/logs/forwarder.log
+      FORWARDER_CONNS: /app/conf/private/conns.json
 
-      # Add extra hosts for host.docker.internal on Linux
-      extra_hosts:
-        - "host.docker.internal:host-gateway"
+    volumes:
+      - ./logs:/app/logs
+      - ../../conf:/app/conf:ro
 
-      networks:
-        - pyfm_network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
-      restart: unless-stopped
+    networks:
+      - pyfm_network
 
-  networks:
-    pyfm_network:
-      external: true
-      name: pyfm_network
+    restart: unless-stopped
+
+networks:
+  pyfm_network:
+    external: true
+    name: pyfm_network
