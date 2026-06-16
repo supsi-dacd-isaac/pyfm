@@ -337,9 +337,18 @@ class TestEndpointAndApiConfig:
         aem = validated["apis"]["aem_api"]
         assert aem.verify_ssl is False
 
-    def test_hp_endpoint_body_mode(self, validated):
+    def test_hp_endpoint_body_template(self, validated):
+        # HP endpoints must translate the internal command into the AEM
+        # {power, time} body. The v2 ``hp_control`` body_mode emits the raw
+        # internal envelope instead, which the AEM API rejects, so HP
+        # endpoints use an explicit body_template (same as the legacy
+        # forwarder_targets.json and the default_aem_command fallback).
         ep = validated["endpoints"]["hp_ecm96_2"]
-        assert ep.body_mode == "hp_control"
+        assert ep.body_mode is None
+        assert ep.body_template is not None
+        assert "$map" in ep.body_template.get("power", {})
+        assert ep.body_template["power"].get("type") == "on_off"
+        assert ep.body_template.get("time", {}).get("type") == "datetime_utc_future_minute"
 
     def test_ev_endpoint_body_mode(self, validated):
         ep = validated["endpoints"]["ev_ecm63_1"]

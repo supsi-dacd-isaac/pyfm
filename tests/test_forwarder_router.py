@@ -1600,7 +1600,10 @@ class TestHttpFailurePolicy:
             r.message for r in caplog.records if r.levelname == "ERROR"
         ]
         assert len(error_msgs) >= 1
-        text = error_msgs[-1]
+        text = next(
+            (m for m in error_msgs if "HTTP dispatch failed after" in m),
+            error_msgs[-1],
+        )
         assert "test_route" in text
         assert "test_api" in text
         assert "test_ep" in text

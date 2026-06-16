@@ -63,12 +63,30 @@
     "hp_ecm96_2": {
       "method": "POST",
       "path_template": "/ECM/ECM96/hp",
-      "body_mode": "hp_control"
+      "body_template": {
+        "power": {
+          "$map": ["payload.discrete_state", "payload.target_state", "target_state"],
+          "type": "on_off"
+        },
+        "time": {
+          "$map": "payload.slot_start",
+          "type": "datetime_utc_future_minute"
+        }
+      }
     },
     "hp_ecm97_3": {
       "method": "POST",
       "path_template": "/ECM/ECM97/hp",
-      "body_mode": "hp_control"
+      "body_template": {
+        "power": {
+          "$map": ["payload.discrete_state", "payload.target_state", "target_state"],
+          "type": "on_off"
+        },
+        "time": {
+          "$map": "payload.slot_start",
+          "type": "datetime_utc_future_minute"
+        }
+      }
     },
     "ev_ecm63_1": {
       "method": "POST",
