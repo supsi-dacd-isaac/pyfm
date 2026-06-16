@@ -244,23 +244,26 @@ def resolve_effective_dry_run(
     message_dry_run: Optional[bool],
     missing_message_dry_run_default: bool = DEFAULT_MISSING_MESSAGE_DRY_RUN,
 ) -> bool:
-    """Compute effective dry-run = forwarder OR route OR message.
+    """Compute effective dry-run with a clear priority cascade.
 
-    * *forwarder_dry_run*: global CLI / env flag.
-    * *route_dry_run*: per-route setting; ``None`` treated as ``False``.
-    * *message_dry_run*: per-message payload flag; ``None`` falls back to
-      *missing_message_dry_run_default*.
+    Priority (highest wins):
+      1. *forwarder_dry_run* — global CLI/env kill switch; always wins.
+      2. *route_dry_run* — explicit per-route override (True=dry-run,
+         False=live).  ``None`` means "defer to message".
+      3. *message_dry_run* — per-message payload flag.
+      4. *missing_message_dry_run_default* — fallback when neither route
+         nor message specifies a value.
     """
     if forwarder_dry_run:
         return True
 
-    if route_dry_run is not None and route_dry_run:
-        return True
+    if route_dry_run is not None:
+        return route_dry_run
 
-    if message_dry_run is None:
-        return missing_message_dry_run_default
+    if message_dry_run is not None:
+        return message_dry_run
 
-    return message_dry_run
+    return missing_message_dry_run_default
 
 
 # ---------------------------------------------------------------------------

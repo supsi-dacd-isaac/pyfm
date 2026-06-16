@@ -5,7 +5,7 @@
     "on_no_match": "ack_warn_no_forward",
     "on_ambiguous_match": "ack_error_no_forward",
     "on_http_failure": "ack_error_no_requeue",
-    "missing_message_dry_run_default": true
+    "missing_message_dry_run_default": false
   },
 
   "sources": {
@@ -81,7 +81,7 @@
     },
     "sim_measure_passthrough": {
       "method": "POST",
-      "path_template": "",
+      "path_template": "/measure/",
       "comment": "Passthrough: sends the entire RabbitMQ message JSON as the POST body"
     },
     "default_aem_command": {

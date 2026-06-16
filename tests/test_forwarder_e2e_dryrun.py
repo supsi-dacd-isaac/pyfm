@@ -636,11 +636,11 @@ class TestNoMatchScenarios:
 
 class TestDryRunDefaultBehavior:
 
-    def test_missing_payload_dry_run_uses_default_true(
+    def test_missing_payload_dry_run_uses_default_false(
         self, router_with_resolved_api
     ):
-        """Message without payload.dry_run → effective_dry_run=True
-        because missing_message_dry_run_default=True and forwarder_dry_run=False."""
+        """Message without payload.dry_run → effective_dry_run=False
+        because missing_message_dry_run_default=False and forwarder_dry_run=False."""
         msg = {
             "message_type": "command",
             "asset_type": "heat_pump",
@@ -662,7 +662,7 @@ class TestDryRunDefaultBehavior:
             router_with_resolved_api,
             forwarder_dry_run=False,
         )
-        assert resolved.effective_dry_run is True
+        assert resolved.effective_dry_run is False
 
     def test_explicit_payload_dry_run_false_with_forwarder_false(
         self, router_with_resolved_api

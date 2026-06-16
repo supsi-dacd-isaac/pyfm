@@ -290,11 +290,11 @@ class TestPoliciesAndDefaults:
         defaults: RoutingDefaults = validated["defaults"]
         assert defaults.on_http_failure == "ack_error_no_requeue"
 
-    def test_missing_message_dry_run_default_true(self, validated):
+    def test_missing_message_dry_run_default_false(self, validated):
         defaults: RoutingDefaults = validated["defaults"]
-        assert defaults.missing_message_dry_run_default is True
+        assert defaults.missing_message_dry_run_default is False
 
-    def test_dry_run_resolves_with_missing_payload_flag(self, router):
+    def test_dry_run_resolves_live_when_no_payload_flag(self, router):
         msg = {
             "message_type": "command",
             "asset_type": "heat_pump",
@@ -312,7 +312,7 @@ class TestPoliciesAndDefaults:
                 router.defaults.missing_message_dry_run_default
             ),
         )
-        assert effective is True
+        assert effective is False
 
 
 # =========================================================================
@@ -375,7 +375,7 @@ class TestEndpointAndApiConfig:
     def test_sim_measure_endpoint_is_passthrough(self, validated):
         ep = validated["endpoints"]["sim_measure_passthrough"]
         assert ep.method == "POST"
-        assert ep.path_template == ""
+        assert ep.path_template == "/measure/"
         assert ep.body_mode is None
         assert ep.body_template is None
 

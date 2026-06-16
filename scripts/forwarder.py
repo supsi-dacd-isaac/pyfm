@@ -2146,7 +2146,7 @@ Examples:
                 )
                 return True
 
-            effective_dry_run = _v2_dry_run or resolve_effective_dry_run(
+            effective_dry_run = resolve_effective_dry_run(
                 forwarder_dry_run=_v2_dry_run,
                 route_dry_run=route.dry_run,
                 message_dry_run=None,

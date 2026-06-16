@@ -564,21 +564,37 @@ class TestDryRunResolution:
     def test_message_dry_run_true_makes_effective_true(self):
         assert resolve_effective_dry_run(
             forwarder_dry_run=False,
-            route_dry_run=False,
+            route_dry_run=None,
             message_dry_run=True,
         ) is True
 
-    def test_all_false_means_live(self):
+    def test_all_none_message_false_means_live(self):
+        assert resolve_effective_dry_run(
+            forwarder_dry_run=False,
+            route_dry_run=None,
+            message_dry_run=False,
+        ) is False
+
+    def test_explicit_route_false_means_live(self):
         assert resolve_effective_dry_run(
             forwarder_dry_run=False,
             route_dry_run=False,
-            message_dry_run=False,
+            message_dry_run=None,
+            missing_message_dry_run_default=True,
+        ) is False
+
+    def test_explicit_route_false_overrides_message_default(self):
+        """route dry_run=false wins over missing_message_dry_run_default=true."""
+        assert resolve_effective_dry_run(
+            forwarder_dry_run=False,
+            route_dry_run=False,
+            message_dry_run=True,
         ) is False
 
     def test_missing_message_dry_run_uses_configured_default_true(self):
         assert resolve_effective_dry_run(
             forwarder_dry_run=False,
-            route_dry_run=False,
+            route_dry_run=None,
             message_dry_run=None,
             missing_message_dry_run_default=True,
         ) is True
@@ -586,12 +602,12 @@ class TestDryRunResolution:
     def test_missing_message_dry_run_uses_configured_default_false(self):
         assert resolve_effective_dry_run(
             forwarder_dry_run=False,
-            route_dry_run=False,
+            route_dry_run=None,
             message_dry_run=None,
             missing_message_dry_run_default=False,
         ) is False
 
-    def test_route_without_dry_run_defaults_to_false(self):
+    def test_route_without_dry_run_defers_to_message(self):
         assert resolve_effective_dry_run(
             forwarder_dry_run=False,
             route_dry_run=None,
