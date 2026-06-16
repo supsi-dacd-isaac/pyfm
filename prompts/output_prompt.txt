@@ -1,277 +1,678 @@
-# Step 3 — Forwarder Configurable Routing: HTTP Dispatcher Report
+================================================================================
+PYFM ARCHITECTURE INVESTIGATION REPORT
+Forwarder responsibility split analysis
+Date: 2026-06-16
+================================================================================
 
-## 1. Summary
 
-Implemented an isolated HTTP dispatch layer for the new routing system. The
-dispatcher takes a `ResolvedRequest` (produced by Step 2's
-`build_resolved_request`) and either:
+## 1. EXECUTIVE SUMMARY
 
-1. Logs it with `[DRY-RUN]` without sending if `effective_dry_run=True`; or
-2. Sends it via HTTP with configurable retries if `effective_dry_run=False`.
+### Verdict: The suspected architectural problem is PARTIALLY CONFIRMED.
 
-The dispatcher returns an `HttpDispatchResult` that records success/failure,
-status code, attempt count, error details, and the applicable failure policy
-(`ack_error_no_requeue`). It does not perform any RabbitMQ ack/nack — that
-will be integrated in Step 4.
+The forwarder (`scripts/forwarder.py`) is NOT a pure message forwarder. It is a
+**protocol adapter** that translates internal RabbitMQ command envelopes into
+external HTTP API calls (currently the AEM REST API). This adapter role is
+**architecturally justified** because the external API requires a different
+payload shape than the internal domain messages.
 
-The dispatcher is fully testable via an injectable mock session parameter,
-with no dependency on RabbitMQ, live HTTP, or modifications to `forwarder.py`.
+However, the investigation reveals several concrete concerns:
 
-## 2. Files changed
+1. **Duplicated body-building logic**: The `_build_ev_power_timeseries_body`
+   function exists in both `forwarder.py` (lines 281-373) and
+   `forwarder_router.py` (lines 855-963). These are near-identical
+   implementations that could diverge.
 
-| File | Action | Purpose |
-|------|--------|---------|
-| `scripts/forwarder_router.py` | **Modified** | Added `HttpDispatchResult`, `dispatch_http_request()`, retry helpers, body preview, `InsecureRequestWarning` handling |
-| `tests/test_forwarder_router.py` | **Modified** | Added 26 new tests for dry-run dispatch, HTTP success, failure policy, retry behavior, and safety |
-| `prompts/output_prompt.txt` | **Overwritten** | This report |
+2. **Duplicated type-coercion/datetime utilities**: Functions like
+   `_format_datetime_utc`, `_coerce_float`, `_to_on_off`, `_to_bool`, and
+   `_first_by_paths` are duplicated between `forwarder.py` and
+   `forwarder_router.py`.
 
-No other files were added, modified, or deleted. `scripts/forwarder.py` was not touched.
+3. **The forwarder interprets command semantics**: It inspects `command_type`,
+   `discrete_state`, `modulation_type`, `payload.schedule`, and other business
+   fields to build the correct external request body. This is necessary for the
+   AEM API translation but means the forwarder depends on internal domain
+   knowledge.
 
-## 3. New classes/functions
+4. **The command contract is implicit**: There is no formal schema definition
+   for the RabbitMQ messages exchanged between manager/actuator and forwarder.
+   The contract is defined implicitly by the producer code and assumed by the
+   consumer code.
 
-### Data classes
+### Current roles:
 
-| Class | Responsibility |
-|-------|---------------|
-| `HttpDispatchResult` | Result of a dispatch operation. Fields: `success`, `dry_run`, `status_code`, `error`, `attempts`, `policy`, `route_name`, `api_name`, `endpoint_name`. |
+- **`flexi_manager.py`**: Decision engine. Queries market results, allocates
+  flexibility across assets, computes curtailment targets, builds internal
+  command payloads, and publishes them to RabbitMQ.
 
-### Functions
+- **`flexi_actuator.py`**: One-shot CLI tool. Translates direct operator
+  commands (force_off, force_on, restore) into the same internal command
+  envelope format used by flexi_manager, and publishes them to RabbitMQ.
 
-| Function | Responsibility |
-|----------|---------------|
-| `dispatch_http_request()` | Main dispatcher — accepts `ResolvedRequest`, message (for logging context), injectable session. Handles dry-run logging, live HTTP with retries, success/failure result. |
-| `_is_retryable_status()` | Returns True for 5xx and 429 status codes. |
-| `_format_body_preview()` | Bounded JSON serialisation of body for logging. |
+- **`forwarder.py`**: Protocol adapter / actuation bridge. Consumes internal
+  command envelopes from RabbitMQ, translates them into AEM REST API calls
+  (different payload shape, different endpoint per asset), and sends HTTP
+  requests to the external system. Also handles simulated measurements.
 
-### Constants / imports
+### Most important finding:
 
-| Item | Purpose |
-|------|---------|
-| `_RETRYABLE_STATUS_CODES` | `frozenset({429})` — status codes retried alongside 5xx. |
-| `InsecureRequestWarning` | Imported from urllib3 when available; synthesized stub otherwise. Used to suppress warnings when `verify_ssl=False`. |
+The forwarder is NOT duplicating command generation or allocation logic. The
+business decisions (which assets to curtail, how much, which discrete state)
+are made entirely by `flexi_manager.py` or `flexi_actuator.py`. The forwarder
+performs **protocol adaptation** — translating the internal domain envelope
+into the external API format required by the AEM platform. This adaptation is
+necessary because the AEM API expects a different payload shape (e.g.,
+`{"power": true/false, "time": "..."}` for heat pumps, or a
+`{"timestamp": power_kw, ...}` timeseries dict for EV chargers) rather than
+the full internal command envelope.
 
-## 4. HTTP dispatch behavior implemented
 
-### Dry-run behavior
+## 2. CURRENT ARCHITECTURE
 
-When `request.effective_dry_run is True`:
-- No HTTP call is made (session is not invoked).
-- An INFO log is emitted containing `[DRY-RUN]`, the HTTP method, URL, route
-  name, API name, endpoint name, and a bounded body preview.
-- Returns `HttpDispatchResult(success=True, dry_run=True, attempts=0)`.
-
-### HTTP success behavior
-
-When the HTTP response status code is in `request.success_status_codes`
-(default `[200, 201, 202, 204]`):
-- Returns `HttpDispatchResult(success=True, dry_run=False, status_code=N,
-  attempts=K)`.
-- If the success occurred on a retry (attempt > 1), an INFO log notes this.
-
-### HTTP failure behavior
-
-When all attempts are exhausted or a non-retryable error is encountered:
-- Returns `HttpDispatchResult(success=False, dry_run=False, status_code=N,
-  error="...", attempts=K, policy="ack_error_no_requeue")`.
-- An ERROR log is emitted with: route name, API name, endpoint name, URL,
-  status code, error description, asset_id, asset_type, message_type, and
-  policy.
-
-### Retry behavior
-
-Retry semantics follow the existing `TargetHandler` convention:
+### 2.1 Real-asset command flow (market activation)
 
 ```
-total_attempts = max(1, request.request_retries + 1)
+NODES market activation
+  -> flexi_manager.py (FlexibilityManager.manage_slot)
+     -> queries market results from NODES API
+     -> determines accepted trades for the slot
+     -> FlexibilityAllocator.allocate_flexibility()
+        -> distributes curtailment across assets
+     -> AssetController.curtail_asset() / restore_asset()
+        -> builds internal command payload
+        -> appends to _pending_commands list
+     -> AssetController.publish_pending_commands()
+        -> _prepare_command_payload_for_slot() enriches with timing, EV schedule
+        -> _resolve_rabbitmq_command_destination() reads asset's rabbitCommandSection
+        -> RabbitMQPublisher.publish_batch_commands()
+           -> publishes batch_start header per destination
+           -> publishes one command message per asset
+  -> RabbitMQ exchange=flexi_commands, queue=flexi_commands_queue, routing_key=real_asset.command
+  -> forwarder.py (RabbitMQConsumer._process_message)
+     -> Legacy path: CommandHandler.handle_command()
+        -> TargetHandler.forward_command()
+           -> TargetConfig.build_request() translates to AEM API format
+           -> TargetHandler._send_to_target() sends HTTP POST
+     -> V2 path: _v2_message_callback()
+        -> MessageRouter.resolve() matches route
+        -> build_resolved_request() builds HTTP request
+        -> dispatch_http_request() sends HTTP POST
+  -> AEM REST API (external system or aem-server-simulator)
 ```
 
-Where `request_retries` means *additional* attempts after the first.
-So `retries=0` → 1 attempt, `retries=2` → 3 attempts.
-
-**Retried conditions:**
-- Status 5xx (500, 502, 503, etc.)
-- Status 429 (rate limited)
-- Connection/timeout exceptions (`Exception` subclasses)
-
-**Not retried (immediate failure):**
-- Status 400 (Bad Request)
-- Status 401 (Unauthorized)
-- Status 403 (Forbidden)
-- Status 404 (Not Found)
-- Status 405 (Method Not Allowed)
-- Status 409 (Conflict)
-- Status 422 (Unprocessable Entity)
-- Any other non-5xx, non-429 failure
-
-This differs from the legacy `TargetHandler` which retries *all* non-success
-responses. The new v2 dispatcher is more selective — non-retryable 4xx errors
-fail immediately without wasting retry attempts.
-
-### Non-retryable status handling
-
-When a 4xx response (other than 429) is received, the dispatcher breaks out of
-the retry loop immediately with `attempts=1` and returns failure. This avoids
-futile retries against deterministic errors.
-
-### Failure policy handling
-
-The policy string (`ack_error_no_requeue`) is attached to every
-`HttpDispatchResult`. In Step 3, no RabbitMQ ack/nack is performed — the
-policy is purely informational for the caller (to be acted upon in Step 4).
-
-### Logging
-
-| Event | Level | Content |
-|-------|-------|---------|
-| Dry-run | INFO | `[DRY-RUN] METHOD URL route api endpoint body_preview` |
-| Retry warning | WARNING | `Route 'name' attempt N/M failed: reason; retrying` |
-| Success on retry | INFO | `Route 'name' request succeeded on attempt N/M` |
-| Final failure | ERROR | Route, API, endpoint, URL, status, error, asset_id, asset_type, message_type, policy |
-
-### Result object
-
-`HttpDispatchResult` captures all dispatch outcomes in a single, immutable-style
-dataclass that the caller can inspect without parsing logs.
-
-## 5. Tests added
-
-### `tests/test_forwarder_router.py` — 26 new tests (117 total)
-
-**Dry-run dispatch (4 tests)**
-
-| Test | Description |
-|------|-------------|
-| `test_dry_run_does_not_call_http_client` | Session not invoked |
-| `test_dry_run_returns_success_true_and_dry_run_true` | Result flags correct |
-| `test_dry_run_logs_marker` | `[DRY-RUN]` in log output |
-| `test_dry_run_log_includes_route_api_endpoint_method_url` | All diagnostics present |
-
-**Successful HTTP dispatch (5 tests)**
-
-| Test | Description |
-|------|-------------|
-| `test_post_success_200` | 200 → success |
-| `test_status_202_in_success_codes` | 202 → success |
-| `test_custom_method_headers_auth_timeout_verify_passed` | All request params forwarded |
-| `test_custom_success_status_codes` | 206 accepted when configured |
-| `test_success_on_retry` | 500 then 200 → success on attempt 2 |
-
-**HTTP failure policy (5 tests)**
-
-| Test | Description |
-|------|-------------|
-| `test_500_after_retries_returns_failure` | Exhausted retries → failure |
-| `test_failure_result_has_ack_error_no_requeue` | Policy field correct |
-| `test_failure_logs_error_with_diagnostics` | ERROR log contains all required fields |
-| `test_failure_records_number_of_attempts` | `attempts=3` for retries=2 |
-| `test_failure_result_names` | route/api/endpoint names in result |
-
-**Retry behavior (9 tests)**
-
-| Test | Description |
-|------|-------------|
-| `test_500_is_retried` | 500 → retry → 200 success |
-| `test_503_is_retried` | 503 → retry → 200 success |
-| `test_timeout_exception_is_retried` | ConnectionError → retry → 200 success |
-| `test_429_is_retried` | 429 → retry → 200 success |
-| `test_400_is_not_retried` | 400 → immediate failure, 1 attempt |
-| `test_401_is_not_retried` | 401 → immediate failure, 1 attempt |
-| `test_404_is_not_retried` | 404 → immediate failure, 1 attempt |
-| `test_422_is_not_retried` | 422 → immediate failure, 1 attempt |
-| `test_connection_error_exhausts_retries` | 3 connection errors → failure after 3 attempts |
-
-**Safety (3 tests)**
-
-| Test | Description |
-|------|-------------|
-| `test_resolved_request_not_mutated` | Request unchanged after dispatch |
-| `test_message_not_mutated` | Message unchanged after dispatch |
-| `test_zero_retries_means_one_attempt` | retries=0 → exactly 1 attempt |
-
-## 6. Tests run
-
-### Routing tests (Steps 1 + 2 + 3)
-
-```bash
-PYTHONPATH=... pytest tests/test_forwarder_router.py -v
-```
-
-Result: **117 passed in 0.75s** (52 Step 1 + 39 Step 2 + 26 Step 3)
-
-### Baseline tests (run individually)
-
-```bash
-PYTHONPATH=... pytest tests/test_forwarder_rabbitmq_sources.py -v
-```
-
-Result: **10 passed in 0.19s**
-
-```bash
-PYTHONPATH=... pytest tests/test_flexi_actuator_rabbitmq_overrides.py -v
-```
-
-Result: **3 passed in 0.04s**
-
-```bash
-PYTHONPATH=... pytest tests/test_flexi_actuator_command_list.py -v
-```
-
-Result: **7 passed in 0.14s**
-
-**Total: 137 tests passed (117 routing + 20 baseline). No regressions.**
-
-## 7. Backward compatibility
-
-- `scripts/forwarder.py` was **not modified** in any way.
-- `TargetHandler`, `CommandHandler`, `RabbitMQConsumer`, and all legacy classes
-  remain untouched.
-- All 91 Step 1+2 routing tests continue to pass unchanged.
-- All 20 baseline tests pass when run individually.
-- The dispatcher does not import or interact with any RabbitMQ code.
-- No Docker Compose files were changed.
-- No production config files were changed.
-
-## 8. Issues, assumptions, or risks
-
-1. **Retry semantics differ from legacy TargetHandler**: The new dispatcher only
-   retries on 5xx, 429, and connection/timeout exceptions. The legacy
-   `TargetHandler._send_to_target` retries on *all* non-success responses. This
-   is an intentional improvement for the v2 path — non-retryable 4xx errors fail
-   fast instead of wasting retries.
-
-2. **No backoff between retries**: The current implementation retries immediately
-   without delay. For production use, especially with 429 (rate limit) or 503
-   (service unavailable), a backoff strategy may be desirable. This can be added
-   in a later step without changing the interface.
-
-3. **`InsecureRequestWarning` fallback**: When `urllib3` is not installed, a
-   synthetic `InsecureRequestWarning` class is created as a `UserWarning`
-   subclass. This ensures the `warnings.catch_warnings()` block works correctly
-   even without urllib3.
-
-4. **Session lifecycle**: The dispatcher creates a new `requests.Session()` per
-   call if none is injected. For production integration (Step 4), a shared session
-   should be created once and reused across dispatches for connection pooling.
-
-5. **No RabbitMQ ack/nack**: As designed, the dispatcher returns a result object
-   and the caller is responsible for RabbitMQ acknowledgment based on the result
-   and policy. This will be wired in Step 4.
-
-## 9. Recommendation for next step
+### 2.2 Real-asset command flow (manual actuator)
 
 ```
-Proceed to Step 4: yes
+Operator CLI invocation
+  -> flexi_actuator.py (main)
+     -> _normalize_command() validates force_off/force_on/restore
+     -> _build_rabbitmq_command() builds internal command payload
+     -> _resolve_rabbitmq_command_destination() reads asset's rabbitCommandSection
+     -> _prepare_commands_for_publish() enriches with timing, EV schedule
+     -> RabbitMQPublisher.publish_batch_commands()
+        -> publishes command messages (NO batch_start header for actuator)
+  -> RabbitMQ exchange=flexi_commands, queue=flexi_commands_queue, routing_key=real_asset.command
+  -> forwarder.py (same path as above)
+  -> AEM REST API
 ```
 
-The HTTP dispatch layer is complete and fully tested. Step 4 should integrate
-the full v2 routing pipeline into `forwarder.py`:
+### 2.3 Simulated-asset command flow
 
-- Detect v2 config in `main()` and instantiate the `MessageRouter`.
-- In `_process_message`, when v2 config is active:
-  1. Call `router.resolve(message, source_section)`.
-  2. Apply `on_no_match` / `on_ambiguous_match` policies.
-  3. Call `build_resolved_request()` for matched routes.
-  4. Call `dispatch_http_request()`.
-  5. Apply `on_http_failure` policy for ack/nack.
-- Maintain backward compatibility: when legacy config is detected, use
-  existing `TargetHandler` / `CommandHandler` path unchanged.
+```
+flexi_manager.py or flexi_actuator.py
+  -> asset_mapping[asset_id].rabbitCommandSection = "simulatedAssetCommands"
+  -> RabbitMQ exchange=flexi_sim_commands, queue=flexi_sim_commands_queue, routing_key=sim_asset.command
+  -> forwarder.py is NOT necessarily consuming this queue
+     (depends on FORWARDER_RABBIT_SECTIONS configuration)
+  -> Intended consumer: a simulator or test harness (not currently implemented
+     as a standalone consumer in the repository)
+```
+
+The docker-compose-aem.yml sets FORWARDER_RABBIT_SECTIONS to
+"realAssetCommands,simulatedAssetMeasures" — explicitly EXCLUDING
+simulatedAssetCommands. This means simulated commands are published to their
+queue but the forwarder does not consume them in the AEM deployment.
+
+### 2.4 Simulated-asset measurement flow
+
+```
+External simulator or test harness
+  -> publishes measurement to RabbitMQ
+     exchange=flexi_sim_measures, queue=flexi_sim_measures_queue, routing_key=sim_asset.measure
+  -> forwarder.py (when configured to consume simulatedAssetMeasures)
+     -> Legacy path: CommandHandler.handle_measurement() (log only)
+     -> V2 path: route "sim_measure_forward"
+        -> forwards entire message as-is to aemAPITest sensorsUrl
+  -> AEM Test API (external system)
+```
+
+Note: `flexi_manager.py` has a `publish_measurement()` method on its
+RabbitMQPublisher class (line 639), but grep shows it is only defined,
+never called in the current codebase. Simulated measurements are expected
+to originate from an external simulator, not from flexi_manager.
+
+
+## 3. DETAILED FLOW TABLE
+
+| Flow | Producer | Exchange | Queue | Routing Key | Consumer | Transformations | Final Destination |
+|------|----------|----------|-------|-------------|----------|-----------------|-------------------|
+| Real curtail command (market) | flexi_manager.py AssetController.publish_pending_commands | flexi_commands | flexi_commands_queue | real_asset.command | forwarder.py | HP: {power: ON/OFF, time: slot_start} via body_template or hp_control body_mode; EV: {timestamp: power_kw} timeseries via ev_power_timeseries body_mode | AEM REST API POST to asset-specific endpoint |
+| Real restore command (market) | flexi_manager.py AssetController.publish_pending_commands | flexi_commands | flexi_commands_queue | real_asset.command | forwarder.py | Same as curtail — discrete_state/target_state -> ON/OFF | AEM REST API |
+| Real command (manual actuator) | flexi_actuator.py RabbitMQPublisher.publish_batch_commands | flexi_commands | flexi_commands_queue | real_asset.command | forwarder.py | Same transformations as market path | AEM REST API |
+| Batch header (market) | flexi_manager.py RabbitMQPublisher._publish_batch_header | flexi_commands | flexi_commands_queue | real_asset.command | forwarder.py | Logged by CommandHandler.handle_batch_header, no forwarding | None (metadata only) |
+| Pre-activation command | flexi_manager.py FlexibilityManager._send_preactivation_command | flexi_commands | flexi_commands_queue | real_asset.command | forwarder.py | Same as curtail path | AEM REST API |
+| Simulated command | flexi_manager.py or flexi_actuator.py | flexi_sim_commands | flexi_sim_commands_queue | sim_asset.command | NOT forwarder.py (in AEM deployment) | N/A | Intended for simulator |
+| Simulated measurement | External simulator | flexi_sim_measures | flexi_sim_measures_queue | sim_asset.measure | forwarder.py (v2 sim_measure_forward route) | Passthrough (entire message) | AEM Test API sensorsUrl |
+
+
+## 4. COMPONENT RESPONSIBILITY ANALYSIS
+
+### 4.1 flexi_manager.py
+
+**Confirmed responsibilities** (from code inspection):
+
+- [YES] Interprets accepted flexibility activations:
+  `FlexibilityManager.manage_slot()` queries NODES API for trades matching
+  the current slot and determines if flexibility activation is needed.
+  (Line ~4800+ in manage_slot method)
+
+- [YES] Allocates requested curtailment among assets:
+  `FlexibilityAllocator.allocate_flexibility()` distributes total flexibility
+  requirement across available assets using modulation_aware strategy.
+  (Line 2219)
+
+- [YES] Decides which assets should be actuated:
+  Asset selection is based on FSP configuration (`assets` list), asset
+  type/modulation filtering, and availability checks (activation-current
+  measurement, EV comfort guard).
+
+- [YES] Computes reference power or target power:
+  `AssetController._calculate_continuous_target_power()` and
+  `_calculate_discrete_ev_target_power()` compute the target power based
+  on reference power, curtailment allocation, and asset capabilities.
+  (Lines 1052-1112, ~1020-1050)
+
+- [YES] Builds asset-level command payloads:
+  `AssetController.curtail_asset()` (line 1114) builds the full command
+  payload including community, site_id, asset_id, modulation_type,
+  target_power_kw, discrete_state, duration_minutes, etc.
+
+- [NO] Does NOT call flexi_actuator.py directly. The actuator is a
+  standalone CLI tool.
+
+- [YES] Publishes directly to RabbitMQ:
+  `RabbitMQPublisher.publish_command()` (line 558) and
+  `RabbitMQPublisher.publish_batch_commands()` (line 705).
+
+- [YES] Performs command-specific business logic:
+  All curtailment decisions, discrete state selection, continuous target
+  calculation, EV schedule building, and restore logic.
+
+### 4.2 flexi_actuator.py
+
+**Confirmed responsibilities:**
+
+- [YES] Converts high-level commands into asset commands:
+  `_build_rabbitmq_command()` (line 755) translates force_off/force_on/restore
+  into curtail/restore command envelopes with appropriate payloads.
+
+- [YES] Selects force_on, force_off, continuous targets:
+  `_normalize_command()` maps CLI input to canonical commands; force_off
+  translates to curtailment at full capacity; force_on translates to
+  curtailment at 0 kW. (Lines 562-578, 765-798)
+
+- [YES] Resolves real vs simulated RabbitMQ destinations:
+  `_resolve_rabbitmq_command_destination()` (line 466) reads
+  `asset_mapping.rabbitCommandSection` to determine whether commands go to
+  realAssetCommands or simulatedAssetCommands.
+
+- [YES] Builds the final RabbitMQ command payload:
+  `_build_curtail_command()` (line 623) and `_build_restore_command()` (line
+  694) create payloads compatible with flexi_manager's format.
+
+- [YES] Publishes commands directly to RabbitMQ:
+  `RabbitMQPublisher.publish_batch_commands()` (line 332).
+
+- [YES] Already performs all transformations needed before RabbitMQ delivery:
+  The actuator builds the complete internal command envelope. No additional
+  business logic is needed by downstream consumers.
+
+- [YES] Includes metadata that forwarder later interprets:
+  Fields like `discrete_state`, `modulation_type`, `target_power_kw`,
+  `power_kw`, `schedule` are included in the payload. The forwarder reads
+  these to build the AEM API request.
+
+### 4.3 forwarder.py
+
+**Confirmed responsibilities:**
+
+- [PARTIAL] Merely transports messages:
+  The forwarder does NOT simply relay the RabbitMQ message body to the
+  external system. It transforms the payload into the AEM API format.
+
+- [YES] Parses command semantics:
+  `CommandHandler.handle_command()` (line 1139) inspects `command_type`,
+  `modulation_type`, `discrete_state`, `target_power_kw`, etc. to log
+  detailed command information.
+
+- [YES] Reconstructs commands for external API:
+  `TargetConfig.build_request()` (line 658) builds a new request body using
+  `body_template` or `body_mode`. For heat pumps, this produces
+  `{"power": true/false, "time": "..."}`. For EV chargers, this produces
+  a `{timestamp: power_kw}` timeseries dict.
+
+- [YES] Changes field names/message shape:
+  The `body_template` maps `payload.discrete_state` -> `power` (via on_off
+  type conversion) and `payload.slot_start` -> `time` (via
+  datetime_utc_future_minute conversion).
+
+- [YES] Resolves endpoints per asset:
+  `asset_request_profiles` in config maps asset IDs to specific endpoints
+  (e.g., ECM96.2 -> /ECM/ECM96/hp, ECM63.1 -> /ECM/ECM63/charge_point_ev_1).
+
+- [NO] Does NOT select actuation modes — it reads the mode already decided
+  by the manager/actuator.
+
+- [YES] Performs HTTP requests:
+  `TargetHandler._send_to_target()` (line 868) sends HTTP POST requests with
+  auth, timeouts, retries, and SSL configuration.
+
+- [NO] Does NOT perform MQTT or Modbus conversion currently (HTTP only, though
+  the docstring mentions MQTT/Modbus as future possibilities).
+
+- [YES] Distinguishes real and simulated via source sections:
+  Different RabbitMQ source sections are consumed based on config
+  (`FORWARDER_RABBIT_SECTIONS`). V2 routes explicitly separate
+  `real_commands` source from `simulated_measures` source.
+
+- [NO] Does NOT manage batches in a stateful way — `handle_batch_header()`
+  logs metadata but does not correlate batch headers with subsequent commands.
+
+- [YES] Applies business-adjacent rules:
+  - `_format_datetime_utc_future_minute()` enforces that timestamps are in
+    the future (at least next UTC minute) — this is an AEM API requirement.
+  - ON/OFF boolean conversion from discrete_state strings.
+  - EV schedule extraction and reformatting.
+
+- [YES] Forwards simulated measurements (V2 route `sim_measure_forward`):
+  Passthrough to aemAPITest sensorsUrl.
+
+**Responsibility classification:**
+
+| Category | Evidence |
+|----------|----------|
+| Transport | RabbitMQ consumption, HTTP dispatch, retry/reconnect |
+| Protocol adaptation | body_template/body_mode transformation, endpoint routing per asset, ON/OFF conversion, datetime formatting |
+| Validation | Request body shape validation, power type checking (line 928-945), endpoint URL validation |
+| Retry/error handling | Configurable retries, timeout, SSL options, ack/nack policies |
+| Command/business logic | Future-minute enforcement (AEM-specific), EV schedule extraction (understanding internal payload shape) |
+
+
+## 5. DUPLICATED OR MISPLACED LOGIC
+
+### 5.1 _build_ev_power_timeseries_body — HIGH SEVERITY
+
+**Files:**
+- `scripts/forwarder.py` lines 281-373
+- `scripts/forwarder_router.py` lines 855-963
+
+**Nature:** Near-identical implementations of the EV schedule body builder.
+Both parse `payload.schedule` (dict or list format), extract timestamps and
+power values with the same fallback key sequences, format datetimes, and
+coerce floats.
+
+**Why duplicated:** `forwarder.py` contains the legacy implementation;
+`forwarder_router.py` contains the V2 routing implementation. Both are
+active code paths depending on config mode.
+
+**Risk:** If the EV schedule format changes (e.g., new timestamp key, new
+power key), one implementation could be updated while the other is forgotten.
+
+**Authoritative owner:** Neither — both are consumers of the same internal
+contract produced by flexi_manager/flexi_actuator.
+
+### 5.2 Datetime formatting utilities — MEDIUM SEVERITY
+
+**Files:**
+- `scripts/forwarder.py`: `_format_datetime_utc()` (line 224),
+  `_format_datetime_utc_future_minute()` (line 237),
+  `_coerce_datetime_utc_naive()` (line 205)
+- `scripts/forwarder_router.py`: `_format_datetime_utc()` (line ~800+),
+  `_format_datetime_utc_future_minute()`, `_coerce_datetime_utc_naive()`
+- `scripts/flexi_manager.py`: `_format_aem_utc()` (line ~2100+)
+- `scripts/flexi_actuator.py`: `_format_aem_utc()` (line 844),
+  `_ceil_to_next_interval()` (line 827)
+
+**Nature:** Multiple implementations of UTC datetime formatting and
+normalization scattered across files.
+
+**Risk:** Subtle formatting differences (e.g., timespec="seconds" vs default)
+could cause mismatches between producer and consumer timestamps.
+
+### 5.3 Type coercion helpers — LOW SEVERITY
+
+**Files:**
+- `scripts/forwarder.py`: `_to_bool()`, `_to_on_off()`, `_coerce_float()`,
+  `_get_by_path()`, `_first_by_paths()`
+- `scripts/forwarder_router.py`: Same functions duplicated
+
+**Nature:** Utility functions duplicated for import isolation between the
+legacy and V2 routing paths.
+
+**Risk:** Low — these are simple, stable utility functions. But maintenance
+burden exists.
+
+### 5.4 RabbitMQ destination resolution — LOW SEVERITY
+
+**Files:**
+- `scripts/flexi_manager.py`: `_resolve_rabbitmq_command_destination()` (line 339)
+- `scripts/flexi_actuator.py`: `_resolve_rabbitmq_command_destination()` (line 466)
+
+**Nature:** Both functions resolve the RabbitMQ destination by reading
+`asset_mapping.rabbitCommandSection` and looking up the exchange/queue/routingKey
+from the rabbitMQ config. They have slightly different signatures (manager
+takes asset_mapping dict; actuator takes individual asset_config and supports
+CLI overrides) but the core logic is equivalent.
+
+**Authoritative owner:** Both are valid owners — each script independently
+resolves destinations for its own publishing path.
+
+**Risk:** Low if the resolution logic is simple. Medium if the resolution rules
+become more complex (e.g., conditional routing).
+
+### 5.5 EV schedule construction — MEDIUM SEVERITY
+
+**Files:**
+- `scripts/flexi_manager.py`: `_build_ev_schedule()` (line ~2100+),
+  `_prepare_command_payload_for_slot()` (line 2136)
+- `scripts/flexi_actuator.py`: `_build_ev_schedule()` (line 851),
+  `_add_ev_schedule_to_payload()` (line 890),
+  `_prepare_commands_for_publish()` (line 929)
+
+**Nature:** Both scripts independently build EV power schedules with the same
+format. The manager's implementation is called from
+`_prepare_command_payload_for_slot`; the actuator's from
+`_prepare_commands_for_publish`. Both produce `{timestamp_str: power_value}`
+dicts.
+
+**Risk:** If the schedule format changes, both must be updated. However, this
+is the PRODUCER side — both scripts need this logic to build valid commands.
+
+### 5.6 Modulation type defaults — LOW SEVERITY
+
+**Files:**
+- `scripts/flexi_manager.py`: `MODULATION_DEFAULTS` dict + `_get_modulation_type()`
+- `scripts/flexi_actuator.py`: `MODULATION_DEFAULTS` dict (line 38) +
+  `_get_modulation_type()` (line 602)
+
+**Nature:** Same default mapping of asset type -> modulation type.
+
+**Risk:** If defaults change (e.g., a new asset type), both must be updated.
+
+
+## 6. IS THE FORWARDER DOING TOO MUCH?
+
+### Direct answer: The forwarder is doing MORE than pure forwarding, but most of what it does is NECESSARY for the AEM API integration.
+
+**Necessary protocol adaptation (JUSTIFIED):**
+
+1. **Body template transformation**: The AEM API expects `{"power": true/false,
+   "time": "2026-06-16T12:00:00"}` for heat pumps and a `{timestamp: kw}`
+   timeseries for EV chargers. The internal command envelope has a completely
+   different shape. This translation is necessary and correctly placed in the
+   forwarder/adapter layer.
+
+2. **Per-asset endpoint routing**: Different assets map to different AEM API
+   endpoints (e.g., `/ECM/ECM96/hp` vs `/ECM/ECM63/charge_point_ev_1`). This
+   is external API topology that the manager should not need to know about.
+
+3. **Authentication and connection management**: HTTP auth, SSL, timeouts, and
+   retries are transport concerns.
+
+4. **Simulated measurement passthrough**: Forwarding raw measurements to the
+   AEM test API is a pure transport task.
+
+**Generic transport/validation (JUSTIFIED):**
+
+5. **Message type dispatching**: Routing `command`, `measurement`, and
+   `batch_start` messages to appropriate handlers.
+
+6. **Malformed message handling**: Rejecting unparseable JSON, validating
+   payload types.
+
+7. **Ack/nack policies**: The v2 routing system's `ack_error_no_requeue` policy
+   prevents poison messages from blocking the queue.
+
+**Borderline — justified but creates coupling:**
+
+8. **Future-minute enforcement** (`_format_datetime_utc_future_minute`): This
+   ensures `slot_start` is at least one minute in the future, which is an AEM
+   API requirement. It is correctly placed in the adapter, but it means the
+   adapter understands the semantics of `slot_start`.
+
+9. **ON/OFF boolean conversion** (`_to_on_off`): Converting `"ON"`/`"OFF"`
+   strings to `true`/`false`. This is AEM API format adaptation, justified
+   in the adapter.
+
+10. **EV schedule extraction and reformatting**: Pulling `payload.schedule`
+    and converting it from the internal format to the AEM timeseries format.
+    This is protocol adaptation but requires understanding the internal
+    payload structure.
+
+**Unnecessary or misplaced (MINOR):**
+
+11. **Detailed command logging in `CommandHandler.handle_command()`**: Lines
+    1172-1240 log extensive command details including `modulation_type`,
+    `discrete_state`, `target_power_kw`, `curtailment`. This logging
+    interprets command semantics purely for observability. It is useful for
+    debugging but technically exceeds the adapter's role. **Severity: Low** —
+    this is observability, not business logic.
+
+### Conclusion:
+
+The forwarder is acting as a **protocol adapter**, not a pure forwarder. This
+is architecturally sound because:
+
+- The external API (AEM) requires a fundamentally different message format.
+- The adapter isolates the internal domain model from external API concerns.
+- The RabbitMQ decoupling provides delivery guarantees and horizontal scaling.
+
+The forwarder does NOT:
+- Duplicate command generation logic
+- Re-allocate flexibility
+- Re-compute target power
+- Re-select discrete states
+- Override business decisions made by the manager/actuator
+
+It DOES read internal payload fields to perform protocol translation, which
+creates a coupling to the internal message schema. This coupling is inherent
+to any adapter pattern and is acceptable as long as the message contract is
+stable and tested.
+
+
+## 7. ARCHITECTURAL OPTIONS
+
+### Option A — Keep the current adapter model
+
+**Description:** The actuator/manager publishes an internal domain command
+to RabbitMQ. The forwarder consumes it and translates to the AEM API format
+using body_template/body_mode configuration.
+
+**Advantages:**
+- Already implemented and working
+- Clean separation: manager owns business decisions, forwarder owns API format
+- RabbitMQ provides delivery guarantees and buffering
+- Multiple forwarder instances can scale consumption
+- Forwarder can be swapped for a different adapter without changing the manager
+- V2 routing config provides declarative route management
+
+**Disadvantages:**
+- Forwarder must understand internal payload structure for translation
+- Duplicated utility code between forwarder.py and forwarder_router.py
+- Implicit message contract (no formal schema)
+- Two config modes (legacy targets + v2 routes) increase cognitive load
+
+**Migration risk:** None — this is the current state.
+
+**Compatibility:** Works for real commands, simulated commands (if consumed),
+and simulated measurements. The forwarder's role for simulated commands is
+currently undefined (not consumed in AEM deployment).
+
+### Option B — Make the actuator/manager produce the final external payload
+
+**Description:** The manager/actuator would produce the AEM-ready payload
+(e.g., `{"power": true, "time": "..."}`) and include the target endpoint URL
+in the RabbitMQ message. The forwarder would become a generic HTTP dispatcher
+that reads the URL and body from the message and POSTs it.
+
+**Advantages:**
+- Forwarder becomes truly transport-only (no command interpretation)
+- Message contract is the external API contract (well-defined)
+- No duplication of body-building logic
+
+**Disadvantages:**
+- Manager/actuator must know external API formats (currently they don't)
+- Asset-endpoint mapping must move to manager config (mixing concerns)
+- If the external API changes, manager/actuator code must change
+- Different external systems (e.g., AEM vs MQTT) would require different
+  payload formats in the producer
+- Breaks the clean boundary between domain logic and integration logic
+- Per-asset endpoint resolution (e.g., ECM96.2 -> /ECM/ECM96/hp) would
+  need to be embedded in the manager's configuration
+- Multiple external targets per asset becomes harder to manage
+
+**Migration risk:** HIGH — requires rearchitecting the manager's publishing
+layer and moving API-specific knowledge from forwarder config to manager config.
+
+**Compatibility:** Poor for multi-protocol scenarios. If a second external
+system (e.g., MQTT, Modbus) is added, the producer would need to know all
+target protocols. Does not fit simulated measurements (which come from external
+sources, not the manager).
+
+### Option C — Separate generic forwarding from protocol adapters
+
+**Description:** Introduce a generic RabbitMQ consumer/router layer that reads
+messages and dispatches them to pluggable protocol adapters. Each adapter
+(e.g., `AemHttpAdapter`, `MqttAdapter`) implements the translation for one
+external system.
+
+```
+RabbitMQ -> GenericRouter -> AemHttpAdapter -> AEM REST API
+                          -> MqttAdapter -> MQTT broker (future)
+                          -> SimPassthroughAdapter -> Test API
+```
+
+**Advantages:**
+- Clean adapter pattern with explicit interfaces
+- Easy to add new external systems
+- Adapter logic is isolated and testable
+- Generic router is truly protocol-agnostic
+- Reduces code in forwarder.py main module
+
+**Disadvantages:**
+- More components to maintain
+- The V2 routing config already partially implements this pattern
+  (routes + endpoints + apis are essentially adapter configuration)
+- Over-engineering if only one external system (AEM) is needed
+- Migration effort for refactoring existing code
+
+**Migration risk:** MEDIUM — the v2 routing config already provides a
+declarative adapter-like structure. The main work would be extracting the
+body-building functions into dedicated adapter classes and eliminating the
+duplicated code between forwarder.py and forwarder_router.py.
+
+**Compatibility:** Good for all message types. The `sim_measure_passthrough`
+endpoint in v2 config is already a minimal passthrough adapter. Each adapter
+can independently handle its protocol translation.
+
+
+## 8. RECOMMENDED NEXT STEP
+
+### Recommendation: Define and document the RabbitMQ message contract, then consolidate duplicated adapter code.
+
+**Specific actions (in order):**
+
+1. **Define a formal message schema** for the three message types exchanged
+   over RabbitMQ:
+   - `command` (curtail, restore, preactivate) — document all fields that
+     the forwarder reads: `message_type`, `asset_id`, `asset_type`,
+     `command_type`, `payload.discrete_state`, `payload.target_state`,
+     `payload.slot_start`, `payload.slot_end`, `payload.schedule`,
+     `payload.power_kw`, `payload.target_power_kw`, `payload.dry_run`,
+     `payload.community`, `payload.site_id`, `payload.modulation_type`
+   - `batch_start` — document `slot_info` fields
+   - `measurement` / `measure` — document the passthrough contract
+
+2. **Add contract tests** that validate:
+   - The command payload produced by `flexi_manager.py` and
+     `flexi_actuator.py` conforms to the documented schema
+   - The forwarder's body builders can handle the documented schema
+   - This catches breaking changes at both ends
+
+3. **Consolidate `_build_ev_power_timeseries_body`** — extract it to a
+   shared module imported by both `forwarder.py` and `forwarder_router.py`,
+   or remove the legacy implementation from `forwarder.py` if the legacy
+   config mode is deprecated.
+
+4. **Consolidate datetime and type-coercion utilities** — extract shared
+   functions to a common module (e.g., `scripts/forwarder_utils.py`).
+
+5. **Consider renaming `forwarder.py`** to `actuation_adapter.py` or
+   `aem_adapter.py` to better reflect its actual role as a protocol adapter
+   rather than a generic forwarder.
+
+Do NOT implement these changes as part of this investigation.
+
+
+## 9. FILES INSPECTED
+
+### Main scripts:
+- `scripts/flexi_manager.py` (5419 lines) — read in multiple chunks
+- `scripts/flexi_actuator.py` (1282 lines) — read in full
+- `scripts/forwarder.py` (2464 lines) — read in full
+- `scripts/forwarder_router.py` (1422 lines) — read key sections
+
+### Configuration files:
+- `conf/test_fm01_aem.json` — main FM configuration with asset_mapping
+- `conf/forwarder_targets.json` — legacy forwarder target config
+- `conf/forwarder_targets_aem.json` — AEM-specific legacy target config
+- `conf/forwarder_routes.json` — V2 routing configuration
+
+### Docker files:
+- `docker/forwarder/docker-compose.yml` — forwarder service definition
+- `docker/forwarder/docker-compose-aem.yml` — AEM-specific forwarder deployment
+- `docker/rabbitmq/docker-compose.yml` — RabbitMQ service definition
+- `docker/aem-server-simulator/docker-compose.yml` — AEM simulator service
+- `docker/aem-server-simulator/server.py` — AEM simulator implementation
+
+### Test files:
+- `unittest/test_forwarder.py` — forwarder unit tests (template rendering,
+  type casting, target matching, dry-run semantics)
+- `tests/test_forwarder_e2e_dryrun.py` — V2 end-to-end dry-run validation
+- `tests/test_forwarder_rabbitmq_sources.py` — RabbitMQ source resolution tests
+- `tests/test_forwarder_routes_config.py` — V2 routing config validation tests
+- `tests/test_forwarder_v2_integration.py` — V2 integration tests
+- `tests/test_flexi_actuator_rabbitmq_overrides.py` — actuator destination
+  override tests
+- `tests/test_flexi_manager_rabbitmq_routing.py` — manager RabbitMQ routing
+  tests
+- `unittest/test_flexi_manager_commands.py` — manager command preparation tests
+
+### Other files examined:
+- `scripts/sim01.py` — market simulation (does NOT use RabbitMQ; unrelated)
+
+
+## 10. COMMANDS EXECUTED
+
+No shell commands were executed during this investigation.
+
+The analysis was performed entirely through static code inspection using
+file reading and pattern searching tools. No tests were run, no external
+services were contacted, and no repository state was modified.
+
+All conclusions are based on source code analysis. Runtime behavior that
+depends on the specific conns.json content (API URLs, credentials) or
+live RabbitMQ state could not be verified statically.
+
+================================================================================
+END OF INVESTIGATION REPORT
+================================================================================

@@ -384,7 +384,7 @@ class TestEndpointAndApiConfig:
     def test_sim_measure_endpoint_is_passthrough(self, validated):
         ep = validated["endpoints"]["sim_measure_passthrough"]
         assert ep.method == "POST"
-        assert ep.path_template == ""
+        assert ep.path_template == "/ECM/ECM00/virtual_assets"
         assert ep.body_mode is None
         assert ep.body_template is None
 

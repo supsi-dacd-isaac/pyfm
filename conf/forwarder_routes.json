@@ -52,7 +52,7 @@
     },
     "aem_test_api": {
       "reference_api": "aemAPITest",
-      "base_url_key": "sensorsUrl",
+      "base_url_key": "controlUrl",
       "timeout": 5.0,
       "retries": 3,
       "verify_ssl": false
@@ -100,8 +100,8 @@
     },
     "sim_measure_passthrough": {
       "method": "POST",
-      "path_template": "",
-      "comment": "Passthrough: POSTs the entire RabbitMQ message JSON to the sensorsUrl"
+      "path_template": "/ECM/ECM00/virtual_assets",
+      "comment": "Passthrough: POSTs the entire RabbitMQ message JSON to controlUrl/ECM/ECM00/virtual_assets"
     },
     "default_aem_command": {
       "method": "POST",
