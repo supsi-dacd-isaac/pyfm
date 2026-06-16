@@ -2278,6 +2278,16 @@ Examples:
                 )
                 return True
 
+            logger.info(
+                "V2 dispatch: route='%s' url='%s' method='%s' "
+                "dry_run=%s body_payload=%s",
+                resolved_req.route_name,
+                resolved_req.url,
+                resolved_req.method,
+                resolved_req.effective_dry_run,
+                json.dumps(resolved_req.body, default=str),
+            )
+
             dispatch_http_request(
                 resolved_req,
                 message,
