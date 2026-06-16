@@ -143,9 +143,15 @@ class AEMRequestHandler(BaseHTTPRequestHandler):
         if query_params:
             logger.info("Query Params: %s", dict(query_params))
 
-        # Log content length if body present
+        # Log body content
         if body:
             logger.info("Body Size:   %d bytes", len(body))
+            try:
+                body_json = json.loads(body.decode("utf-8"))
+                body_str = json.dumps(body_json, indent=2, ensure_ascii=False)
+                logger.info("Body:\n%s", body_str)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                logger.info("Body (raw):  %s", body.decode("utf-8", errors="replace")[:2000])
 
         logger.info(separator)
 

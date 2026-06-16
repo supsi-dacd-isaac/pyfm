@@ -2006,12 +2006,12 @@ Examples:
                 ref_cfg = conns_config.get(api_cfg.reference_api, {})
                 if ref_cfg:
                     if not api_cfg.base_url:
-                        ctrl = (
-                            ref_cfg.get("controlUrl")
-                            or ref_cfg.get("controlURL")
-                        )
+                        url_key = api_cfg.base_url_key or "controlUrl"
+                        url_val = ref_cfg.get(url_key)
+                        if url_val is None and url_key == "controlUrl":
+                            url_val = ref_cfg.get("controlURL")
                         api_cfg.base_url = (
-                            _normalize_control_url(ctrl, ref_cfg.get("port"))
+                            _normalize_control_url(url_val, ref_cfg.get("port"))
                             or ""
                         )
                     if not api_cfg.user:

@@ -127,6 +127,7 @@ class ApiConfig:
     name: str
     base_url: str = ""
     reference_api: Optional[str] = None
+    base_url_key: Optional[str] = None
     user: Optional[str] = None
     password: Optional[str] = None
     timeout: float = 10.0
@@ -139,6 +140,7 @@ class ApiConfig:
             name=name,
             base_url=data.get("base_url", ""),
             reference_api=data.get("reference_api"),
+            base_url_key=data.get("base_url_key"),
             user=data.get("user"),
             password=data.get("password"),
             timeout=float(data.get("timeout", 10.0)),
@@ -316,7 +318,7 @@ _KNOWN_PROFILE_KEYS = frozenset({
 })
 
 _KNOWN_API_KEYS = frozenset({
-    "base_url", "reference_api", "user", "password",
+    "base_url", "reference_api", "base_url_key", "user", "password",
     "timeout", "retries", "verify_ssl", "comment",
 })
 
