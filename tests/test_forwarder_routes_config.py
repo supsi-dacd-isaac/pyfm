@@ -220,8 +220,8 @@ class TestRouteResolution:
         result = router.resolve(msg, "simulatedAssetCommands")
         assert result.status == "no_match"
 
-    def test_simulated_measure_no_match(self, router):
-        """Measurements from simulatedAssetMeasures have no route — ack'd per policy."""
+    def test_simulated_measure_matches(self, router):
+        """Measurements from simulatedAssetMeasures route to sim_measure_forward."""
         msg = {
             "message_type": "measurement",
             "asset_type": "heat_pump",
@@ -230,7 +230,10 @@ class TestRouteResolution:
             "payload": {"power_kw": 2.5},
         }
         result = router.resolve(msg, "simulatedAssetMeasures")
-        assert result.status == "no_match"
+        assert result.status == "matched"
+        assert result.route.name == "sim_measure_forward"
+        assert result.route.api == "aem_test_api"
+        assert result.route.endpoint == "sim_measure_passthrough"
 
 
 # =========================================================================
@@ -257,10 +260,11 @@ class TestSourceDerivation:
                 sections.add(sec)
         assert sections == {"realAssetCommands", "simulatedAssetMeasures"}
 
-    def test_no_route_references_simulated_measures(self, router):
-        """simulated_measures is a consume-only source; no routes use it."""
-        for route in router.routes:
-            assert route.source != "simulated_measures"
+    def test_sim_measure_route_exists(self, router):
+        """simulated_measures has exactly one route: sim_measure_forward."""
+        sim_routes = [r for r in router.routes if r.source == "simulated_measures"]
+        assert len(sim_routes) == 1
+        assert sim_routes[0].name == "sim_measure_forward"
 
     def test_no_route_references_simulatedAssetCommands(self, router):
         for route in router.routes:
@@ -346,13 +350,38 @@ class TestEndpointAndApiConfig:
         assert ep.body_template is not None
         assert "$map" in ep.body_template.get("power", {})
 
-    def test_all_routes_reference_same_api(self, router):
+    def test_real_command_routes_reference_aem_api(self, router):
         for route in router.routes:
-            assert route.api == "aem_api"
+            if route.source == "real_commands":
+                assert route.api == "aem_api"
+
+    def test_sim_measure_route_references_aem_test_api(self, router):
+        sim = [r for r in router.routes if r.name == "sim_measure_forward"]
+        assert len(sim) == 1
+        assert sim[0].api == "aem_test_api"
+
+    def test_aem_test_api_has_reference_api(self, validated):
+        api = validated["apis"]["aem_test_api"]
+        assert api.reference_api == "aemAPITest"
+
+    def test_aem_test_api_timeout(self, validated):
+        api = validated["apis"]["aem_test_api"]
+        assert api.timeout == 5.0
+
+    def test_aem_test_api_verify_ssl_false(self, validated):
+        api = validated["apis"]["aem_test_api"]
+        assert api.verify_ssl is False
+
+    def test_sim_measure_endpoint_is_passthrough(self, validated):
+        ep = validated["endpoints"]["sim_measure_passthrough"]
+        assert ep.method == "POST"
+        assert ep.path_template == ""
+        assert ep.body_mode is None
+        assert ep.body_template is None
 
     def test_asset_specific_routes_are_high_priority(self, router):
         for route in router.routes:
-            if route.name != "fallback_aem_command":
+            if route.name not in ("fallback_aem_command", "sim_measure_forward"):
                 assert route.priority == 100
 
     def test_fallback_route_is_low_priority(self, router):

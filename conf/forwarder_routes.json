@@ -14,7 +14,7 @@
     },
     "simulated_measures": {
       "section": "simulatedAssetMeasures",
-      "comment": "Measurements from simulated assets; consumed and ack'd, not forwarded via HTTP"
+      "comment": "Measurements from simulated assets, forwarded to aemAPITest"
     }
   },
 
@@ -37,12 +37,21 @@
     },
     "cmd_any_command": {
       "message_type": "command"
+    },
+    "meas_any": {
+      "message_type": "measurement"
     }
   },
 
   "apis": {
     "aem_api": {
       "reference_api": "aemAPI",
+      "timeout": 5.0,
+      "retries": 3,
+      "verify_ssl": false
+    },
+    "aem_test_api": {
+      "reference_api": "aemAPITest",
       "timeout": 5.0,
       "retries": 3,
       "verify_ssl": false
@@ -69,6 +78,11 @@
       "method": "POST",
       "path_template": "/ECM/ECM63/charge_point_ev_2",
       "body_mode": "ev_power_timeseries"
+    },
+    "sim_measure_passthrough": {
+      "method": "POST",
+      "path_template": "",
+      "comment": "Passthrough: sends the entire RabbitMQ message JSON as the POST body"
     },
     "default_aem_command": {
       "method": "POST",
@@ -131,6 +145,16 @@
       "endpoint": "default_aem_command",
       "priority": 0,
       "enabled": true
+    },
+    {
+      "name": "sim_measure_forward",
+      "source": "simulated_measures",
+      "message_profile": "meas_any",
+      "api": "aem_test_api",
+      "endpoint": "sim_measure_passthrough",
+      "priority": 0,
+      "enabled": true,
+      "comment": "Forward simulated asset measurements to aemAPITest"
     }
   ]
 }

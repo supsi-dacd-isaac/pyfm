@@ -156,6 +156,19 @@ class TestReferenceApiResolution:
         aem = router_with_resolved_api.apis["aem_api"]
         assert aem.password, "password should be resolved from conns.json"
 
+    def test_aem_test_api_base_url_resolved(self, router_with_resolved_api):
+        api = router_with_resolved_api.apis["aem_test_api"]
+        assert api.base_url, "base_url should be resolved from conns.json"
+        assert "://" in api.base_url
+
+    def test_aem_test_api_user_resolved(self, router_with_resolved_api):
+        api = router_with_resolved_api.apis["aem_test_api"]
+        assert api.user, "user should be resolved from conns.json"
+
+    def test_aem_test_api_password_resolved(self, router_with_resolved_api):
+        api = router_with_resolved_api.apis["aem_test_api"]
+        assert api.password, "password should be resolved from conns.json"
+
 
 # =========================================================================
 # 3. Active source derivation
@@ -188,8 +201,8 @@ class TestSourceDerivation:
                 sections.add(sec)
         assert sections == {"realAssetCommands", "simulatedAssetMeasures"}
 
-    def test_measurement_on_simulated_measures_no_match(self, router_with_resolved_api):
-        """Measurements arrive but have no forwarding route — handled by on_no_match policy."""
+    def test_measurement_on_simulated_measures_matches(self, router_with_resolved_api):
+        """Measurements from simulatedAssetMeasures route to sim_measure_forward."""
         msg = {
             "message_type": "measurement",
             "asset_type": "heat_pump",
@@ -198,7 +211,9 @@ class TestSourceDerivation:
             "payload": {"power_kw": 2.5},
         }
         result = router_with_resolved_api.resolve(msg, "simulatedAssetMeasures")
-        assert result.status == "no_match"
+        assert result.status == "matched"
+        assert result.route.name == "sim_measure_forward"
+        assert result.route.api == "aem_test_api"
 
 
 # =========================================================================
@@ -439,6 +454,146 @@ class TestFullPipelinePerMessage:
 # =========================================================================
 # 5. No-match and wrong-source scenarios
 # =========================================================================
+
+# =========================================================================
+# 4b. Simulated measurement — full pipeline dry-run
+# =========================================================================
+
+SIM_MEASURE_MESSAGES = [
+    {
+        "id": "sim_measure_hp",
+        "message": {
+            "message_type": "measurement",
+            "asset_type": "heat_pump",
+            "asset_id": "ECM68.3",
+            "measurement_type": "power",
+            "payload": {"power_kw": 2.5, "timestamp": "2026-06-15T14:00:00Z"},
+        },
+        "source_section": "simulatedAssetMeasures",
+        "expected_route": "sim_measure_forward",
+        "expected_endpoint": "sim_measure_passthrough",
+        "expected_api": "aem_test_api",
+    },
+    {
+        "id": "sim_measure_ev",
+        "message": {
+            "message_type": "measurement",
+            "asset_type": "ev_charger",
+            "asset_id": "ECM63.1",
+            "measurement_type": "energy",
+            "payload": {"energy_kwh": 12.3, "timestamp": "2026-06-15T14:15:00Z"},
+        },
+        "source_section": "simulatedAssetMeasures",
+        "expected_route": "sim_measure_forward",
+        "expected_endpoint": "sim_measure_passthrough",
+        "expected_api": "aem_test_api",
+    },
+]
+
+
+class TestSimMeasurePipeline:
+
+    @pytest.mark.parametrize(
+        "case",
+        SIM_MEASURE_MESSAGES,
+        ids=[m["id"] for m in SIM_MEASURE_MESSAGES],
+    )
+    def test_route_resolution(self, router_with_resolved_api, case):
+        result = router_with_resolved_api.resolve(
+            case["message"], case["source_section"]
+        )
+        assert result.status == "matched"
+        assert result.route.name == case["expected_route"]
+        assert result.route.endpoint == case["expected_endpoint"]
+        assert result.route.api == case["expected_api"]
+
+    @pytest.mark.parametrize(
+        "case",
+        SIM_MEASURE_MESSAGES,
+        ids=[m["id"] for m in SIM_MEASURE_MESSAGES],
+    )
+    def test_request_building_dry_run(self, router_with_resolved_api, case):
+        resolution = router_with_resolved_api.resolve(
+            case["message"], case["source_section"]
+        )
+        resolved = build_resolved_request(
+            case["message"],
+            resolution.route,
+            router_with_resolved_api,
+            forwarder_dry_run=True,
+        )
+        assert isinstance(resolved, ResolvedRequest)
+        assert resolved.effective_dry_run is True
+        assert resolved.method == "POST"
+        assert resolved.url, "URL should not be empty"
+        assert "://" in resolved.url
+        assert resolved.route_name == case["expected_route"]
+        assert resolved.api_name == case["expected_api"]
+
+    @pytest.mark.parametrize(
+        "case",
+        SIM_MEASURE_MESSAGES,
+        ids=[m["id"] for m in SIM_MEASURE_MESSAGES],
+    )
+    def test_passthrough_body(self, router_with_resolved_api, case):
+        """Passthrough endpoint sends the entire message as the body."""
+        resolution = router_with_resolved_api.resolve(
+            case["message"], case["source_section"]
+        )
+        resolved = build_resolved_request(
+            case["message"],
+            resolution.route,
+            router_with_resolved_api,
+            forwarder_dry_run=True,
+        )
+        assert resolved.body == case["message"]
+
+    @pytest.mark.parametrize(
+        "case",
+        SIM_MEASURE_MESSAGES,
+        ids=[m["id"] for m in SIM_MEASURE_MESSAGES],
+    )
+    def test_dispatch_dry_run_no_http(self, router_with_resolved_api, case, caplog):
+        resolution = router_with_resolved_api.resolve(
+            case["message"], case["source_section"]
+        )
+        resolved = build_resolved_request(
+            case["message"],
+            resolution.route,
+            router_with_resolved_api,
+            forwarder_dry_run=True,
+        )
+        mock_session = MagicMock()
+        with caplog.at_level(logging.INFO, logger="forwarder"):
+            result = dispatch_http_request(
+                resolved,
+                case["message"],
+                policy="ack_error_no_requeue",
+                session=mock_session,
+            )
+        assert result.success is True
+        assert result.dry_run is True
+        assert result.attempts == 0
+        mock_session.request.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "case",
+        SIM_MEASURE_MESSAGES,
+        ids=[m["id"] for m in SIM_MEASURE_MESSAGES],
+    )
+    def test_url_uses_aem_test_base(self, router_with_resolved_api, case):
+        resolution = router_with_resolved_api.resolve(
+            case["message"], case["source_section"]
+        )
+        resolved = build_resolved_request(
+            case["message"],
+            resolution.route,
+            router_with_resolved_api,
+            forwarder_dry_run=True,
+        )
+        api = router_with_resolved_api.apis["aem_test_api"]
+        assert resolved.url.startswith(api.base_url.rstrip("/"))
+
 
 class TestNoMatchScenarios:
 
