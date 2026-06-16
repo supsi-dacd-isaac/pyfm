@@ -277,6 +277,7 @@ class AEMRequestHandler(BaseHTTPRequestHandler):
                 "command_received": body_data,
                 "timestamp": datetime.now().isoformat()
             }
+            self._send_response(201, response)
         else:
             response = {
                 "status": "ok",
@@ -284,8 +285,7 @@ class AEMRequestHandler(BaseHTTPRequestHandler):
                 "body_received": body_data,
                 "timestamp": datetime.now().isoformat()
             }
-
-        self._send_response(200, response)
+            self._send_response(201, response)
 
     def do_PUT(self):
         """Handle PUT requests."""
