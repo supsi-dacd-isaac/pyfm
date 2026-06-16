@@ -204,7 +204,7 @@ class TestSourceDerivation:
     def test_measurement_on_simulated_measures_matches(self, router_with_resolved_api):
         """Measurements from simulatedAssetMeasures route to sim_measure_forward."""
         msg = {
-            "message_type": "measurement",
+            "message_type": "measure",
             "asset_type": "heat_pump",
             "asset_id": "ECM68.3",
             "measurement_type": "power",
@@ -463,7 +463,7 @@ SIM_MEASURE_MESSAGES = [
     {
         "id": "sim_measure_hp",
         "message": {
-            "message_type": "measurement",
+            "message_type": "measure",
             "asset_type": "heat_pump",
             "asset_id": "ECM68.3",
             "measurement_type": "power",
@@ -477,7 +477,7 @@ SIM_MEASURE_MESSAGES = [
     {
         "id": "sim_measure_ev",
         "message": {
-            "message_type": "measurement",
+            "message_type": "measure",
             "asset_type": "ev_charger",
             "asset_id": "ECM63.1",
             "measurement_type": "energy",

@@ -39,7 +39,7 @@
       "message_type": "command"
     },
     "meas_any": {
-      "message_type": "measurement"
+      "message_type": "measure"
     }
   },
 

@@ -223,7 +223,7 @@ class TestRouteResolution:
     def test_simulated_measure_matches(self, router):
         """Measurements from simulatedAssetMeasures route to sim_measure_forward."""
         msg = {
-            "message_type": "measurement",
+            "message_type": "measure",
             "asset_type": "heat_pump",
             "asset_id": "ECM68.3",
             "measurement_type": "power",

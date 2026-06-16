@@ -52,6 +52,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Callable, Any, Iterable, Union
+import copy
 from urllib.parse import urlparse, urlunparse
 
 # HTTP requests for forwarding to targets
@@ -92,22 +93,26 @@ except ImportError:
 try:
     from scripts.forwarder_router import (
         RoutingConfigError,
+        ResolvedRequest,
         detect_config_mode,
         validate_routing_config,
         MessageRouter,
         build_resolved_request,
         dispatch_http_request,
+        resolve_effective_dry_run,
     )
     V2_ROUTING_AVAILABLE = True
 except ImportError:
     try:
         from forwarder_router import (
             RoutingConfigError,
+            ResolvedRequest,
             detect_config_mode,
             validate_routing_config,
             MessageRouter,
             build_resolved_request,
             dispatch_http_request,
+            resolve_effective_dry_run,
         )
         V2_ROUTING_AVAILABLE = True
     except ImportError:
@@ -1616,28 +1621,13 @@ class RabbitMQConsumer:
             )
 
             decoded_payload = json.loads(body.decode("utf-8"))
-            message = _validate_payload(decoded_payload)
-            message_type = message.get("message_type", "unknown")
-            asset_type = message.get("asset_type", "")
-            if message_type == "command":
-                _validate_dict_field(message, "payload", message_type)
-            elif message_type == "batch_start":
-                _validate_dict_field(message, "slot_info", message_type)
-            
-            # Apply asset type filter
-            if self.asset_types_filter and asset_type:
-                if asset_type not in self.asset_types_filter:
-                    self.logger.debug(
-                        "Skipping message for asset type '%s' (not in filter)",
-                        asset_type
-                    )
-                    ch.basic_ack(delivery_tag=delivery_tag)
-                    return
 
-            # V2 routing callback path — always ack, never requeue
+            # V2 routing callback path — always ack, never requeue.
+            # Accepts both dict and list payloads; the callback
+            # handles each type appropriately.
             if self.message_callback is not None:
                 try:
-                    self.message_callback(message, source)
+                    self.message_callback(decoded_payload, source)
                 except Exception:
                     self.logger.exception(
                         "V2 message callback error: queue=%s source=%s "
@@ -1649,6 +1639,24 @@ class RabbitMQConsumer:
                 ch.basic_ack(delivery_tag=delivery_tag)
                 self._messages_processed += 1
                 return
+
+            message = _validate_payload(decoded_payload)
+            message_type = message.get("message_type", "unknown")
+            asset_type = message.get("asset_type", "")
+            if message_type == "command":
+                _validate_dict_field(message, "payload", message_type)
+            elif message_type == "batch_start":
+                _validate_dict_field(message, "slot_info", message_type)
+
+            # Apply asset type filter
+            if self.asset_types_filter and asset_type:
+                if asset_type not in self.asset_types_filter:
+                    self.logger.debug(
+                        "Skipping message for asset type '%s' (not in filter)",
+                        asset_type
+                    )
+                    ch.basic_ack(delivery_tag=delivery_tag)
+                    return
 
             # Dispatch to appropriate handler (legacy path)
             handled = False
@@ -2127,7 +2135,97 @@ Examples:
         _v2_router = v2_router
         _v2_dry_run = force_dry_run
 
-        def _v2_message_callback(message: dict, source: RabbitMQSource) -> bool:
+        def _v2_forward_raw(payload, route, source: RabbitMQSource) -> bool:
+            """Forward a raw payload (list or dict) without profile matching."""
+            api_cfg = _v2_router.apis.get(route.api)
+            ep_cfg = _v2_router.endpoints.get(route.endpoint)
+            if not api_cfg or not ep_cfg:
+                logger.error(
+                    "V2 raw forward: route '%s' references missing api/endpoint",
+                    route.name,
+                )
+                return True
+
+            effective_dry_run = _v2_dry_run or resolve_effective_dry_run(
+                forwarder_dry_run=_v2_dry_run,
+                route_dry_run=route.dry_run,
+                message_dry_run=None,
+                missing_message_dry_run_default=(
+                    _v2_router.defaults.missing_message_dry_run_default
+                ),
+            )
+
+            base = api_cfg.base_url.rstrip("/")
+            url = f"{base}/" if not ep_cfg.path_template else f"{base}/{ep_cfg.path_template.lstrip('/')}"
+
+            resolved_req = ResolvedRequest(
+                route_name=route.name,
+                api_name=route.api,
+                endpoint_name=route.endpoint,
+                method=ep_cfg.method,
+                url=url,
+                headers=ep_cfg.headers,
+                body=copy.deepcopy(payload),
+                auth=(api_cfg.user, api_cfg.password) if api_cfg.user else None,
+                timeout_seconds=api_cfg.timeout or 5.0,
+                verify_ssl=api_cfg.verify_ssl if api_cfg.verify_ssl is not None else True,
+                request_retries=api_cfg.retries or 3,
+                success_status_codes=ep_cfg.success_status_codes or [200, 201, 202, 204],
+                effective_dry_run=effective_dry_run,
+            )
+
+            n_items = len(payload) if isinstance(payload, list) else 1
+            logger.info(
+                "V2 raw forward: route='%s' source='%s' queue='%s' "
+                "api='%s' endpoint='%s' items=%d dry_run=%s",
+                route.name, source.section, source.queue,
+                route.api, route.endpoint, n_items, effective_dry_run,
+            )
+
+            dispatch_http_request(
+                resolved_req,
+                payload,
+                policy=_v2_router.defaults.on_http_failure,
+                session=v2_http_session,
+            )
+            return True
+
+        def _v2_message_callback(message, source: RabbitMQSource) -> bool:
+            # List payload: find route by source and forward raw JSON
+            if isinstance(message, list):
+                source_name = None
+                for sname, sdef in _v2_router.sources.items():
+                    if sdef.get("section") == source.section:
+                        source_name = sname
+                        break
+                if source_name is None:
+                    logger.warning(
+                        "V2 list payload from unknown source section '%s'; acking",
+                        source.section,
+                    )
+                    return True
+
+                matching_routes = [
+                    r for r in _v2_router.routes
+                    if r.source == source_name and r.enabled
+                ]
+                if not matching_routes:
+                    logger.warning(
+                        "V2 list payload from '%s' has no enabled routes; acking",
+                        source.section,
+                    )
+                    return True
+
+                return _v2_forward_raw(message, matching_routes[0], source)
+
+            # Dict payload: standard profile-based routing
+            if not isinstance(message, dict):
+                logger.warning(
+                    "V2 unexpected payload type %s from '%s'; acking",
+                    type(message).__name__, source.section,
+                )
+                return True
+
             resolution = _v2_router.resolve(message, source.section)
 
             if resolution.status == "no_match":
