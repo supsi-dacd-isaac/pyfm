@@ -1405,6 +1405,11 @@ def dispatch_http_request(
         message_type,
         policy,
     )
+    log.error(
+        "Route '%s' HTTP dispatch failed payload: %s",
+        request.route_name,
+        _format_body_preview(request.body, limit=2000),
+    )
 
     return HttpDispatchResult(
         success=False,
