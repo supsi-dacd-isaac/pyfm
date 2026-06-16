@@ -23,7 +23,7 @@ import re
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 
 logger = logging.getLogger("forwarder")
@@ -1215,7 +1215,7 @@ class HttpDispatchResult:
 
 def dispatch_http_request(
     request: ResolvedRequest,
-    message: dict,
+    message: Union[dict, list],
     policy: str = DEFAULT_HTTP_FAILURE_POLICY,
     session: Any = None,
     _logger: Optional[logging.Logger] = None,
@@ -1227,8 +1227,9 @@ def dispatch_http_request(
     request:
         The fully resolved request produced by :func:`build_resolved_request`.
     message:
-        The original RabbitMQ message dict — used only for logging context
-        (``asset_id``, ``asset_type``, ``message_type``).  Never mutated.
+        The original RabbitMQ message (dict or list of dicts) — used only for
+        logging context (``asset_id``, ``asset_type``, ``message_type``).
+        Never mutated.
     policy:
         The failure policy to record in the result (default:
         ``ack_error_no_requeue``).  This step does not perform RabbitMQ
@@ -1378,9 +1379,14 @@ def dispatch_http_request(
         break
 
     # -- all attempts exhausted or non-retryable error -----------------------
-    asset_id = message.get("asset_id", "unknown")
-    asset_type = message.get("asset_type", "unknown")
-    message_type = message.get("message_type", "unknown")
+    if isinstance(message, list):
+        asset_id = ", ".join(m.get("asset_id", "unknown") for m in message if isinstance(m, dict)) or "unknown"
+        asset_type = next((m.get("asset_type", "unknown") for m in message if isinstance(m, dict)), "unknown")
+        message_type = next((m.get("message_type", "unknown") for m in message if isinstance(m, dict)), "unknown")
+    else:
+        asset_id = message.get("asset_id", "unknown")
+        asset_type = message.get("asset_type", "unknown")
+        message_type = message.get("message_type", "unknown")
 
     log.error(
         "Route '%s' HTTP dispatch failed after %d attempt(s): "
