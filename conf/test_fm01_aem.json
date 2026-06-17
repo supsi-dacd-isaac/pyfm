@@ -133,6 +133,7 @@
               "fillType": "Normal"
             }
           },
+          "assets": ["ECM62.1", "ECM62.2", "ECM62.3", "ECM68.3", "ECM162.1"],
           "pricing": {
             "source": "constant",
             "constant": 5.0,
