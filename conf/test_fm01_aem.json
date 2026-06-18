@@ -163,8 +163,8 @@
       "baseline_persistence_go_back_minutes": 120,
       "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "discrete",
-      "min_power_kw": 6.24,
-      "discrete_states_kw": [6.24, 6.93, 7.62, 8.31, 9.01, 9.70, 10.39, 11.0]
+      "min_power_kw": 6.93,
+      "discrete_states_kw": [6.93, 7.62, 8.31, 9.01, 9.70, 10.39, 11.0]
     },
     "ECM63.2": {
       "device_name_tag": "charge_point_ev_2",
@@ -180,8 +180,8 @@
       "baseline_persistence_go_back_minutes": 120,
       "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "discrete",
-      "min_power_kw": 6.24,
-      "discrete_states_kw": [6.24, 6.93, 7.62, 8.31, 9.01, 9.70, 10.39, 11.0]
+      "min_power_kw": 6.93,
+      "discrete_states_kw": [6.93, 7.62, 8.31, 9.01, 9.70, 10.39, 11.0]
     },
     "ECM96.2": {
       "device_name_tag": "shelly_3em_pro_heat_pump_ext_unit",
