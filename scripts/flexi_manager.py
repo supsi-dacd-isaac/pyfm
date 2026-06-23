@@ -1057,6 +1057,7 @@ class AssetController:
         reference_power_kw: Optional[float] = None,
         reference_power_source: Optional[str] = None,
         activation_current_power_kw: Optional[float] = None,
+        strategy_cfg: Optional[dict] = None,
     ) -> Tuple[float, float]:
         """Select a valid discrete OCPP power state for an EV charger.
 
@@ -1076,7 +1077,7 @@ class AssetController:
         else:
             selected_ref = capacity_kw
 
-        valid_states = _get_discrete_ev_states(asset_config)
+        valid_states = _get_discrete_ev_states(asset_config, strategy_cfg)
 
         selection = _select_discrete_ev_target_for_curtailment(
             reference_power_kw=selected_ref,
@@ -1121,6 +1122,7 @@ class AssetController:
         reference_power_kw: Optional[float] = None,
         reference_power_source: Optional[str] = None,
         activation_current_power_kw: Optional[float] = None,
+        strategy_cfg: Optional[Dict] = None,
     ) -> Dict:
         """
         Send curtailment command to an asset.
@@ -1135,6 +1137,7 @@ class AssetController:
         :param force_discrete_off: If True, positive discrete curtailment forces OFF
         :param activation_current_power_kw: Latest measured power at activation time (kW).
             Used as activation reference for recent_profile_baseline continuous assets.
+        :param strategy_cfg: Strategy configuration dict for discrete EV state filtering.
         :return: Result dictionary with status and details
         """
         asset_config = self.asset_mapping.get(asset_id, {})
@@ -1151,7 +1154,7 @@ class AssetController:
         if modulation_type == "discrete":
             is_discrete_ev = (
                 asset_type == "ev_charger"
-                and len(asset_config.get("discrete_states_kw", [])) > 2
+                and len(asset_config.get("discrete_states_kw", [])) >= 2
             )
             if is_discrete_ev:
                 target_power_kw, actual_curtailment_kw = (
@@ -1162,6 +1165,7 @@ class AssetController:
                         reference_power_kw=reference_power_kw,
                         reference_power_source=reference_power_source,
                         activation_current_power_kw=activation_current_power_kw,
+                        strategy_cfg=strategy_cfg,
                     )
                 )
                 state_name = f"LIMIT_{target_power_kw:.2f}kW"
@@ -4592,7 +4596,7 @@ class FlexibilityManager:
             is_discrete_ev = (
                 asset_type == "ev_charger"
                 and mod_type == "discrete"
-                and len(asset_config.get("discrete_states_kw", [])) > 2
+                and len(asset_config.get("discrete_states_kw", [])) >= 2
             )
 
             # Discrete HP assets skip the comfort guard path entirely (ON/OFF).
@@ -4801,6 +4805,7 @@ class FlexibilityManager:
                 reference_power_kw=bid_reference_power_kw,
                 reference_power_source=bid_reference_source,
                 activation_current_power_kw=activation_current_power_kw,
+                strategy_cfg=strategy_obj.config if strategy_obj else None,
             )
             summary["control_results"][asset_id] = result
             if result.get("status") in ["success", "simulated", "queued"]:

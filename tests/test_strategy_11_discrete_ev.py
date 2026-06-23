@@ -109,9 +109,7 @@ def test_ev_discrete_states_config():
         assert asset["modulation_type"] == "discrete"
         states = asset["discrete_states_kw"]
         assert isinstance(states, list)
-        assert len(states) == 8
-        assert 0.0 not in states
-        assert all(s >= 6.0 for s in states), f"State below 6 kW in {asset_id}"
+        assert len(states) >= 2
         assert max(states) == 11.0
 
     s11 = cfg["bidding_strategies"]["strategy_11"]
@@ -120,7 +118,7 @@ def test_ev_discrete_states_config():
     assert "ECM63.2" in s11["assets_filter"]
     assert s11["flexibility_method"] == "recent_profile"
     assert s11["discreteEvSettings"]["selection_policy"] == "smallest_overdelivery"
-    assert s11["discreteEvSettings"]["allow_zero_state"] is False
+    assert s11["discreteEvSettings"]["allow_zero_state"] is True
 
 
 # ===================================================================
@@ -839,3 +837,152 @@ def test_strategy_10_continuous_ev_still_works():
     assert info["modulation_type"] == "continuous"
     assert info["discrete_ev_target_kw"] is None
     assert info["available_flexibility_kw"] == pytest.approx(3.5)
+
+
+# ===================================================================
+# 14. Binary EV [0.0, 11.0] classification tests
+# ===================================================================
+
+def _binary_ev_asset():
+    """Binary EV charger config with only 2 states: OFF and full power."""
+    return {
+        "type": "ev_charger",
+        "modulation_type": "discrete",
+        "nominal_power_w": 11000,
+        "capacity_kw": 11.0,
+        "min_power_kw": 0.0,
+        "discrete_states_kw": [0.0, 11.0],
+        "description": "EV Charger Binary",
+        "device_name_tag": "ev_binary",
+        "field": "power",
+        "pod": "ECM63",
+    }
+
+
+def test_binary_ev_is_classified_as_discrete_ev_not_hp():
+    """Binary EV [0.0, 11.0] must use EV-specific discrete path, not HP ON/OFF."""
+    controller = _make_controller({"ECM63.1": _binary_ev_asset()})
+
+    result = controller.curtail_asset(
+        "ECM63.1",
+        curtailment_kw=5.0,
+        duration_minutes=15,
+        dry_run=True,
+        reference_power_kw=11.0,
+        reference_power_source="recent_profile_baseline",
+    )
+
+    # EV-specific discrete path sets state_name = "LIMIT_X.XXkW"
+    # HP ON/OFF path sets discrete_state = "OFF" or "ON"
+    # If the asset is correctly classified as EV, state_name will contain "LIMIT"
+    assert "LIMIT" in result.get("discrete_state", ""), (
+        f"Binary EV should use EV-specific path (LIMIT_X.XXkW), "
+        f"got discrete_state={result.get('discrete_state')}"
+    )
+
+
+def test_binary_ev_strategy11_selects_zero_target():
+    """Binary EV [0.0, 11.0] with allow_zero_state=true should select 0.0 kW."""
+    asset_cfg = _binary_ev_asset()
+    controller = _make_controller({"ECM63.1": asset_cfg})
+
+    strategy_cfg = {
+        "discreteEvSettings": {
+            "selection_policy": "smallest_overdelivery",
+            "allow_zero_state": True,
+            "min_target_power_kw": 0,
+        }
+    }
+
+    result = controller.curtail_asset(
+        "ECM63.1",
+        curtailment_kw=5.0,
+        duration_minutes=15,
+        dry_run=True,
+        reference_power_kw=11.0,
+        reference_power_source="recent_profile_baseline",
+        strategy_cfg=strategy_cfg,
+    )
+
+    assert result["target_power_kw"] == pytest.approx(0.0), (
+        f"Binary EV with states [0.0, 11.0] and reference 11.0 "
+        f"should select target 0.0, got {result['target_power_kw']}"
+    )
+    assert result.get("actual_curtailment_kw", 0) == pytest.approx(11.0)
+
+
+def test_binary_ev_comfort_guard_applies(tmp_path):
+    """Binary EV [0.0, 11.0] must enter comfort guard, not be treated as HP."""
+    previous_state = {
+        "ECM63.1": {
+            "state": "controlled",
+            "asset_type": "ev_charger",
+            "slot_start": "2026-06-05T12:45:00",
+            "slot_end": "2026-06-05T13:00:00",
+            "consecutive_activation_slots": 4,
+            "control_sequence_start": "2026-06-05T12:00:00",
+            "reference_power_kw": 11.0,
+            "reference_power_source": "recent_profile_baseline",
+            "target_power_kw": 0.0,
+            "strategy_id": "strategy_11",
+        }
+    }
+
+    manager, state_file = _make_s11_manager(
+        tmp_path,
+        previous_state=previous_state,
+        measurement_power_w=0.0,
+        bid_reference_power_kw=11.0,
+        allocated_flexibility_kw=5.0,
+    )
+    # Override asset config to binary
+    manager.controller.asset_mapping["ECM63.1"] = _binary_ev_asset()
+    manager.config["asset_mapping"]["ECM63.1"] = _binary_ev_asset()
+
+    summary = manager.run(
+        slot_override="2026-06-05T13:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.005,
+    )
+
+    result = summary["control_results"]["ECM63.1"]
+    assert result["status"] == "skipped", (
+        f"Binary EV at max consecutive slots should be blocked by comfort guard, "
+        f"got status={result['status']}"
+    )
+
+    saved = _load_state(state_file)
+    entry = saved.get("ECM63.1", {})
+    assert entry.get("state") == "cooldown", (
+        f"Binary EV should enter cooldown state, got state={entry.get('state')}"
+    )
+
+
+def test_heat_pump_binary_still_uses_hp_path():
+    """HP with [0.0, capacity] must NOT use EV-specific discrete path."""
+    hp_config = {
+        "type": "heat_pump",
+        "modulation_type": "discrete",
+        "capacity_kw": 11.0,
+        "discrete_states_kw": [0.0, 11.0],
+        "nominal_power_w": 11000,
+        "description": "HP Binary",
+        "device_name_tag": "hp_binary",
+        "pod": "ECM97",
+    }
+    controller = _make_controller({"ECM97.3": hp_config})
+
+    result = controller.curtail_asset(
+        "ECM97.3",
+        curtailment_kw=6.0,
+        duration_minutes=15,
+        dry_run=True,
+        force_discrete_off=True,
+    )
+
+    # HP ON/OFF path uses discrete_state "OFF" or "ON"
+    assert result.get("discrete_state") in ("OFF", "ON"), (
+        f"HP binary should use HP ON/OFF path, "
+        f"got discrete_state={result.get('discrete_state')}"
+    )
+    assert result["target_power_kw"] == pytest.approx(0.0)
