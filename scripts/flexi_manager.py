@@ -3814,6 +3814,11 @@ class FlexibilityManager:
         remaining accepted quantity without exceeding their stored bid-time plan.
         """
         tolerance = 1e-9
+        # Allow a discrete asset to overshoot the accepted quantity by up to one
+        # market rounding unit (0.001 MW = 1 kW). The bid quantity is floored to
+        # MW precision, so an asset can be ~1 kW above accepted_kw purely due to
+        # rounding; a tiny over-delivery is far cheaper than delivering nothing.
+        overshoot_tolerance = 1.0
         planned_kw = sum(planned_asset_flex_kw.values())
         discrete_assets = []
         continuous_assets = []
@@ -3842,7 +3847,7 @@ class FlexibilityManager:
         discrete_planned_total = sum(kw for _, kw in discrete_assets)
         continuous_planned_total = sum(kw for _, kw in continuous_assets)
 
-        if accepted_kw + tolerance >= planned_kw:
+        if accepted_kw + overshoot_tolerance + tolerance >= planned_kw:
             allocations = dict(planned_asset_flex_kw)
             for asset_id, activation_kw in allocations.items():
                 detail = asset_details[asset_id]
@@ -3872,7 +3877,7 @@ class FlexibilityManager:
                     subset.append(item)
                     subset_total += item[1]
 
-            if subset_total > accepted_kw + tolerance:
+            if subset_total > accepted_kw + overshoot_tolerance + tolerance:
                 continue
 
             if (
@@ -3898,7 +3903,7 @@ class FlexibilityManager:
             if asset_id in selected_discrete_ids:
                 continue
             detail = asset_details[asset_id]
-            if planned_asset_kw > accepted_kw + tolerance:
+            if planned_asset_kw > accepted_kw + overshoot_tolerance + tolerance:
                 detail["reason"] = "not selected because it would exceed accepted_kw"
             else:
                 detail["reason"] = "not selected by best discrete subset"
