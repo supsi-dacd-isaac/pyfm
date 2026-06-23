@@ -1327,6 +1327,7 @@ class RabbitMQSource:
 
 
 _RABBITMQ_SOURCE_FIELDS = ("exchange", "queue", "routingKey")
+SIMULATED_ASSET_MEASURES_SECTION = "simulatedAssetMeasures"
 
 
 class MalformedMessageError(Exception):
@@ -1369,6 +1370,105 @@ def _validate_dict_field(message: dict, field_name: str, message_type: str) -> N
             f"Unsupported {message_type}.{field_name} type: "
             f"{type(value).__name__}; expected dict"
         )
+
+
+def _normalize_simulated_asset_measure_batch(
+    message: dict,
+    source_section: str,
+    logger: Optional[logging.Logger] = None,
+) -> Optional[List[dict]]:
+    """Expand external simulator measurement batches into V2 envelopes.
+
+    Returns None when the message is not the supported source-specific batch
+    shape, otherwise a possibly-empty list of normalized measurement messages.
+    """
+    if source_section != SIMULATED_ASSET_MEASURES_SECTION:
+        return None
+    if not isinstance(message, dict) or "series" not in message:
+        return None
+
+    series_items = message.get("series")
+    if not isinstance(series_items, list):
+        return None
+
+    log = logger or logging.getLogger("forwarder")
+    normalized: List[dict] = []
+
+    for series_index, series_item in enumerate(series_items):
+        if not isinstance(series_item, dict):
+            log.warning(
+                "Skipping simulated measurement series[%d]: expected object, got %s",
+                series_index,
+                type(series_item).__name__,
+            )
+            continue
+
+        device_name = series_item.get("device_name")
+        if not device_name:
+            log.warning(
+                "Skipping simulated measurement series[%d]: missing device_name",
+                series_index,
+            )
+            continue
+
+        values = series_item.get("values")
+        if not isinstance(values, list):
+            log.warning(
+                "Skipping simulated measurement series[%d] for device '%s': "
+                "values must be a list",
+                series_index,
+                device_name,
+            )
+            continue
+
+        for value_index, value_item in enumerate(values):
+            if not isinstance(value_item, dict):
+                log.warning(
+                    "Skipping simulated measurement series[%d].values[%d] for "
+                    "device '%s': expected object, got %s",
+                    series_index,
+                    value_index,
+                    device_name,
+                    type(value_item).__name__,
+                )
+                continue
+
+            timestamp = value_item.get("time")
+            if timestamp is None:
+                log.warning(
+                    "Skipping simulated measurement series[%d].values[%d] for "
+                    "device '%s': missing time",
+                    series_index,
+                    value_index,
+                    device_name,
+                )
+                continue
+            if "active_power" not in value_item:
+                log.warning(
+                    "Skipping simulated measurement series[%d].values[%d] for "
+                    "device '%s': missing active_power",
+                    series_index,
+                    value_index,
+                    device_name,
+                )
+                continue
+
+            normalized.append({
+                "message_type": "measure",
+                "asset_id": device_name,
+                "asset_type": "unknown",
+                "measurement_type": "power",
+                "timestamp": timestamp,
+                "payload": {
+                    "community": series_item.get("community"),
+                    "site": series_item.get("site"),
+                    "device_name": device_name,
+                    "time": timestamp,
+                    "active_power": value_item.get("active_power"),
+                },
+            })
+
+    return normalized
 
 
 def _parse_rabbitmq_sections(
@@ -2211,6 +2311,32 @@ Examples:
                     "V2 unexpected payload type %s from '%s'; acking",
                     type(message).__name__, source.section,
                 )
+                return True
+
+            normalized_measurements = _normalize_simulated_asset_measure_batch(
+                message,
+                source.section,
+                logger,
+            )
+            if normalized_measurements is not None:
+                if not normalized_measurements:
+                    logger.warning(
+                        "V2 simulated measurement batch produced no valid "
+                        "measurements: source=%s queue=%s",
+                        source.section,
+                        source.queue,
+                    )
+                    return True
+
+                logger.info(
+                    "V2 simulated measurement batch expanded: source=%s "
+                    "queue=%s measurements=%d",
+                    source.section,
+                    source.queue,
+                    len(normalized_measurements),
+                )
+                for item in normalized_measurements:
+                    _v2_message_callback(item, source)
                 return True
 
             resolution = _v2_router.resolve(message, source.section)

@@ -1316,3 +1316,168 @@ class TestActuatorListPayloadRouting:
         assert len(dispatched) == 2
         assert dispatched[0]["asset_id"] == "ECM96.2"
         assert dispatched[1]["asset_id"] == "ECM97.3"
+
+
+# =========================================================================
+# External simulator series payload → normalized simulated measurements
+# =========================================================================
+
+class TestSimulatedAssetMeasureBatchNormalization:
+    """Validate source-specific expansion for simulatedAssetMeasures batches."""
+
+    @staticmethod
+    def _batch_payload():
+        return {
+            "series": [
+                {
+                    "community": "ECM",
+                    "site": "ECM96",
+                    "device_name": "ECM96.1",
+                    "values": [
+                        {
+                            "time": "2025-11-10T10:00:00Z",
+                            "active_power": 12226.2343333333,
+                        },
+                    ],
+                },
+            ],
+        }
+
+    @staticmethod
+    def _load_real_router():
+        import os
+        from scripts.forwarder_router import MessageRouter, validate_routing_config
+
+        config_path = os.path.join(
+            os.path.dirname(__file__), "..", "conf", "forwarder_routes.json"
+        )
+        with open(config_path) as f:
+            config = json.load(f)
+        return MessageRouter.from_validated_config(validate_routing_config(config))
+
+    def test_series_payload_normalizes_to_measure_envelope(self):
+        normalized = fw._normalize_simulated_asset_measure_batch(
+            self._batch_payload(),
+            "simulatedAssetMeasures",
+            logging.getLogger("test_sim_measure_normalize"),
+        )
+
+        assert normalized == [
+            {
+                "message_type": "measure",
+                "asset_id": "ECM96.1",
+                "asset_type": "unknown",
+                "measurement_type": "power",
+                "timestamp": "2025-11-10T10:00:00Z",
+                "payload": {
+                    "community": "ECM",
+                    "site": "ECM96",
+                    "device_name": "ECM96.1",
+                    "time": "2025-11-10T10:00:00Z",
+                    "active_power": 12226.2343333333,
+                },
+            },
+        ]
+
+    def test_two_devices_one_value_each_produce_two_messages(self):
+        payload = self._batch_payload()
+        payload["series"].append({
+            "community": "ECM",
+            "site": "ECM97",
+            "device_name": "ECM97.1",
+            "values": [
+                {
+                    "time": "2025-11-10T10:00:00Z",
+                    "active_power": 13.7933244444,
+                },
+            ],
+        })
+
+        normalized = fw._normalize_simulated_asset_measure_batch(
+            payload,
+            "simulatedAssetMeasures",
+            logging.getLogger("test_sim_measure_normalize"),
+        )
+
+        assert len(normalized) == 2
+        assert [message["asset_id"] for message in normalized] == [
+            "ECM96.1",
+            "ECM97.1",
+        ]
+        assert all(message["message_type"] == "measure" for message in normalized)
+
+    def test_one_device_two_values_produces_two_messages(self):
+        payload = self._batch_payload()
+        payload["series"][0]["values"].append({
+            "time": "2025-11-10T10:15:00Z",
+            "active_power": 12000.0,
+        })
+
+        normalized = fw._normalize_simulated_asset_measure_batch(
+            payload,
+            "simulatedAssetMeasures",
+            logging.getLogger("test_sim_measure_normalize"),
+        )
+
+        assert len(normalized) == 2
+        assert all(message["asset_id"] == "ECM96.1" for message in normalized)
+        assert [message["timestamp"] for message in normalized] == [
+            "2025-11-10T10:00:00Z",
+            "2025-11-10T10:15:00Z",
+        ]
+        assert [message["payload"]["active_power"] for message in normalized] == [
+            12226.2343333333,
+            12000.0,
+        ]
+
+    def test_normalized_messages_match_existing_sim_measure_route(self):
+        router = self._load_real_router()
+        normalized = fw._normalize_simulated_asset_measure_batch(
+            self._batch_payload(),
+            "simulatedAssetMeasures",
+            logging.getLogger("test_sim_measure_normalize"),
+        )
+
+        result = router.resolve(normalized[0], "simulatedAssetMeasures")
+
+        assert result.status == "matched"
+        assert result.route.name == "sim_measure_forward"
+
+    def test_series_payload_from_other_source_is_not_normalized(self):
+        normalized = fw._normalize_simulated_asset_measure_batch(
+            self._batch_payload(),
+            "realAssetCommands",
+            logging.getLogger("test_sim_measure_normalize"),
+        )
+
+        assert normalized is None
+
+    def test_invalid_series_entries_are_skipped_without_exception(self, caplog):
+        payload = {
+            "series": [
+                "not an object",
+                {"device_name": "ECM96.1", "values": "not a list"},
+                {"device_name": "ECM96.2", "values": [{"time": "2025-11-10T10:00:00Z"}]},
+                {"device_name": "ECM96.3", "values": [{"active_power": 1.0}]},
+                {"values": [{"time": "2025-11-10T10:00:00Z", "active_power": 1.0}]},
+            ],
+        }
+
+        with caplog.at_level(logging.WARNING, logger="test_sim_measure_normalize"):
+            normalized = fw._normalize_simulated_asset_measure_batch(
+                payload,
+                "simulatedAssetMeasures",
+                logging.getLogger("test_sim_measure_normalize"),
+            )
+
+        assert normalized == []
+        assert "Skipping simulated measurement" in caplog.text
+
+    def test_non_list_series_is_not_normalized(self):
+        normalized = fw._normalize_simulated_asset_measure_batch(
+            {"series": {"device_name": "ECM96.1"}},
+            "simulatedAssetMeasures",
+            logging.getLogger("test_sim_measure_normalize"),
+        )
+
+        assert normalized is None
