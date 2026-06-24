@@ -255,16 +255,24 @@ def _resolve_activation_current_config(strategy_obj, config: dict) -> Dict:
     rps = strategy_config.get("recentProfileSettings", {})
     persistence_cfg = config.get("flexibility", {}).get("persistenceSettings", {})
 
-    max_age = (
-        rps.get("maxCurrentMeasurementAgeMinutes")
-        or persistence_cfg.get("maxCurrentMeasurementAgeMinutes")
-        or ACTIVATION_CURRENT_DEFAULTS["max_measurement_age_minutes"]
+    def _first_not_none(*values, default):
+        # Explicit None check so an explicit 0 is honored instead of being
+        # treated as "unset" by truthiness (e.g. activeThresholdW: 0.0).
+        for value in values:
+            if value is not None:
+                return value
+        return default
+
+    max_age = _first_not_none(
+        rps.get("maxCurrentMeasurementAgeMinutes"),
+        persistence_cfg.get("maxCurrentMeasurementAgeMinutes"),
+        default=ACTIVATION_CURRENT_DEFAULTS["max_measurement_age_minutes"],
     )
-    active_threshold_w = float(
-        rps.get("activeThresholdW")
-        or persistence_cfg.get("activeThresholdW")
-        or ACTIVATION_CURRENT_DEFAULTS["active_threshold_w"]
-    )
+    active_threshold_w = float(_first_not_none(
+        rps.get("activeThresholdW"),
+        persistence_cfg.get("activeThresholdW"),
+        default=ACTIVATION_CURRENT_DEFAULTS["active_threshold_w"],
+    ))
 
     return {
         "max_measurement_age_minutes": int(max_age),
@@ -3611,6 +3619,7 @@ class FlexibilityManager:
         bid_reference_source: Optional[str],
         activation_current_cfg: Dict,
         is_continuation: bool = False,
+        is_discrete_ev: bool = False,
     ):
         """Resolve activation-time current power for a recent_profile_baseline continuous EV asset.
 
@@ -3620,6 +3629,14 @@ class FlexibilityManager:
         bypassed and ``bid_reference_power_kw`` is returned as the activation
         reference instead.  The active-threshold check is still enforced because
         a very low reading may indicate the EV has disconnected.
+
+        When *is_discrete_ev* is True the asset is actuated by setting a fixed
+        OCPP power state (e.g. full OFF or a current step).  That command is
+        deterministic regardless of the live draw, so the
+        ``current_power < allocated_curtailment`` margin skip is bypassed: the
+        command is always actuated and the live measurement is only used as the
+        discrete-state selection reference.  The active-threshold and staleness
+        checks still apply (they detect a disconnected/unmeasured EV).
 
         Returns:
             float: activation_current_power_kw (or bid_reference_power_kw for
@@ -3706,14 +3723,14 @@ class FlexibilityManager:
             )
             return reason
 
-        if current_power_kw <= active_threshold_kw:
+        if current_power_kw < active_threshold_kw:
             qualifier = (
                 "continuation asset appears inactive/disconnected"
                 if is_continuation
                 else "EV appears inactive for recent_profile_baseline activation"
             )
             reason = (
-                f"skipped: current power {current_power_kw:.3f} kW at or below "
+                f"skipped: current power {current_power_kw:.3f} kW below "
                 f"active threshold {active_threshold_kw:.3f} kW; {qualifier}"
             )
             self.logger.warning(
@@ -3759,7 +3776,7 @@ class FlexibilityManager:
             )
             return continuation_ref
 
-        if current_power_kw < curtailment_kw:
+        if current_power_kw < curtailment_kw and not is_discrete_ev:
             reason = (
                 f"skipped: current power {current_power_kw:.3f} kW below allocated "
                 f"curtailment {curtailment_kw:.3f} kW; skipping recent-profile EV "
@@ -3781,6 +3798,25 @@ class FlexibilityManager:
                 active_threshold_kw, reason,
             )
             return reason
+
+        if current_power_kw < curtailment_kw and is_discrete_ev:
+            self.logger.info(
+                "Continuous activation reference decision for %s:\n"
+                "  allocated_curtailment_kw=%.3f\n"
+                "  bid_reference_power_kw=%s\n"
+                "  bid_reference_source=%s\n"
+                "  activation_current_power_kw=%.3f\n"
+                "  activation_current_time_utc=%s\n"
+                "  activation_measurement_age_minutes=%.1f\n"
+                "  active_threshold_kw=%.3f\n"
+                "  decision=discrete EV command is deterministic (fixed power state); "
+                "actuating despite current power below allocated curtailment",
+                asset_id, curtailment_kw,
+                bid_ref_str, bid_reference_source,
+                current_power_kw, str(measurement_time_utc), age_minutes,
+                active_threshold_kw,
+            )
+            return current_power_kw
 
         self.logger.info(
             "Continuous activation reference decision for %s:\n"
@@ -4774,6 +4810,7 @@ class FlexibilityManager:
                         bid_reference_source=bid_reference_source,
                         activation_current_cfg=activation_current_cfg,
                         is_continuation=is_continuation,
+                        is_discrete_ev=is_discrete_ev,
                     )
                     if isinstance(skip_reason, str):
                         summary["control_results"][asset_id] = self._build_ev_skip_result(
