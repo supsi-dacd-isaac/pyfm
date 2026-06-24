@@ -1,0 +1,681 @@
+{
+  "connectionsFile": "../conf/private/conns.json",
+  "location": {
+    "name": "Lugano",
+    "latitude": 46.0037,
+    "longitude": 8.9511
+  },
+  "baseline": {
+    "source": "db",
+    "shiftMinutes": 90,
+    "fileSettings": {
+      "profileFile": "../data/baselines/example01.csv"
+    },
+    "dbSettings": {
+      "strategy": "slot_persistence",
+      "upcomingHoursToQuery": 24,
+      "daysToGoBack": 7,
+      "uploadOnlyComputableHorizon": true,
+      "maxSlotsToUpload": 1,
+      "missingMeasurementPolicy": "zero_fill_asset"
+    }
+  },
+  "fm": {
+	"community": "ECM",
+    "granularity": 15,
+    "ordersTimeShift": 90,
+    "marketName": "Opentunity-CH",
+    "gridAreaName": "Switzerland",
+    "actors": {
+      "dso": {
+        "id": "AEM",
+        "name": "Switzerland",
+        "role": "dso",
+        "flexibilitySource": "forecast",
+        "forecast":{
+          "source": "aem",
+          "filename": "../data/forecast/example01.csv"
+        },
+        "peak": {
+            "source": "file",
+            "filename": "../data/peak/example01.csv"
+        },
+        "orderSection": {
+          "nodeName": "Massagno_1",
+          "quantities": {
+            "random": [0.005, 0.008, 0.01, 0.013, 0.015, 0.018, 0.02, 0.023, 0.025, 0.028, 0.03],
+            "db": {
+              "fields":["CH2ActivePowL1", "CH2ActivePowL2", "CH2ActivePowL3"],
+              "community": "ECM",
+              "device": "sgim",
+              "daysToGoBack": 7
+            },
+            "forecasting_cut": 240.0,
+            "cut_margin": 10.0,
+            "day_of_month_cut_max_increase": 10.0
+          },
+          "unitPrice":{
+            "source": "forecast",
+            "constant": 10.0,
+            "forecast_base": 1.0,
+            "forecast_multiplier": 10.0,
+            "day_of_month_max_increase": 3.0
+          },
+          "mainSettings": {
+            "side": "Buy",
+            "regulationType": "Up",
+            "priceType": "Limit",
+            "currency": "CHF",
+            "fillType": "Normal"
+          }
+        },
+        "contractSection": {
+          "mainSettings": {
+            "unitPrice": 100,
+            "availabilityPrice": 50,
+            "crontab": "* 9-12,13-17 * 7,8 1,2,3,4,5",
+            "crontabSummertimeCooling": "* 9-12,13-17 * 7,8 1,2,3,4,5"
+          }
+        }
+      },
+      "fsps": {
+        "supsi01": {
+          "id": "SUPSI",
+          "name": "SUPSI",
+          "role": "fsp",
+          "baselines": {
+            "tmpFolder": "../data/tmp",
+            "fromBeforeNowHours": 12,
+            "toAfterNowHours": 12
+          },
+          "orderSection": {
+            "quantityPercBaseline": 50,
+            "mainSettings": {
+              "side": "Sell",
+              "priceType": "Limit",
+              "currency": "CHF",
+              "fillType": "Normal"
+            }
+          },
+          "pricing": {
+            "source": "strategy",
+            "constant": 5.0,
+            "forecasting_multiplier": 1.0,
+            "activationCost": 2.5
+          },
+          "strategy": "strategy_4",
+          "assets": ["ECM96.2", "ECM97.3", "ECM63.1", "ECM63.2"],
+          "forecast":{
+            "source": "aem",
+            "filename": "../data/forecast/example01.csv"
+          },
+          "contractSection": {
+            "mainSettings": {
+              "autoCreateExpiry": 7200
+            }
+          }
+        },
+        "supsi02": {
+          "id": "SUPSI2",
+          "name": "SUPSI VIRTUELL",
+          "role": "fsp",
+          "baselines": {
+            "tmpFolder": "../data/tmp",
+            "fromBeforeNowHours": 12,
+            "toAfterNowHours": 12
+          },
+          "orderSection": {
+            "quantityPercBaseline": 50,
+            "mainSettings": {
+              "side": "Sell",
+              "priceType": "Limit",
+              "currency": "CHF",
+              "fillType": "Normal"
+            }
+          },
+          "assets": ["ECM62.1", "ECM62.2", "ECM62.3", "ECM68.3", "ECM162.1"],
+          "pricing": {
+            "source": "constant",
+            "constant": 5.0,
+            "forecasting_multiplier": 1.0,
+            "activationCost": 1.0
+          },
+          "forecast":{
+            "source": "aem",
+            "filename": "../data/forecast/example01.csv"
+          }
+        }
+      }
+    }
+  },
+  "asset_mapping": {
+    "ECM63.1": {
+      "device_name_tag": "charge_point_ev_1",
+      "pod": "ECM63",
+      "field": "power",
+      "type": "ev_charger",
+      "rabbitCommandSection": "realAssetCommands",
+      "description": "EV Charger 1",
+      "capacity_kw": 11.0,
+      "nominal_power_w": 11000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 0.5,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "min_power_kw": 0.0,
+      "discrete_states_kw": [0.0, 11.0]
+    },
+    "ECM63.2": {
+      "device_name_tag": "charge_point_ev_2",
+      "pod": "ECM63",
+      "field": "power",
+      "type": "ev_charger",
+      "rabbitCommandSection": "realAssetCommands",
+      "description": "EV Charger 2",
+      "capacity_kw": 11.0,
+      "nominal_power_w": 11000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 0.5,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "min_power_kw": 0.0,
+      "discrete_states_kw": [0.0, 11.0]
+    },
+    "ECM96.2": {
+      "device_name_tag": "shelly_3em_pro_heat_pump_ext_unit",
+      "pod": "ECM96",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands",
+      "description": "HP Small",
+      "capacity_kw": 4.0,
+      "nominal_power_w": 7500,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 4.0]
+    },
+    "ECM97.1": {
+      "device_name_tag": "shelly_3em_pro_heat_pump_1",
+      "pod": "ECM97",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands",
+      "description": "HP Cinema 1",
+      "capacity_kw": 15.0,
+      "nominal_power_w": 15000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 15.0]
+    },
+    "ECM97.2": {
+      "device_name_tag": "shelly_3em_pro_heat_pump_2",
+      "pod": "ECM97",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands",
+      "description": "HP Cinema 2",
+      "capacity_kw": 15.0,
+      "nominal_power_w": 15000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 15.0]
+    },
+	"ECM97.3": {
+      "device_name_tag": "v_shelly_3em_pro_heat_pump",
+      "pod": "ECM97",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "realAssetCommands",
+      "description": "HP Cinema",
+      "capacity_kw": 30.0,
+      "nominal_power_w": 30000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 30.0]
+    },
+	"ECM62.1": {
+      "device_name_tag": "ECM62.1",
+      "pod": "ECM62",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands",
+      "description": "HP ECM62.1 simulated",
+      "capacity_kw": 9.0,
+      "nominal_power_w": 9000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 9.0]
+    },
+	"ECM62.2": {
+      "device_name_tag": "ECM62.2",
+      "pod": "ECM62",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands",
+      "description": "HP ECM62.2 simulated",
+      "capacity_kw": 9.0,
+      "nominal_power_w": 9000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 9.0]
+    },
+	"ECM62.3": {
+      "device_name_tag": "ECM62.3",
+      "pod": "ECM62",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands",
+      "description": "HP ECM62.3 simulated",
+      "capacity_kw": 18.0,
+      "nominal_power_w": 18000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 18.0]
+    },
+	"ECM68.3": {
+      "device_name_tag": "ECM68.3",
+      "pod": "ECM68",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands",
+      "description": "HP ECM68.3 simulated",
+      "capacity_kw": 8.4,
+      "nominal_power_w": 8400,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 8.4]
+    },
+	"ECM162.1": {
+      "device_name_tag": "ECM162.1",
+      "pod": "ECM162",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands",
+      "description": "HP ECM162.1 simulated",
+      "capacity_kw": 6.0,
+      "nominal_power_w": 6000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 6.0]
+    }
+  },
+  "assets_grouping": {
+    "ECM_Cinema_HPs": {
+      "type": "heat_pump",
+      "assets": ["ECM97.1", "ECM97.2"]
+    },
+    "ECM_EV_Chargers": {
+      "type": "ev_charger",
+      "assets": ["ECM63.1", "ECM63.2"]
+    }
+  },
+  "flexibility": {
+    "method": "persistence",
+    "peak_hours": {
+      "morning": {"start": 7, "end": 10},
+      "evening": {"start": 16, "end": 20}
+    },
+    "historical_days_back": 30,
+    "default_flexibility_factor": 0.50,
+    "persistenceSettings": {
+      "persistenceGoBackMinutes": 90,
+      "activeThresholdW": 0,
+      "defaultSafetyFactor": 1.0,
+      "missingMeasurementPolicy": "skip_asset",
+      "maxCurrentMeasurementAgeMinutes": 30
+    },
+    "ev_charger": {
+      "occupancy_threshold_w": 100
+    },
+    "temperature": {
+      "enabled": false,
+      "source": {
+        "site": "ECM",
+        "device": "weather_station",
+        "field": "temperature"
+      },
+      "bins": [-5, 0, 5, 10, 15, 20, 25],
+      "forecast": {
+        "type": "historical_avg",
+        "file": "../data/forecast/temperature_forecast.json"
+      }
+    }
+  },
+  "autonomous": {
+    "enabled": true,
+    "lookahead_hours": 3,
+    "historical_days": 7,
+    "price_increase_threshold_pct": 20,
+    "dso_id": "AEM",
+    "preactivation_enabled": false
+  },
+  "bidding_strategies": {
+    "strategy_1": {
+      "name": "HP Only",
+      "description": "Heat pumps only, conservative full-day coverage, no EV chargers",
+      "asset_types": ["heat_pump"],
+      "time_slots": [
+        {"name": "Morning Peak", "start": "06:30", "end": "09:00", "flexibility_mw": 0.015, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.015, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_2": {
+      "name": "Full Portfolio + Evening EV",
+      "description": "All assets, focus on evening when EVs might be charging",
+      "asset_types": ["heat_pump", "ev_charger"],
+      "time_slots": [
+        {"name": "Morning Peak", "start": "07:00", "end": "10:00", "flexibility_mw": 0.015, "bid_price": 8.0, "activation_cost": 2.5},
+        {"name": "Midday", "start": "10:00", "end": "17:00", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "17:00", "end": "20:00", "flexibility_mw": 0.015, "bid_price": 9.5, "activation_cost": 2.5, "ev_flexibility_mw": 0.0008, "ev_bid_price": 10.0, "ev_activation_cost": 4.5},
+        {"name": "Off-peak", "start": "20:00", "end": "07:00", "flexibility_mw": 0.005, "bid_price": 5.5, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_3": {
+      "name": "Morning Peak Focus",
+      "description": "Aggressive bidding during morning peak when Cinema HPs are at maximum",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM97.3"],
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.010, "bid_price": 7.5, "activation_cost": 2.5},
+        {"name": "Afternoon/Evening", "start": "12:00", "end": "20:00", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5},
+        {"name": "Night", "start": "20:00", "end": "06:30", "flexibility_mw": 0.004, "bid_price": 5.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_4": {
+      "name": "Hybrid (S3+S1)",
+      "description": "Morning peak aggressive (S3) + full day HP coverage (S1) - RECOMMENDED",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM96.2", "ECM97.3"],
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_5": {
+      "name": "Hybrid2 (S3+S2)",
+      "description": "Morning peak aggressive (S3) + evening EV focus (S2)",
+      "asset_types": ["heat_pump", "ev_charger"],
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.020, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.010, "bid_price": 7.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "17:00", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "17:00", "end": "20:00", "flexibility_mw": 0.020, "bid_price": 9.5, "activation_cost": 2.5, "ev_flexibility_mw": 0.0008, "ev_bid_price": 10.0, "ev_activation_cost": 4.5},
+        {"name": "Off-peak", "start": "20:00", "end": "06:30", "flexibility_mw": 0.005, "bid_price": 5.5, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_6": {
+      "name": "Smart Preheat",
+      "description": "Preheat 04-06h to increase/guarantee HP flexibility during morning peak 07-10h",
+      "asset_types": ["heat_pump"],
+      "time_slots": [
+        {
+          "name": "Preheat (HP ON)",
+          "start": "04:00",
+          "end": "06:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "preheat_power_mw": 0.02,
+          "preheat_elec_cost_chf_mwh": 20.0
+        },
+        {
+          "name": "Transition",
+          "start": "06:00",
+          "end": "07:00",
+          "flexibility_mw": 0.01,
+          "bid_price": 8.0,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Morning Peak (HP OFF - Full Flex)",
+          "start": "07:00",
+          "end": "10:00",
+          "flexibility_mw": 0.028,
+          "bid_price": 10.5,
+          "activation_cost": 1.0
+        },
+        {
+          "name": "Post-Peak Recovery",
+          "start": "10:00",
+          "end": "12:00",
+          "flexibility_mw": 0.01,
+          "bid_price": 7.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Afternoon",
+          "start": "12:00",
+          "end": "16:00",
+          "flexibility_mw": 0.008,
+          "bid_price": 7.0,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Evening Peak",
+          "start": "16:00",
+          "end": "19:00",
+          "flexibility_mw": 0.012,
+          "bid_price": 9.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Night",
+          "start": "19:00",
+          "end": "04:00",
+          "flexibility_mw": 0.005,
+          "bid_price": 5.5,
+          "activation_cost": 2.5
+        }
+      ]
+    },
+    "strategy_7": {
+      "name": "Double Pre-heating",
+      "description": "Dual preheat (04-06h + 12-15h) for maximum flex during BOTH morning (07-11h) and evening (16-20h) peaks",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM96.2"],
+      "time_slots": [
+        {
+          "name": "Pre-heat 1 (04:00-06:00)",
+          "start": "04:00",
+          "end": "06:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "preheat_power_mw": 0.018,
+          "preheat_elec_cost_chf_mwh": 15.0
+        },
+        {
+          "name": "Transition 1 (06:00-07:00)",
+          "start": "06:00",
+          "end": "07:00",
+          "flexibility_mw": 0.008,
+          "bid_price": 8.0,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Morning Peak Flex (07:00-11:00)",
+          "start": "07:00",
+          "end": "11:00",
+          "flexibility_mw": 0.025,
+          "bid_price": 10.0,
+          "activation_cost": 1.0
+        },
+        {
+          "name": "Transition 2 (11:00-12:00)",
+          "start": "11:00",
+          "end": "12:00",
+          "flexibility_mw": 0.006,
+          "bid_price": 7.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Pre-heat 2 (12:00-15:00)",
+          "start": "12:00",
+          "end": "15:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "preheat_power_mw": 0.018,
+          "preheat_elec_cost_chf_mwh": 10.0
+        },
+        {
+          "name": "Transition 3 (15:00-16:00)",
+          "start": "15:00",
+          "end": "16:00",
+          "flexibility_mw": 0.01,
+          "bid_price": 8.5,
+          "activation_cost": 2.5
+        },
+        {
+          "name": "Evening Peak Flex (16:00-20:00)",
+          "start": "16:00",
+          "end": "20:00",
+          "flexibility_mw": 0.028,
+          "bid_price": 11.5,
+          "activation_cost": 0.8
+        },
+        {
+          "name": "Night Recovery (20:00-04:00)",
+          "start": "20:00",
+          "end": "04:00",
+          "flexibility_mw": 0.004,
+          "bid_price": 5.5,
+          "activation_cost": 3.0
+        }
+      ]
+	},
+    "strategy_8": {
+      "name": "Persistence HP Strategy",
+      "description": "Persistence-based HP bidding for ECM96.2 and ECM97.3",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM96.2", "ECM97.3"],
+      "flexibility_method": "persistence",
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_9": {
+      "name": "Persistence HP + EV Strategy",
+      "description": "Persistence-based bidding for ECM63.1, ECM63.2, ECM96.2, and ECM97.3",
+      "asset_types": ["heat_pump", "ev_charger"],
+      "assets_filter": ["ECM63.1", "ECM63.2", "ECM96.2", "ECM97.3"],
+      "flexibility_method": "persistence",
+      "time_slots": [
+        {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00", "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.012, "bid_price": 8.5, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.008, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Evening Peak (Aggressive)", "start": "16:00", "end": "19:00", "flexibility_mw": 0.040, "bid_price": 9.5, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.006, "bid_price": 6.0, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_10": {
+      "name": "Recent-profile Short-term Flexibility (EV)",
+      "description": "Profile-based forecast: q25 of last 2h of 15-min samples, 50% of expected power for continuous EV chargers; architecture also supports discrete HPs but only EV chargers are enabled for now",
+      "asset_types": ["ev_charger", "heat_pump"],
+      "assets_filter": ["ECM63.1", "ECM63.2"],
+      "flexibility_method": "recent_profile",
+      "recentProfileSettings": {
+        "lookbackMinutes": 90,
+        "quantile": 0.25,
+        "continuousFactor": 0.5,
+        "discreteFactor": 1.0,
+        "activeThresholdW": 5000,
+        "maxConsecutiveActivationSlots": 4,
+        "cooldownSlotsAfterMaxActivation": 2,
+        "minSamples": 2,
+        "missingMeasurementPolicy": "skip_asset",
+        "adaptiveLookback": {
+          "enabled": true,
+          "appliesTo": "continuous",
+          "mode": "load_ratio",
+          "rules": [
+            {
+              "minLoadRatio": 0.80,
+              "lookbackMinutes": 45
+            },
+            {
+              "minLoadRatio": 0.65,
+              "lookbackMinutes": 60
+            }
+          ]
+        }
+      },
+      "time_slots": [
+        {"name": "Morning Peak", "start": "06:30", "end": "09:00", "flexibility_mw": 0.011, "bid_price": 7.5, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.011, "bid_price": 7.0, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.011, "bid_price": 5.5, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.011, "bid_price": 8.0, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.011, "bid_price": 4.5, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_11": {
+      "name": "Recent-profile discrete EV current-step flexibility",
+      "description": "EV flexibility based on recent-profile reference power and feasible OCPP current-step power states.",
+      "enabled": true,
+      "asset_types": ["ev_charger"],
+      "assets_filter": ["ECM63.2"],
+      "flexibility_method": "recent_profile",
+      "recentProfileSettings": {
+        "lookbackMinutes": 15,
+        "quantile": 0.50,
+        "continuousFactor": 1.0,
+        "discreteFactor": 1.0,
+        "activeThresholdW": 0.0,
+        "minSamples": 1,
+        "maxConsecutiveActivationSlots": 4,
+        "cooldownSlotsAfterMaxActivation": 2
+      },
+      "discreteEvSettings": {
+        "selection_policy": "smallest_overdelivery",
+        "allow_zero_state": true,
+        "min_target_power_kw": 0
+      },
+      "time_slots": [
+        {"name": "Morning Peak", "start": "06:30", "end": "09:00", "flexibility_mw": 0.011, "bid_price": 5.0, "activation_cost": 2.5},
+        {"name": "Late Morning", "start": "09:00", "end": "12:00", "flexibility_mw": 0.011, "bid_price": 5.0, "activation_cost": 2.5},
+        {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.011, "bid_price": 5.0, "activation_cost": 2.5},
+        {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.011, "bid_price": 5.0, "activation_cost": 2.5},
+        {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.011, "bid_price": 5.0, "activation_cost": 2.5}
+      ]
+    }
+  }
+}
