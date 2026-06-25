@@ -481,6 +481,53 @@ def _log_v2_dispatch_destination(
     )
 
 
+def _log_v2_dispatch_result(
+    log: logging.Logger,
+    request: "ResolvedRequest",
+    result: Any,
+) -> None:
+    """Log the HTTP result with returned status and used/total attempts."""
+    total_attempts = max(1, request.request_retries + 1)
+    if result.dry_run:
+        log.info(
+            "V2 dispatch result: route='%s' api='%s' endpoint='%s' "
+            "status=DRY_RUN attempts=0/%d success=%s",
+            request.route_name,
+            request.api_name,
+            request.endpoint_name,
+            total_attempts,
+            result.success,
+        )
+        return
+
+    if result.success:
+        log.info(
+            "V2 dispatch result: route='%s' api='%s' endpoint='%s' "
+            "status=%s attempts=%d/%d success=%s",
+            request.route_name,
+            request.api_name,
+            request.endpoint_name,
+            result.status_code,
+            result.attempts,
+            total_attempts,
+            result.success,
+        )
+        return
+
+    log.warning(
+        "V2 dispatch result: route='%s' api='%s' endpoint='%s' "
+        "status=%s attempts=%d/%d success=%s error='%s'",
+        request.route_name,
+        request.api_name,
+        request.endpoint_name,
+        result.status_code,
+        result.attempts,
+        total_attempts,
+        result.success,
+        result.error,
+    )
+
+
 def _normalize_control_url(control_url: Optional[str], api_port: Optional[int]) -> Optional[str]:
     """Ensure controlUrl has a scheme and optional port if missing."""
     if not control_url:
@@ -2353,12 +2400,13 @@ Examples:
                 items=n_items,
             )
 
-            dispatch_http_request(
+            result = dispatch_http_request(
                 resolved_req,
                 payload,
                 policy=_v2_router.defaults.on_http_failure,
                 session=v2_http_session,
             )
+            _log_v2_dispatch_result(logger, resolved_req, result)
             return True
 
         def _v2_message_callback(message, source: RabbitMQSource) -> bool:
@@ -2496,27 +2544,7 @@ Examples:
                 policy=_v2_router.defaults.on_http_failure,
                 session=v2_http_session,
             )
-            if result.dry_run:
-                logger.info(
-                    "V2 result: route='%s' status=DRY_RUN (no HTTP call)",
-                    resolved_req.route_name,
-                )
-            elif result.success:
-                logger.info(
-                    "V2 result: route='%s' status=%s attempts=%d",
-                    resolved_req.route_name,
-                    result.status_code,
-                    result.attempts,
-                )
-            else:
-                logger.warning(
-                    "V2 result: route='%s' status=%s error='%s' "
-                    "attempts=%d",
-                    resolved_req.route_name,
-                    result.status_code,
-                    result.error,
-                    result.attempts,
-                )
+            _log_v2_dispatch_result(logger, resolved_req, result)
             return True
 
         logger.info(
