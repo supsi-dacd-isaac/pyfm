@@ -548,6 +548,39 @@ class TestSimMeasurePipeline:
         )
         assert resolved.body == case["message"]
 
+    def test_series_batch_is_sent_as_raw_body(self, router_with_resolved_api):
+        """Series batches use the sim measure route but keep the original body."""
+        batch = {
+            "series": [
+                {
+                    "community": "ECM",
+                    "site": "ECM68",
+                    "device_name": "ECM68.3",
+                    "values": [
+                        {
+                            "time": "2026-06-25T08:31:22Z",
+                            "active_power": 38563.73563443726,
+                        }
+                    ],
+                }
+            ]
+        }
+        resolution = router_with_resolved_api.resolve(
+            {"message_type": "measure"},
+            "simulatedAssetMeasures",
+        )
+
+        resolved = build_resolved_request(
+            batch,
+            resolution.route,
+            router_with_resolved_api,
+            forwarder_dry_run=True,
+        )
+
+        assert resolution.status == "matched"
+        assert resolution.route.name == "sim_measure_forward"
+        assert resolved.body == batch
+
     @pytest.mark.parametrize(
         "case",
         SIM_MEASURE_MESSAGES,

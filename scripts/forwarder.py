@@ -2323,30 +2323,38 @@ Examples:
                 )
                 return True
 
-            normalized_measurements = _normalize_simulated_asset_measure_batch(
-                message,
-                source.section,
-                logger,
-            )
-            if normalized_measurements is not None:
-                if not normalized_measurements:
-                    logger.warning(
-                        "V2 simulated measurement batch produced no valid "
-                        "measurements: source=%s queue=%s",
+            if (
+                source.section == SIMULATED_ASSET_MEASURES_SECTION
+                and "series" in message
+            ):
+                resolution = _v2_router.resolve(
+                    {"message_type": "measure"},
+                    source.section,
+                )
+                if resolution.status == "matched":
+                    logger.info(
+                        "V2 simulated measurement batch raw forward: "
+                        "source=%s queue=%s route='%s'",
+                        source.section,
+                        source.queue,
+                        resolution.route.name,
+                    )
+                    return _v2_forward_raw(message, resolution.route, source)
+
+                if resolution.status == "ambiguous":
+                    logger.error(
+                        "V2 ambiguous raw measurement route match: routes=%s "
+                        "source=%s queue=%s",
+                        [r.name for r in resolution.matching_routes],
                         source.section,
                         source.queue,
                     )
-                    return True
-
-                logger.info(
-                    "V2 simulated measurement batch expanded: source=%s "
-                    "queue=%s measurements=%d",
-                    source.section,
-                    source.queue,
-                    len(normalized_measurements),
-                )
-                for item in normalized_measurements:
-                    _v2_message_callback(item, source)
+                else:
+                    logger.warning(
+                        "V2 no raw measurement route matched: source=%s queue=%s",
+                        source.section,
+                        source.queue,
+                    )
                 return True
 
             resolution = _v2_router.resolve(message, source.section)
