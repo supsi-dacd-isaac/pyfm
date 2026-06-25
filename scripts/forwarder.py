@@ -1721,6 +1721,16 @@ class RabbitMQConsumer:
             )
 
             decoded_payload = json.loads(body.decode("utf-8"))
+            self.logger.info(
+                "RabbitMQ message received: queue=%s exchange=%s section=%s "
+                "routing_key=%s delivery_tag=%s payload=%s",
+                queue_name,
+                exchange_name,
+                section,
+                routing_key,
+                delivery_tag,
+                json.dumps(decoded_payload, ensure_ascii=True, default=str),
+            )
 
             # V2 routing callback path — always ack, never requeue.
             # Accepts both dict and list payloads; the callback
