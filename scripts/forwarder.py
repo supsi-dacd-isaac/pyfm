@@ -427,6 +427,60 @@ def _format_request_body_for_log(request_body: Any) -> str:
         return str(request_body)
 
 
+def _format_headers_for_log(headers: Optional[Dict[str, str]]) -> str:
+    """Serialize request headers to a stable single-line string for logging."""
+    if not headers:
+        return "{}"
+    try:
+        return json.dumps(headers, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return str(headers)
+
+
+def _log_v2_dispatch_destination(
+    log: logging.Logger,
+    request: "ResolvedRequest",
+    payload: Any,
+    *,
+    source: Optional["RabbitMQSource"] = None,
+    items: Optional[int] = None,
+) -> None:
+    """Log the fully resolved V2 HTTP destination and request body."""
+    source_section = source.section if source is not None else "unknown"
+    queue = source.queue if source is not None else "unknown"
+    payload_type = type(payload).__name__
+    if items is not None:
+        item_count = items
+    elif isinstance(payload, list):
+        item_count = len(payload)
+    else:
+        item_count = 1
+    log.info(
+        "V2 dispatch destination: route='%s' source='%s' queue='%s' "
+        "api='%s' endpoint='%s' method='%s' url='%s' headers=%s "
+        "payload_type='%s' items=%d dry_run=%s timeout=%.1f "
+        "verify_ssl=%s retries=%d success_status_codes=%s auth_configured=%s "
+        "payload=%s",
+        request.route_name,
+        source_section,
+        queue,
+        request.api_name,
+        request.endpoint_name,
+        request.method,
+        request.url,
+        _format_headers_for_log(request.headers),
+        payload_type,
+        item_count,
+        request.effective_dry_run,
+        request.timeout_seconds,
+        request.verify_ssl,
+        request.request_retries,
+        request.success_status_codes,
+        request.auth is not None,
+        _format_request_body_for_log(request.body),
+    )
+
+
 def _normalize_control_url(control_url: Optional[str], api_port: Optional[int]) -> Optional[str]:
     """Ensure controlUrl has a scheme and optional port if missing."""
     if not control_url:
@@ -2291,6 +2345,13 @@ Examples:
                 route.name, source.section, source.queue,
                 route.api, route.endpoint, n_items, effective_dry_run,
             )
+            _log_v2_dispatch_destination(
+                logger,
+                resolved_req,
+                payload,
+                source=source,
+                items=n_items,
+            )
 
             dispatch_http_request(
                 resolved_req,
@@ -2422,14 +2483,11 @@ Examples:
                 )
                 return True
 
-            logger.info(
-                "V2 dispatch: route='%s' url='%s' method='%s' "
-                "dry_run=%s body_payload=%s",
-                resolved_req.route_name,
-                resolved_req.url,
-                resolved_req.method,
-                resolved_req.effective_dry_run,
-                json.dumps(resolved_req.body, default=str),
+            _log_v2_dispatch_destination(
+                logger,
+                resolved_req,
+                message,
+                source=source,
             )
 
             result = dispatch_http_request(

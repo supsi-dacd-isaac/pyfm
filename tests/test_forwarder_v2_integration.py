@@ -40,6 +40,66 @@ if "pika" not in sys.modules:
 from scripts import forwarder as fw  # noqa: E402
 
 
+def test_v2_dispatch_destination_log_includes_url_method_and_payload(caplog):
+    request = fw.ResolvedRequest(
+        route_name="sim_measure_forward",
+        api_name="aem_test_api",
+        endpoint_name="sim_measure_passthrough",
+        method="POST",
+        url="https://aem.example.test/ECM/ECM00/virtual_assets",
+        headers={"Content-Type": "application/json"},
+        body={
+            "series": [
+                {
+                    "community": "ECM",
+                    "site": "ECM68",
+                    "device_name": "ECM68.3",
+                    "values": [
+                        {
+                            "time": "2026-06-25T08:47:38Z",
+                            "active_power": 44674.13638674036,
+                        }
+                    ],
+                }
+            ]
+        },
+        auth=("user", "secret"),
+        timeout_seconds=5.0,
+        verify_ssl=False,
+        request_retries=3,
+        success_status_codes=[200, 201, 202, 204],
+        effective_dry_run=False,
+    )
+    source = fw.RabbitMQSource(
+        section="simulatedAssetMeasures",
+        exchange="flexi_sim_measures",
+        queue="flexi_sim_measures_queue",
+        routing_key="sim_asset.measure",
+    )
+
+    with caplog.at_level(logging.INFO, logger="forwarder"):
+        fw._log_v2_dispatch_destination(
+            logging.getLogger("forwarder"),
+            request,
+            request.body,
+            source=source,
+            items=1,
+        )
+
+    log_text = caplog.text
+    assert "V2 dispatch destination" in log_text
+    assert "route='sim_measure_forward'" in log_text
+    assert "api='aem_test_api'" in log_text
+    assert "endpoint='sim_measure_passthrough'" in log_text
+    assert "method='POST'" in log_text
+    assert "url='https://aem.example.test/ECM/ECM00/virtual_assets'" in log_text
+    assert "queue='flexi_sim_measures_queue'" in log_text
+    assert "payload_type='dict'" in log_text
+    assert "auth_configured=True" in log_text
+    assert '"device_name": "ECM68.3"' in log_text
+    assert '"active_power": 44674.13638674036' in log_text
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
