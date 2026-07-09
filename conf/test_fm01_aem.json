@@ -119,6 +119,7 @@
           "id": "SUPSI2",
           "name": "SUPSI VIRTUELL",
           "role": "fsp",
+          "strategy": "strategy_12",
           "baselines": {
             "tmpFolder": "../data/tmp",
             "fromBeforeNowHours": 12,
@@ -133,7 +134,7 @@
               "fillType": "Normal"
             }
           },
-          "assets": ["ECM62.1", "ECM62.2", "ECM62.3", "ECM68.3", "ECM162.1"],
+          "assets": ["ECM62.10", "ECM68.3", "ECM162.1"],
           "pricing": {
             "source": "constant",
             "constant": 5.0,
@@ -290,6 +291,22 @@
       "flexibility_persistence_go_back_minutes": 120,
       "modulation_type": "discrete",
       "discrete_states_kw": [0.0, 18.0]
+    },
+	"ECM62.10": {
+      "device_name_tag": "ECM62.10",
+      "pod": "ECM62",
+      "field": "active_power",
+      "type": "heat_pump",
+      "rabbitCommandSection": "simulatedAssetCommands",
+      "description": "HP ECM62.10 simulated",
+      "capacity_kw": 36.0,
+      "nominal_power_w": 36000,
+      "flexibility_factor": 1.0,
+      "persistence_safety_factor": 1.0,
+      "baseline_persistence_go_back_minutes": 120,
+      "flexibility_persistence_go_back_minutes": 120,
+      "modulation_type": "discrete",
+      "discrete_states_kw": [0.0, 36.0]
     },
 	"ECM68.3": {
       "device_name_tag": "ECM68.3",
@@ -675,6 +692,72 @@
         {"name": "Afternoon", "start": "12:00", "end": "16:00", "flexibility_mw": 0.011, "bid_price": 5.5, "activation_cost": 2.5},
         {"name": "Evening Peak", "start": "16:00", "end": "19:00", "flexibility_mw": 0.011, "bid_price": 8.0, "activation_cost": 2.5},
         {"name": "Off-peak", "start": "19:00", "end": "06:30", "flexibility_mw": 0.011, "bid_price": 4.5, "activation_cost": 2.5}
+      ]
+    },
+    "strategy_12": {
+      "name": "Preconditioned Binary HP Flexibility",
+      "description": "Evening-only preconditioned binary simulated HP strategy. Uses the preconditioned_binary flexibility method: each binary HP contributes its full ON-OFF block only when recent telemetry confirms it is reliably ON, otherwise 0 kW. The evening slot target is the nominal portfolio maximum (50.4 kW); actual bids are gated by measured availability and the discrete allocator.",
+      "enabled": true,
+      "implementation_status": "preconditioned_binary_method_live",
+      "flexibility_method": "preconditioned_binary",
+      "asset_types": ["heat_pump"],
+      "assets_filter": ["ECM62.10", "ECM68.3", "ECM162.1"],
+      "nominal_portfolio_flexibility_mw": 0.0504,
+      "preconditionedBinarySettings": {
+        "maxCurrentMeasurementAgeMinutes": 30,
+        "minSamples": 2,
+        "requireLatestOn": true,
+        "minOnRatio": 0.8,
+        "stateToleranceW": 100,
+        "missingMeasurementPolicy": "skip_asset"
+      },
+      "preconditioningSettings": {
+        "enabled": true,
+        "prepareStart": "14:00",
+        "flexibilityStart": "17:00",
+        "maintainUntil": "20:00",
+        "releaseAction": "force_off",
+        "ownerTag": "strategy_12"
+      },
+      "weatherGateSettings": {
+        "enabled": false,
+        "source": "flexibility.temperature.forecast",
+        "temperatureThresholdC": 24.0,
+        "evaluationStart": "17:00",
+        "evaluationEnd": "20:00",
+        "aggregation": "max",
+        "missingForecastPolicy": "skip_preconditioning"
+      },
+      "time_slots": [
+        {
+          "name": "Pre-conditioning (configuration only)",
+          "start": "14:00",
+          "end": "17:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0,
+          "is_preheat_period": true,
+          "control_note": "Configuration-only marker. This does not trigger flexi_actuator.py or send force_on in production; no pre-conditioning scheduler is implemented."
+        },
+        {
+          "name": "Evening Peak Flex (preconditioned_binary)",
+          "start": "17:00",
+          "end": "20:00",
+          "flexibility_mw": 0.0504,
+          "bid_price": 11.5,
+          "activation_cost": 0.8,
+          "target_window": true,
+          "target_flexibility_mw": 0.0504,
+          "target_note": "Maximum nominal binary portfolio target (36.0 + 8.4 + 6.0 = 50.4 kW). The preconditioned_binary gate and discrete allocator reduce the recommended bid to the achievable binary combination based on measured ON availability."
+        },
+        {
+          "name": "Off-window (no bid)",
+          "start": "20:00",
+          "end": "14:00",
+          "flexibility_mw": 0.0,
+          "bid_price": 0.0,
+          "activation_cost": 0.0
+        }
       ]
     }
   }

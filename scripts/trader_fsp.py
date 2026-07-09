@@ -754,10 +754,17 @@ def resolve_strategy_flexibility_method(strategy, logger):
         "recent-profile": "recent_profile",
         "recentprofile": "recent_profile",
         "profile": "recent_profile",
+        "preconditioned-binary": "preconditioned_binary",
+        "preconditionedbinary": "preconditioned_binary",
     }
     method = aliases.get(method, method)
 
-    if method not in {"historical", "persistence", "recent_profile"}:
+    if method not in {
+        "historical",
+        "persistence",
+        "recent_profile",
+        "preconditioned_binary",
+    }:
         logger.warning(
             "Unknown flexibility_method=%s for strategy %s; using historical",
             raw_method,
@@ -1058,7 +1065,11 @@ if __name__ == "__main__":
     # Methods that pre-compute a real-time per-asset availability gate
     # (e.g. persistence for strategy_8/9, recent_profile for strategy_10).
     # Both feed the same portfolio-scoped activation pipeline via bid records.
-    gated_flexibility_methods = {"persistence", "recent_profile"}
+    gated_flexibility_methods = {
+        "persistence",
+        "recent_profile",
+        "preconditioned_binary",
+    }
     use_persistence_flexibility = (
         strategy_flexibility_method in gated_flexibility_methods
         if use_strategy_mode
@@ -1081,6 +1092,24 @@ if __name__ == "__main__":
                 flex_forecaster.recent_profile_active_threshold_w,
                 flex_forecaster.granularity,
                 flex_forecaster.max_current_measurement_age_minutes,
+            )
+        elif flex_forecaster.method == "preconditioned_binary":
+            logger.info(
+                "Preconditioned-binary flexibility mode (strategy_12 / binary "
+                "ON/OFF state validation; not persistence and not q25): "
+                "settings_source=%s, target_slot_utc=%s, "
+                "maxCurrentMeasurementAgeMinutes=%s, minSamples=%s, "
+                "requireLatestOn=%s, minOnRatio=%.3f, stateToleranceW=%.1f, "
+                "sampleWindowMinutes=%s, missingMeasurementPolicy=%s",
+                flex_forecaster.preconditioned_binary_settings_source,
+                slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                flex_forecaster.preconditioned_binary_max_current_measurement_age_minutes,
+                flex_forecaster.preconditioned_binary_min_samples,
+                flex_forecaster.preconditioned_binary_require_latest_on,
+                flex_forecaster.preconditioned_binary_min_on_ratio,
+                flex_forecaster.preconditioned_binary_state_tolerance_w,
+                flex_forecaster.preconditioned_binary_sample_window_minutes,
+                flex_forecaster.preconditioned_binary_missing_measurement_policy,
             )
         else:
             logger.info(

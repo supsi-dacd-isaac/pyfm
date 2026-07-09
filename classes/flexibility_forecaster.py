@@ -71,6 +71,127 @@ def resolve_recent_profile_settings(
     }
 
 
+def resolve_preconditioned_binary_settings(
+    main_cfg: dict,
+    strategy_config: Optional[dict] = None,
+    strategy_id: Optional[str] = None,
+    logger=None,
+    persistence_missing_measurement_policy: str = "skip_asset",
+    max_current_measurement_age_minutes: int = 30,
+    granularity: int = 15,
+) -> Dict:
+    """
+    Resolve strategy-owned settings for the ``preconditioned_binary`` method.
+
+    Priority:
+    1. strategy_config.preconditionedBinarySettings (bidding_strategies.<id>)
+    2. flexibility.preconditionedBinarySettings (legacy global fallback, warned)
+    3. Built-in defaults
+
+    The method is *binary state validation*, so it deliberately shares nothing
+    with the recent-profile / q25 machinery: there is no quantile, no
+    continuous/discrete factor and no adaptive lookback here.
+
+    Configuration is validated defensively. Invalid values raise ``ValueError``
+    rather than being silently coerced to unsafe defaults.
+
+    Returns a dict of normalized settings plus a ``source`` key describing
+    where the raw configuration was loaded from.
+    """
+    strategy_settings = (strategy_config or {}).get("preconditionedBinarySettings")
+    global_settings = main_cfg.get("flexibility", {}).get(
+        "preconditionedBinarySettings"
+    )
+
+    if strategy_settings:
+        raw = strategy_settings
+        if strategy_id:
+            source = (
+                f"bidding_strategies.{strategy_id}.preconditionedBinarySettings"
+            )
+        else:
+            source = "strategy.preconditionedBinarySettings"
+    elif global_settings:
+        raw = global_settings
+        source = "flexibility.preconditionedBinarySettings"
+        if logger is not None:
+            logger.warning(
+                "preconditionedBinarySettings not found on strategy %s; "
+                "falling back to legacy global "
+                "flexibility.preconditionedBinarySettings",
+                strategy_id or "unknown",
+            )
+    else:
+        raw = {}
+        source = "defaults"
+        if logger is not None and strategy_id:
+            logger.warning(
+                "preconditionedBinarySettings not found for strategy %s or "
+                "globally; using built-in defaults",
+                strategy_id,
+            )
+
+    def _fail(message: str):
+        raise ValueError(
+            f"Invalid preconditionedBinarySettings ({source}): {message}"
+        )
+
+    try:
+        max_age = int(
+            raw.get(
+                "maxCurrentMeasurementAgeMinutes",
+                max_current_measurement_age_minutes,
+            )
+        )
+        min_samples = int(raw.get("minSamples", 2))
+        min_on_ratio = float(raw.get("minOnRatio", 0.8))
+        state_tolerance_w = float(raw.get("stateToleranceW", 100))
+    except (TypeError, ValueError) as exc:
+        _fail(f"non-numeric value ({exc})")
+
+    require_latest_on = bool(raw.get("requireLatestOn", True))
+    missing_policy = raw.get(
+        "missingMeasurementPolicy", persistence_missing_measurement_policy
+    )
+
+    if max_age <= 0:
+        _fail("maxCurrentMeasurementAgeMinutes must be > 0")
+    if min_samples < 1:
+        _fail("minSamples must be >= 1")
+    if not (0.0 <= min_on_ratio <= 1.0):
+        _fail("minOnRatio must be within [0, 1]")
+    if state_tolerance_w < 0:
+        _fail("stateToleranceW must be >= 0")
+    if missing_policy not in ("skip_asset", "fail_portfolio"):
+        _fail(
+            "missingMeasurementPolicy must be 'skip_asset' or 'fail_portfolio'"
+        )
+
+    # The recent-sample window is not part of the documented settings block;
+    # derive a sensible default that always leaves room for `minSamples`
+    # grouped samples while remaining at least as long as the freshness
+    # window. An explicit `sampleWindowMinutes` override is honored when given.
+    granularity = int(granularity) if granularity else 15
+    default_window = max(int(max_age), int(min_samples) * granularity)
+    try:
+        sample_window = int(raw.get("sampleWindowMinutes", default_window))
+    except (TypeError, ValueError) as exc:
+        _fail(f"non-numeric sampleWindowMinutes ({exc})")
+    if sample_window <= 0:
+        _fail("sampleWindowMinutes must be > 0")
+
+    return {
+        "source": source,
+        "max_current_measurement_age_minutes": max_age,
+        "min_samples": min_samples,
+        "require_latest_on": require_latest_on,
+        "min_on_ratio": min_on_ratio,
+        "state_tolerance_w": state_tolerance_w,
+        "missing_measurement_policy": missing_policy,
+        "sample_window_minutes": sample_window,
+    }
+
+
 def _recent_profile_quantile_label(quantile: float) -> str:
     return f"q{int(round(quantile * 100))}"
 
@@ -450,6 +571,41 @@ class FlexibilityForecaster:
                     ),
                 )
             )
+
+        # Preconditioned-binary settings are strategy-owned (strategy_12+).
+        # They gate binary ON/OFF heat pumps and are loaded only when the
+        # active method is preconditioned_binary.
+        self.preconditioned_binary_settings_source = None
+        self.preconditioned_binary_max_current_measurement_age_minutes = (
+            self.max_current_measurement_age_minutes
+        )
+        self.preconditioned_binary_min_samples = 2
+        self.preconditioned_binary_require_latest_on = True
+        self.preconditioned_binary_min_on_ratio = 0.8
+        self.preconditioned_binary_state_tolerance_w = 100.0
+        self.preconditioned_binary_missing_measurement_policy = (
+            self.persistence_missing_measurement_policy
+        )
+        self.preconditioned_binary_sample_window_minutes = max(
+            self.max_current_measurement_age_minutes,
+            2 * self.granularity,
+        )
+        if self.method == "preconditioned_binary":
+            self._load_preconditioned_binary_settings(
+                resolve_preconditioned_binary_settings(
+                    main_cfg=main_cfg,
+                    strategy_config=strategy_config,
+                    strategy_id=strategy_id,
+                    logger=logger,
+                    persistence_missing_measurement_policy=(
+                        self.persistence_missing_measurement_policy
+                    ),
+                    max_current_measurement_age_minutes=(
+                        self.max_current_measurement_age_minutes
+                    ),
+                    granularity=self.granularity,
+                )
+            )
         
         # Temperature configuration
         temp_cfg = flex_cfg.get("temperature", {})
@@ -511,6 +667,21 @@ class FlexibilityForecaster:
                 self.recent_profile_min_samples,
                 self.recent_profile_missing_measurement_policy,
                 self.max_current_measurement_age_minutes,
+            )
+        elif self.method == "preconditioned_binary":
+            self.logger.info(
+                "Preconditioned-binary flexibility settings (source=%s): "
+                "maxCurrentMeasurementAgeMinutes=%s, minSamples=%s, "
+                "requireLatestOn=%s, minOnRatio=%.3f, stateToleranceW=%.1f, "
+                "missingMeasurementPolicy=%s, sampleWindowMinutes=%s",
+                self.preconditioned_binary_settings_source,
+                self.preconditioned_binary_max_current_measurement_age_minutes,
+                self.preconditioned_binary_min_samples,
+                self.preconditioned_binary_require_latest_on,
+                self.preconditioned_binary_min_on_ratio,
+                self.preconditioned_binary_state_tolerance_w,
+                self.preconditioned_binary_missing_measurement_policy,
+                self.preconditioned_binary_sample_window_minutes,
             )
         
         if self.temperature_enabled:
@@ -1338,6 +1509,64 @@ class FlexibilityForecaster:
         self.recent_profile_adaptive_lookback = (
             adaptive_lookback if isinstance(adaptive_lookback, dict) else {}
         )
+
+    def _load_preconditioned_binary_settings(self, settings: Dict) -> None:
+        """Apply normalized preconditioned-binary settings onto this forecaster."""
+        self.preconditioned_binary_settings_source = settings["source"]
+        self.preconditioned_binary_max_current_measurement_age_minutes = settings[
+            "max_current_measurement_age_minutes"
+        ]
+        self.preconditioned_binary_min_samples = settings["min_samples"]
+        self.preconditioned_binary_require_latest_on = settings["require_latest_on"]
+        self.preconditioned_binary_min_on_ratio = settings["min_on_ratio"]
+        self.preconditioned_binary_state_tolerance_w = settings["state_tolerance_w"]
+        self.preconditioned_binary_missing_measurement_policy = settings[
+            "missing_measurement_policy"
+        ]
+        self.preconditioned_binary_sample_window_minutes = settings[
+            "sample_window_minutes"
+        ]
+
+    @staticmethod
+    def _classify_binary_state(
+        value_w: Optional[float],
+        off_state_w: float,
+        on_state_w: float,
+        tolerance_w: float,
+    ) -> str:
+        """
+        Classify a single power measurement (in W) against a binary asset's
+        configured OFF/ON states (also in W) within ``tolerance_w``.
+
+        Returns one of ``"on"``, ``"off"`` or ``"invalid"``. A value that does
+        not fall within tolerance of either configured state is *invalid* and
+        must never be rounded to the nearest state or treated as partial
+        availability.
+        """
+        if value_w is None:
+            return "invalid"
+        try:
+            value_w = float(value_w)
+        except (TypeError, ValueError):
+            return "invalid"
+        if not np.isfinite(value_w):
+            return "invalid"
+
+        distance_off = abs(value_w - off_state_w)
+        distance_on = abs(value_w - on_state_w)
+        within_off = distance_off <= tolerance_w
+        within_on = distance_on <= tolerance_w
+
+        if within_on and within_off:
+            # Overlapping tolerance windows (states closer than the tolerance):
+            # attribute to the nearest configured state, favoring OFF on ties
+            # so ambiguous samples never inflate availability.
+            return "on" if distance_on < distance_off else "off"
+        if within_on:
+            return "on"
+        if within_off:
+            return "off"
+        return "invalid"
 
     def _is_recent_profile_continuous_asset(
         self,
@@ -2184,6 +2413,271 @@ class FlexibilityForecaster:
 
         return breakdown
 
+    def _get_asset_flexibility_breakdown_preconditioned_binary(
+        self,
+        period_from: datetime,
+        current_time_utc: Optional[datetime] = None,
+        asset_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Dict]:
+        """
+        Binary state-validation flexibility breakdown (used by strategy_12).
+
+        For each selected binary heat pump:
+        1. read the configured discrete states and require *exactly two* usable
+           states -> OFF = min(states), ON = max(states);
+        2. read the recent grouped measurement window;
+        3. require the latest sample to be fresh
+           (<= maxCurrentMeasurementAgeMinutes);
+        4. classify every sample as ON / OFF / invalid within stateToleranceW;
+        5. require at least ``minSamples`` valid (ON or OFF) classified samples;
+        6. when ``requireLatestOn`` is set, require the latest sample to be ON;
+        7. require ``on_ratio >= minOnRatio`` over the valid classified samples;
+        8. if every gate passes, offer exactly ``ON - OFF`` kW, else 0.0 kW.
+
+        This is deliberately *not* recent-profile forecasting: there is no
+        quantile, no expected/average power, and no continuous/discrete factor.
+        The delivered flexibility is always 0 or the full binary block.
+
+        The returned dict mirrors the persistence breakdown shape so that
+        downstream consumers (trader_fsp logging, bid records, flexi_manager
+        activation) can be reused unchanged.
+        """
+        if current_time_utc is None:
+            current_time_utc = datetime.utcnow()
+
+        sample_window_minutes = self.preconditioned_binary_sample_window_minutes
+        max_age_minutes = (
+            self.preconditioned_binary_max_current_measurement_age_minutes
+        )
+        min_samples = self.preconditioned_binary_min_samples
+        min_on_ratio = self.preconditioned_binary_min_on_ratio
+        tolerance_w = self.preconditioned_binary_state_tolerance_w
+        require_latest_on = self.preconditioned_binary_require_latest_on
+        missing_policy = self.preconditioned_binary_missing_measurement_policy
+
+        selected_asset_ids = asset_ids or list(self.asset_capacities.keys())
+        breakdown: Dict[str, Dict] = {}
+        target_slot_utc = pd.Timestamp(period_from, tz="UTC")
+        window_end_utc = pd.Timestamp(current_time_utc, tz="UTC")
+        window_start_utc = window_end_utc - pd.Timedelta(
+            minutes=sample_window_minutes
+        )
+        current_naive = window_end_utc.tz_convert("UTC").tz_localize(None)
+
+        for asset_id in selected_asset_ids:
+            mapping = self.asset_mapping.get(asset_id, {})
+            if not isinstance(mapping, dict):
+                self.logger.warning(
+                    "Skipping preconditioned-binary flexibility for %s: legacy "
+                    "asset_mapping entry is not supported",
+                    asset_id,
+                )
+                continue
+
+            asset_type = mapping.get("type", "unknown")
+            description = self.asset_descriptions.get(asset_id, asset_id)
+            nominal_power_w = mapping.get("nominal_power_w")
+
+            # Require exactly two distinct usable binary states.
+            states_kw = self._get_discrete_states(asset_id)
+            distinct_states = sorted(
+                {float(s) for s in states_kw if s is not None}
+            ) if states_kw else []
+            if len(distinct_states) != 2:
+                self.logger.warning(
+                    "Skipping preconditioned-binary flexibility for %s: exactly "
+                    "two discrete states are required, got %s",
+                    asset_id,
+                    states_kw,
+                )
+                continue
+            off_state_kw, on_state_kw = distinct_states[0], distinct_states[1]
+            off_state_w = off_state_kw * 1000.0
+            on_state_w = on_state_kw * 1000.0
+            block_kw = on_state_kw - off_state_kw
+            if block_kw <= 0:
+                self.logger.warning(
+                    "Skipping preconditioned-binary flexibility for %s: "
+                    "ON-OFF block is non-positive (off=%.3f kW, on=%.3f kW)",
+                    asset_id,
+                    off_state_kw,
+                    on_state_kw,
+                )
+                continue
+
+            self.logger.info(
+                "Preconditioned-binary flexibility asset=%s target_slot_utc=%s "
+                "off_state=%.3f kW on_state=%.3f kW sample_window=[%s, %s] "
+                "tolerance=%.1f W",
+                asset_id,
+                target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                off_state_kw,
+                on_state_kw,
+                window_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                window_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                tolerance_w,
+            )
+
+            series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=window_start_utc.to_pydatetime(),
+                end_time_utc=window_end_utc.to_pydatetime(),
+            )
+            if series is None:
+                self.logger.warning(
+                    "Skipping preconditioned-binary flexibility for asset=%s "
+                    "target_slot=%s: measurement query failed",
+                    asset_id,
+                    target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                if missing_policy == "fail_portfolio":
+                    return {}
+                continue
+
+            series = series.dropna().astype(float)
+            series = series.sort_index()
+
+            # --- Freshness / missing-data gate (latest sample) ---
+            latest_ts = None
+            latest_value_w = None
+            latest_age_minutes = None
+            if not series.empty:
+                latest_ts = series.index[-1]
+                latest_value_w = float(series.iloc[-1])
+                latest_naive = latest_ts.tz_convert("UTC").tz_localize(None)
+                latest_age_minutes = (
+                    current_naive - latest_naive
+                ).total_seconds() / 60.0
+
+            # --- Classify samples ---
+            classifications = [
+                self._classify_binary_state(
+                    value_w, off_state_w, on_state_w, tolerance_w
+                )
+                for value_w in series.tolist()
+            ]
+            valid_states = [c for c in classifications if c in ("on", "off")]
+            valid_sample_count = len(valid_states)
+            on_sample_count = sum(1 for c in valid_states if c == "on")
+            latest_state = classifications[-1] if classifications else "invalid"
+            on_ratio = (
+                on_sample_count / valid_sample_count
+                if valid_sample_count > 0
+                else 0.0
+            )
+            latest_on_result = latest_state == "on"
+
+            # --- Sequential availability gates ---
+            rejection_reason = None
+            if series.empty or latest_ts is None:
+                rejection_reason = "missing_telemetry"
+            elif (
+                latest_age_minutes is None
+                or latest_age_minutes > max_age_minutes
+            ):
+                rejection_reason = "stale_measurement"
+            elif valid_sample_count < min_samples:
+                rejection_reason = "insufficient_samples"
+            elif require_latest_on and not latest_on_result:
+                rejection_reason = "latest_not_on"
+            elif on_ratio < min_on_ratio:
+                rejection_reason = "on_ratio_below_threshold"
+
+            is_available = rejection_reason is None
+            available_flexibility_kw = block_kw if is_available else 0.0
+            available_flexibility_w = available_flexibility_kw * 1000.0
+
+            self.logger.info(
+                "Preconditioned-binary flexibility asset=%s target_slot_utc=%s "
+                "latest=%s W @ %s age=%s min fresh=%s valid_samples=%d "
+                "on_samples=%d on_ratio=%.3f latest_state=%s "
+                "require_latest_on=%s available=%.3f kW%s",
+                asset_id,
+                target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                f"{latest_value_w:.1f}" if latest_value_w is not None else "N/A",
+                latest_ts.strftime("%Y-%m-%dT%H:%M:%SZ") if latest_ts is not None else "N/A",
+                f"{latest_age_minutes:.1f}" if latest_age_minutes is not None else "N/A",
+                (
+                    latest_age_minutes is not None
+                    and latest_age_minutes <= max_age_minutes
+                ),
+                valid_sample_count,
+                on_sample_count,
+                on_ratio,
+                latest_state,
+                require_latest_on,
+                available_flexibility_kw,
+                f" rejected:{rejection_reason}" if rejection_reason else "",
+            )
+
+            breakdown[asset_id] = {
+                "description": description,
+                "asset_type": asset_type,
+                "nominal_capacity_kw": (
+                    float(nominal_power_w) / 1000
+                    if nominal_power_w is not None
+                    else on_state_kw
+                ),
+                # Persistence-shaped keys reused by downstream consumers. The
+                # ON state doubles as the "baseline"/reference for a binary HP.
+                "typical_load_kw": on_state_kw,
+                "baseline_power_w": on_state_w,
+                "baseline_source_time_utc": window_start_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "flexibility_persistence_go_back_minutes": sample_window_minutes,
+                "current_measured_power_w": (
+                    latest_value_w if latest_value_w is not None else 0.0
+                ),
+                "gate_measurement_time_utc": (
+                    latest_ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+                    if latest_ts is not None
+                    else "N/A"
+                ),
+                "current_measurement_age_minutes": latest_age_minutes,
+                "active_threshold_w": None,
+                "is_currently_active": latest_on_result,
+                "safety_factor": 1.0,
+                "flexibility_factor": 1.0,
+                "nominal_power_w": (
+                    float(nominal_power_w)
+                    if nominal_power_w is not None
+                    else on_state_w
+                ),
+                "occupancy_probability": None,
+                "available_flexibility_w": available_flexibility_w,
+                "available_flexibility_kw": available_flexibility_kw,
+                "max_flexibility_kw": block_kw,
+                "estimation_method": "preconditioned_binary",
+                "is_available_for_flexibility": bool(is_available),
+                # Preconditioned-binary-specific diagnostics:
+                "preconditioned_binary_settings_source": (
+                    self.preconditioned_binary_settings_source
+                ),
+                "preconditioned_binary_off_state_kw": off_state_kw,
+                "preconditioned_binary_on_state_kw": on_state_kw,
+                "preconditioned_binary_state_tolerance_w": tolerance_w,
+                "preconditioned_binary_valid_sample_count": valid_sample_count,
+                "preconditioned_binary_on_sample_count": on_sample_count,
+                "preconditioned_binary_on_ratio": on_ratio,
+                "preconditioned_binary_min_samples": min_samples,
+                "preconditioned_binary_min_on_ratio": min_on_ratio,
+                "preconditioned_binary_require_latest_on": require_latest_on,
+                "preconditioned_binary_latest_state": latest_state,
+                "preconditioned_binary_latest_on_result": latest_on_result,
+                "preconditioned_binary_sample_window_minutes": (
+                    sample_window_minutes
+                ),
+                "preconditioned_binary_max_current_measurement_age_minutes": (
+                    max_age_minutes
+                ),
+                "preconditioned_binary_rejection_reason": rejection_reason,
+                "target_slot_utc": target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "aggregation_resolution_minutes": self.granularity,
+            }
+
+        return breakdown
+
     def get_asset_flexibility_breakdown(
         self, 
         period_from: datetime,
@@ -2213,6 +2707,13 @@ class FlexibilityForecaster:
 
         if self.method == "recent_profile":
             return self._get_asset_flexibility_breakdown_recent_profile(
+                period_from=period_from,
+                current_time_utc=current_time_utc,
+                asset_ids=asset_ids,
+            )
+
+        if self.method == "preconditioned_binary":
+            return self._get_asset_flexibility_breakdown_preconditioned_binary(
                 period_from=period_from,
                 current_time_utc=current_time_utc,
                 asset_ids=asset_ids,
@@ -2508,7 +3009,11 @@ class FlexibilityForecaster:
         # availability as the discrete ON state, rather than the nominal
         # capacity. This is the path used by strategy_8/9 (persistence) and
         # strategy_10 (recent_profile).
-        is_gated_method = self.method in ("persistence", "recent_profile")
+        is_gated_method = self.method in (
+            "persistence",
+            "recent_profile",
+            "preconditioned_binary",
+        )
 
         for asset_id, info in breakdown.items():
             mod_type = self._get_modulation_type(asset_id)
