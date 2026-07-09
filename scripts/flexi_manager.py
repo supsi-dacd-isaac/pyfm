@@ -3986,6 +3986,1141 @@ class FlexibilityManager:
             "asset_details": list(asset_details.values()),
         }
 
+    # ------------------------------------------------------------------
+    # Strategy-12 maintained prepared portfolio lifecycle (Step 3)
+    #
+    # The manager is the single owner of ON/OFF intent for the strategy's
+    # binary heat pumps during the strategy-controlled window:
+    #
+    #   before prepareStart      -> idle       (no lifecycle commands)
+    #   prepareStart..flexStart  -> prepare    (all scope assets desired ON)
+    #   flexStart..maintainUntil -> maintain   (selected-for-delivery OFF,
+    #                                            everything else ON)
+    #   >= maintainUntil         -> release    (all owned assets OFF, cleared)
+    #
+    # This is schedule-driven and strategy-scoped, and is intentionally kept
+    # separate from the price-driven autonomous pre-activation subsystem.
+    # ------------------------------------------------------------------
+
+    _PRECONDITIONING_STATES = ("prepared", "controlled")
+    _PRECONDITIONING_WEATHER_GATE_PREFIX = "__preconditioning_weather_gate__:"
+
+    # Command transport statuses treated as "the command was accepted"
+    # (mirrors run()'s success set at the activation-tail).
+    _COMMAND_SUCCESS_STATUSES = ("success", "simulated", "queued")
+
+    @staticmethod
+    def _parse_hhmm_to_minutes(value: str) -> int:
+        """Parse an ``"HH:MM"`` string into minutes since midnight."""
+        if not isinstance(value, str):
+            raise ValueError(f"time value must be a string, got {value!r}")
+        parts = value.strip().split(":")
+        if len(parts) != 2:
+            raise ValueError(f"invalid HH:MM time value: {value!r}")
+        try:
+            hours = int(parts[0])
+            minutes = int(parts[1])
+        except ValueError:
+            raise ValueError(f"invalid HH:MM time value: {value!r}")
+        if not (0 <= hours <= 23 and 0 <= minutes <= 59):
+            raise ValueError(f"HH:MM time value out of range: {value!r}")
+        return hours * 60 + minutes
+
+    def _parse_preconditioning_settings(self, raw: Dict, strategy_id: str) -> Optional[Dict]:
+        """Validate and parse a strategy's ``preconditioningSettings`` block.
+
+        Returns a normalised settings dict, or ``None`` when the block is
+        absent or explicitly disabled.  Structurally invalid configuration
+        raises ``ValueError`` so the operator sees a clear failure instead of
+        silently mis-controlling assets.
+        """
+        if not raw:
+            return None
+        if not isinstance(raw, dict):
+            raise ValueError(
+                f"{strategy_id}.preconditioningSettings must be an object"
+            )
+
+        enabled = raw.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(
+                f"{strategy_id}.preconditioningSettings.enabled must be a boolean"
+            )
+        if not enabled:
+            return None
+
+        prepare_start = self._parse_hhmm_to_minutes(raw.get("prepareStart"))
+        flexibility_start = self._parse_hhmm_to_minutes(raw.get("flexibilityStart"))
+        maintain_until = self._parse_hhmm_to_minutes(raw.get("maintainUntil"))
+
+        if not (prepare_start < flexibility_start < maintain_until):
+            raise ValueError(
+                f"{strategy_id}.preconditioningSettings requires "
+                "prepareStart < flexibilityStart < maintainUntil "
+                f"(got {raw.get('prepareStart')}, {raw.get('flexibilityStart')}, "
+                f"{raw.get('maintainUntil')}); overnight windows are not supported"
+            )
+
+        release_action = raw.get("releaseAction", "force_off")
+        if release_action != "force_off":
+            raise ValueError(
+                f"{strategy_id}.preconditioningSettings.releaseAction must be "
+                f"'force_off' (got {release_action!r})"
+            )
+
+        owner_tag = raw.get("ownerTag", strategy_id)
+        if not isinstance(owner_tag, str) or not owner_tag:
+            raise ValueError(
+                f"{strategy_id}.preconditioningSettings.ownerTag must be a "
+                "non-empty string"
+            )
+
+        return {
+            "enabled": True,
+            "prepare_start_min": prepare_start,
+            "flexibility_start_min": flexibility_start,
+            "maintain_until_min": maintain_until,
+            "release_action": release_action,
+            "owner_tag": owner_tag,
+            "prepare_start": raw.get("prepareStart"),
+            "flexibility_start": raw.get("flexibilityStart"),
+            "maintain_until": raw.get("maintainUntil"),
+        }
+
+    def _parse_preconditioning_weather_gate_settings(
+        self,
+        raw: Optional[Dict],
+        strategy_id: str,
+        preconditioning_settings: Dict,
+    ) -> Dict:
+        """Validate Strategy-owned weather gate settings.
+
+        The gate is optional and defaults to disabled for backward
+        compatibility. When enabled, the threshold is compared against the
+        configured forecast window for the current lifecycle day.
+        """
+        source = f"bidding_strategies.{strategy_id}.weatherGateSettings"
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise ValueError(f"{source} must be an object")
+
+        enabled = raw.get("enabled", False)
+        if not isinstance(enabled, bool):
+            raise ValueError(f"{source}.enabled must be a boolean")
+        if not enabled:
+            return {
+                "enabled": False,
+                "source": raw.get("source", "flexibility.temperature.forecast"),
+                "settings_source": source,
+            }
+
+        try:
+            threshold_c = float(raw.get("temperatureThresholdC"))
+        except (TypeError, ValueError):
+            raise ValueError(f"{source}.temperatureThresholdC must be numeric")
+        if not math.isfinite(threshold_c):
+            raise ValueError(f"{source}.temperatureThresholdC must be finite")
+
+        evaluation_start = raw.get(
+            "evaluationStart", preconditioning_settings["flexibility_start"]
+        )
+        evaluation_end = raw.get(
+            "evaluationEnd", preconditioning_settings["maintain_until"]
+        )
+        evaluation_start_min = self._parse_hhmm_to_minutes(evaluation_start)
+        evaluation_end_min = self._parse_hhmm_to_minutes(evaluation_end)
+        if evaluation_start_min >= evaluation_end_min:
+            raise ValueError(
+                f"{source} requires evaluationStart < evaluationEnd "
+                f"(got {evaluation_start!r}, {evaluation_end!r})"
+            )
+
+        aggregation = raw.get("aggregation", "max")
+        if aggregation not in ("max", "mean"):
+            raise ValueError(f"{source}.aggregation must be 'max' or 'mean'")
+
+        missing_policy = raw.get("missingForecastPolicy", "skip_preconditioning")
+        if missing_policy not in ("skip_preconditioning", "fail"):
+            raise ValueError(
+                f"{source}.missingForecastPolicy must be "
+                "'skip_preconditioning' or 'fail'"
+            )
+
+        return {
+            "enabled": True,
+            "settings_source": source,
+            "source": raw.get("source", "flexibility.temperature.forecast"),
+            "temperature_threshold_c": threshold_c,
+            "evaluation_start": evaluation_start,
+            "evaluation_end": evaluation_end,
+            "evaluation_start_min": evaluation_start_min,
+            "evaluation_end_min": evaluation_end_min,
+            "aggregation": aggregation,
+            "missing_forecast_policy": missing_policy,
+            "constant_temperature_c": raw.get("constantTemperatureC"),
+            "file": raw.get("file"),
+        }
+
+    def _resolve_active_strategy_id(self, fallback_strategy: Optional[str] = None) -> Optional[str]:
+        """Resolve the strategy that is *active* for this FSP.
+
+        Authoritative order (mirrors ``trader_fsp.py``):
+          1. explicit override (``--fallback-strategy`` on the manager);
+          2. the FSP config ``strategy`` field.
+
+        A strategy merely *existing* in ``bidding_strategies`` never makes it
+        active; it must be selected for this FSP.
+        """
+        if fallback_strategy:
+            return fallback_strategy
+        configured = self.fsp_config.get("strategy")
+        if configured:
+            return configured
+        return None
+
+    def _resolve_preconditioning_context(
+        self, fallback_strategy: Optional[str] = None
+    ) -> Optional[Dict]:
+        """Resolve the preconditioning lifecycle context for this FSP.
+
+        Returns ``None`` when the active strategy has no enabled
+        ``preconditioningSettings`` block, meaning the lifecycle is inactive
+        and ``run()`` proceeds with its normal activation flow.
+        """
+        active_strategy_id = self._resolve_active_strategy_id(fallback_strategy)
+        if not active_strategy_id:
+            return None
+
+        strategies_cfg = self.config.get("bidding_strategies", {})
+        strategy_cfg = strategies_cfg.get(active_strategy_id)
+        if not strategy_cfg:
+            return None
+
+        settings = self._parse_preconditioning_settings(
+            strategy_cfg.get("preconditioningSettings"),
+            active_strategy_id,
+        )
+        if not settings:
+            return None
+        weather_gate_settings = self._parse_preconditioning_weather_gate_settings(
+            strategy_cfg.get("weatherGateSettings"),
+            active_strategy_id,
+            settings,
+        )
+
+        # Scope strictly to the active strategy's allowed assets (assets_filter
+        # intersected with asset_types), never the full FSP/asset_mapping set.
+        strategy_obj = self.strategy_manager.get_strategy(active_strategy_id)
+        scope_assets = [
+            a for a in (strategy_obj.allowed_assets if strategy_obj else [])
+            if a in self.asset_mapping
+        ]
+
+        return {
+            "strategy_id": active_strategy_id,
+            "owner_tag": settings["owner_tag"],
+            "settings": settings,
+            "weather_gate_settings": weather_gate_settings,
+            "scope_assets": scope_assets,
+        }
+
+    def _resolve_preconditioning_phase(self, slot_start: datetime, settings: Dict) -> str:
+        """Map the current slot time to a lifecycle phase.
+
+        Uses the manager's existing UTC-naive slot time basis (see
+        ``get_target_slot``); the configured ``HH:MM`` boundaries are compared
+        against the slot's minutes-of-day on that same basis.
+        """
+        minutes_of_day = slot_start.hour * 60 + slot_start.minute
+        if minutes_of_day < settings["prepare_start_min"]:
+            return "idle"
+        if minutes_of_day < settings["flexibility_start_min"]:
+            return "prepare"
+        if minutes_of_day < settings["maintain_until_min"]:
+            return "maintain"
+        return "release"
+
+    def _is_owned_by_preconditioning(
+        self, previous_state: Dict, asset_id: str, owner_tag: str
+    ) -> bool:
+        """Return True when ``asset_id`` is currently owned by this lifecycle."""
+        meta = previous_state.get(asset_id)
+        if not isinstance(meta, dict):
+            return False
+        if meta.get("state") not in self._PRECONDITIONING_STATES:
+            return False
+        return meta.get("owner") == owner_tag
+
+    def _compute_preconditioning_desired_state(
+        self,
+        phase: str,
+        scope_assets: List[str],
+        selected_off: set,
+        previous_state: Dict,
+        owner_tag: str,
+    ) -> Dict[str, str]:
+        """Core lifecycle oracle: desired ON/OFF per scope asset.
+
+        Returns a mapping of ``asset_id -> "ON"|"OFF"``.  Assets that must be
+        left untouched are simply omitted from the mapping.
+        """
+        desired: Dict[str, str] = {}
+
+        if phase in ("prepare", "maintain"):
+            for asset_id in scope_assets:
+                # During 14:00-20:00 every scope asset is owned by the
+                # lifecycle: selected-for-delivery -> OFF, otherwise ON.
+                if phase == "maintain" and asset_id in selected_off:
+                    desired[asset_id] = "OFF"
+                else:
+                    desired[asset_id] = "ON"
+        elif phase in ("release", "idle"):
+            # Release: all currently-owned scope assets are switched OFF and
+            # ownership is cleared.  Idle only ever touches leftover ownership
+            # (e.g. a missed release after a restart); unowned assets are never
+            # touched before prepareStart.
+            for asset_id in scope_assets:
+                if self._is_owned_by_preconditioning(previous_state, asset_id, owner_tag):
+                    desired[asset_id] = "OFF"
+
+        return desired
+
+    def _preconditioning_weather_gate_key(self, strategy_id: str) -> str:
+        return f"{self._PRECONDITIONING_WEATHER_GATE_PREFIX}{strategy_id}"
+
+    def _preconditioning_day(self, slot_start: datetime) -> str:
+        return slot_start.date().isoformat()
+
+    def _stored_preconditioning_weather_gate(
+        self,
+        previous_state: Dict,
+        strategy_id: str,
+        gate_date: str,
+    ) -> Optional[Dict]:
+        meta = previous_state.get(self._preconditioning_weather_gate_key(strategy_id))
+        if not isinstance(meta, dict):
+            return None
+        if meta.get("date") != gate_date:
+            return None
+        return meta
+
+    def _has_preconditioning_ownership(
+        self, previous_state: Dict, scope_assets: List[str], owner_tag: str
+    ) -> bool:
+        return any(
+            self._is_owned_by_preconditioning(previous_state, asset_id, owner_tag)
+            for asset_id in scope_assets
+        )
+
+    @staticmethod
+    def _is_valid_temperature_value(value) -> bool:
+        if value is None:
+            return False
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(numeric)
+
+    @staticmethod
+    def _parse_weather_forecast_timestamp(value) -> Optional[datetime]:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+        return parsed.replace(second=0, microsecond=0)
+
+    def _weather_gate_window_bounds(
+        self, slot_start: datetime, settings: Dict
+    ) -> Tuple[datetime, datetime]:
+        day = slot_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        start = day + timedelta(minutes=settings["evaluation_start_min"])
+        end = day + timedelta(minutes=settings["evaluation_end_min"])
+        return start, end
+
+    def _weather_gate_source_config(self, settings: Dict) -> Tuple[str, Dict]:
+        temp_cfg = self.config.get("flexibility", {}).get("temperature", {})
+        forecast_cfg = dict(temp_cfg.get("forecast", {}) or {})
+        configured_source = settings.get("source") or "flexibility.temperature.forecast"
+        if configured_source == "flexibility.temperature.forecast":
+            source_type = forecast_cfg.get("type", "constant")
+        else:
+            source_type = configured_source
+            forecast_cfg.setdefault("type", source_type)
+        return source_type, {
+            "temperature_enabled": bool(temp_cfg.get("enabled", False)),
+            "forecast": forecast_cfg,
+        }
+
+    def _load_weather_gate_forecast_values(
+        self,
+        slot_start: datetime,
+        settings: Dict,
+    ) -> Tuple[List[float], str, str]:
+        """Return forecast values in Celsius for the configured gate window."""
+        source_type, source_cfg = self._weather_gate_source_config(settings)
+        forecast_cfg = source_cfg["forecast"]
+        if not source_cfg["temperature_enabled"]:
+            return [], source_type, "missing_forecast"
+
+        window_start, window_end = self._weather_gate_window_bounds(slot_start, settings)
+        if source_type == "constant":
+            raw_value = settings.get("constant_temperature_c")
+            if raw_value is None:
+                raw_value = forecast_cfg.get("value", forecast_cfg.get("constant"))
+            if not self._is_valid_temperature_value(raw_value):
+                return [], source_type, "invalid_forecast"
+            granularity = int(self.config.get("fm", {}).get("granularity", 15) or 15)
+            count = max(
+                1,
+                int((window_end - window_start).total_seconds() // (granularity * 60)),
+            )
+            return [float(raw_value)] * count, source_type, "ok"
+
+        if source_type == "file":
+            forecast_file = settings.get("file") or forecast_cfg.get("file")
+            if not forecast_file or not os.path.isfile(forecast_file):
+                return [], source_type, "missing_forecast"
+            try:
+                with open(forecast_file, "r") as fh:
+                    forecast_data = json.load(fh)
+            except Exception:
+                return [], source_type, "invalid_forecast"
+
+            values = []
+            invalid_seen = False
+            for entry in forecast_data.get("forecast", []):
+                if not isinstance(entry, dict):
+                    invalid_seen = True
+                    continue
+                timestamp = self._parse_weather_forecast_timestamp(
+                    entry.get("timestamp")
+                )
+                if timestamp is None:
+                    invalid_seen = True
+                    continue
+                if not (window_start <= timestamp < window_end):
+                    continue
+                raw_temp = entry.get("temperature")
+                if not self._is_valid_temperature_value(raw_temp):
+                    invalid_seen = True
+                    continue
+                values.append(float(raw_temp))
+            if invalid_seen:
+                return [], source_type, "invalid_forecast"
+            if not values:
+                return [], source_type, "missing_forecast"
+            return values, source_type, "ok"
+
+        # Historical average support exists in FlexibilityForecaster, but the
+        # manager has no historical temperature cache here. Treat it as missing
+        # unless a deterministic forecast file/source is provided.
+        return [], source_type, "missing_forecast"
+
+    def _evaluate_preconditioning_weather_gate(
+        self,
+        settings: Dict,
+        slot_start: datetime,
+    ) -> Dict:
+        if not settings.get("enabled"):
+            return {
+                "enabled": False,
+                "decision": "open",
+                "reason": "disabled",
+                "source": settings.get("source", "flexibility.temperature.forecast"),
+            }
+
+        window_start, window_end = self._weather_gate_window_bounds(slot_start, settings)
+        values, source_type, load_status = self._load_weather_gate_forecast_values(
+            slot_start, settings
+        )
+        result = {
+            "enabled": True,
+            "decision": "closed",
+            "reason": load_status,
+            "source": source_type,
+            "evaluation_start": settings["evaluation_start"],
+            "evaluation_end": settings["evaluation_end"],
+            "evaluation_window": {
+                "start": _format_aem_utc(window_start),
+                "end": _format_aem_utc(window_end),
+            },
+            "aggregation": settings["aggregation"],
+            "aggregated_temperature_c": None,
+            "threshold_c": settings["temperature_threshold_c"],
+            "forecast_sample_count": len(values),
+            "forecast_values_c": values,
+            "missing_forecast_policy": settings["missing_forecast_policy"],
+        }
+        if load_status != "ok":
+            if load_status == "missing_forecast" and settings["missing_forecast_policy"] == "fail":
+                raise ValueError(
+                    "Strategy 12 weather gate forecast is unavailable and "
+                    "missingForecastPolicy is 'fail'"
+                )
+            return result
+
+        if settings["aggregation"] == "mean":
+            aggregated = sum(values) / len(values)
+        else:
+            aggregated = max(values)
+        result["aggregated_temperature_c"] = aggregated
+        if aggregated >= settings["temperature_threshold_c"]:
+            result["decision"] = "open"
+            result["reason"] = "threshold_met"
+        else:
+            result["reason"] = "threshold_not_met"
+        return result
+
+    def _weather_gate_summary_from_metadata(
+        self,
+        metadata: Dict,
+        settings: Dict,
+        reason: Optional[str] = None,
+    ) -> Dict:
+        summary = dict(metadata.get("result", {}) if isinstance(metadata, dict) else {})
+        summary["enabled"] = bool(settings.get("enabled"))
+        summary["decision"] = metadata.get("decision", summary.get("decision", "closed"))
+        summary["reason"] = reason or metadata.get("reason", summary.get("reason", "stored"))
+        summary["date"] = metadata.get("date")
+        summary["stable_daily_decision"] = True
+        return summary
+
+    def _weather_gate_metadata_from_result(
+        self,
+        result: Dict,
+        gate_date: str,
+        strategy_id: str,
+    ) -> Dict:
+        return {
+            "owner": strategy_id,
+            "strategy_id": strategy_id,
+            "state": "weather_gate_decision",
+            "date": gate_date,
+            "decision": result.get("decision"),
+            "reason": result.get("reason"),
+            "result": result,
+        }
+
+    def _resolve_preconditioning_weather_gate(
+        self,
+        pc_ctx: Dict,
+        phase: str,
+        slot_start: datetime,
+        previous_state: Dict,
+    ) -> Tuple[Dict, Optional[Dict], bool]:
+        """Resolve the stable daily weather-gate decision.
+
+        Returns ``(summary_result, metadata_to_persist, lifecycle_allowed)``.
+        Release/idle cleanup is never blocked by weather.
+        """
+        settings = pc_ctx.get("weather_gate_settings", {"enabled": False})
+        strategy_id = pc_ctx["strategy_id"]
+        owner_tag = pc_ctx["owner_tag"]
+        scope_assets = pc_ctx["scope_assets"]
+
+        if not settings.get("enabled"):
+            return self._evaluate_preconditioning_weather_gate(settings, slot_start), None, True
+
+        gate_date = self._preconditioning_day(slot_start)
+        if phase in ("release", "idle"):
+            result = self._evaluate_preconditioning_weather_gate(settings, slot_start)
+            result["decision"] = "open"
+            result["reason"] = f"{phase}_cleanup_not_gated"
+            return result, None, True
+
+        has_ownership = self._has_preconditioning_ownership(
+            previous_state, scope_assets, owner_tag
+        )
+        if has_ownership:
+            result = self._evaluate_preconditioning_weather_gate(settings, slot_start)
+            result["decision"] = "open"
+            result["reason"] = "existing_lifecycle_ownership"
+            metadata = self._weather_gate_metadata_from_result(
+                result, gate_date, strategy_id
+            )
+            return result, metadata, True
+
+        stored = self._stored_preconditioning_weather_gate(
+            previous_state, strategy_id, gate_date
+        )
+        if stored:
+            result = self._weather_gate_summary_from_metadata(stored, settings)
+            return result, None, result.get("decision") == "open"
+
+        if phase == "maintain":
+            result = self._evaluate_preconditioning_weather_gate(settings, slot_start)
+            result["decision"] = "closed"
+            result["reason"] = "no_preparation_ownership"
+            metadata = self._weather_gate_metadata_from_result(
+                result, gate_date, strategy_id
+            )
+            return result, metadata, False
+
+        result = self._evaluate_preconditioning_weather_gate(settings, slot_start)
+        metadata = self._weather_gate_metadata_from_result(
+            result, gate_date, strategy_id
+        )
+        return result, metadata, result.get("decision") == "open"
+
+    def _complete_preconditioning_weather_gate_skip(
+        self,
+        summary: Dict,
+        previous_state: Dict,
+        pc_ctx: Dict,
+        phase: str,
+        weather_gate_result: Dict,
+        weather_gate_metadata: Optional[Dict],
+    ) -> Dict:
+        strategy_id = pc_ctx["strategy_id"]
+        gate_key = self._preconditioning_weather_gate_key(strategy_id)
+        new_state = dict(previous_state)
+        if weather_gate_metadata is not None:
+            new_state[gate_key] = weather_gate_metadata
+        summary["preconditioning"]["weather_gate"] = weather_gate_result
+        summary["preconditioning"]["selected_for_delivery"] = []
+        summary["preconditioning"]["transitions"] = []
+        summary["preconditioning"]["command_results"] = []
+        summary["preconditioning"]["delivery_assets"] = []
+        summary["preconditioning"]["successful_commands"] = 0
+        summary["preconditioning"]["failed_commands"] = 0
+        summary["preconditioning"]["delivery_activation_records_written"] = 0
+        summary["preconditioning"]["delivery_source"] = "weather_gate_closed"
+        summary["preconditioning"]["batch_metadata"] = {
+            "lifecycle": "preconditioned_binary",
+            "phase": phase,
+            "strategy_id": strategy_id,
+            "has_delivery": False,
+            "delivery_assets": [],
+            "weather_gate_decision": weather_gate_result.get("decision"),
+        }
+        self._save_controlled_state(new_state)
+        self.logger.info(
+            "WEATHER_GATE decision=CLOSED reason=%s phase=%s no Strategy 12 commands issued",
+            weather_gate_result.get("reason"),
+            phase,
+        )
+        return summary
+
+    def _resolve_current_delivery_selection(
+        self,
+        pc_ctx: Dict,
+        slot_start: datetime,
+        slot_end: datetime,
+        dry_run: bool,
+        simulate_sold_mw: Optional[float],
+        allow_market_ledger_fallback: bool,
+        summary: Dict,
+    ) -> Dict:
+        """Determine which scope assets are selected for the current accepted
+        delivery, reusing the existing bid-record + accepted-trade + discrete
+        allocation machinery (no second allocator).
+
+        Returns a delivery dict::
+
+            {
+                "selected_off": set(asset_id),   # assets to switch OFF now
+                "allocations": {asset_id: kw},   # delivered flexibility per asset
+                "bid_record_id": <id or None>,   # for activation-record linkage
+            }
+
+        An empty ``selected_off`` means "no accepted delivery -> keep all
+        prepared ON".
+        """
+        empty: Dict = {"selected_off": set(), "allocations": {}, "bid_record_id": None}
+        scope = set(pc_ctx["scope_assets"])
+
+        bid_record = self.bid_handler.get_bid_record(self.fsp_id, slot_start)
+        if not bid_record:
+            summary["preconditioning"]["delivery_source"] = "no_bid_record"
+            return empty
+
+        bid_record_id = bid_record.get("id")
+
+        planned = self.bid_handler.get_bid_asset_flexibilities(bid_record)
+        planned = {a: kw for a, kw in planned.items() if a in scope}
+        if not planned:
+            summary["preconditioning"]["delivery_source"] = "no_planned_scope_assets"
+            return {"selected_off": set(), "allocations": {}, "bid_record_id": bid_record_id}
+
+        # Resolve accepted quantity (mirrors run()'s market-result handling).
+        if simulate_sold_mw is not None:
+            total_sold_kw = simulate_sold_mw * 1000.0
+            summary["preconditioning"]["delivery_source"] = "simulate_sold_mw"
+        else:
+            trades = []
+            if self.organization_id:
+                trades = self.market_handler.get_accepted_trades_for_slot(
+                    self.organization_id, slot_start, slot_end
+                )
+            if not trades and allow_market_ledger_fallback:
+                player_name = self.fsp_config.get("name", self.fsp_id)
+                trades = self.bid_handler.get_trades_from_ledger(player_name, slot_start)
+            total_sold_kw = sum(t.get("quantity", 0) for t in trades) * 1000.0
+            summary["preconditioning"]["delivery_source"] = (
+                "nodes_or_ledger" if trades else "no_trades"
+            )
+
+        if total_sold_kw <= 0:
+            return {"selected_off": set(), "allocations": {}, "bid_record_id": bid_record_id}
+
+        allocations, _selection = self._build_persistence_activation_allocations(
+            planned, total_sold_kw
+        )
+        selected_allocations = {
+            asset_id: curtailment_kw
+            for asset_id, curtailment_kw in allocations.items()
+            if curtailment_kw > 0 and asset_id in scope
+        }
+        selected_off = set(selected_allocations.keys())
+        summary["preconditioning"]["current_delivery_allocation"] = dict(selected_allocations)
+        return {
+            "selected_off": selected_off,
+            "allocations": selected_allocations,
+            "bid_record_id": bid_record_id,
+        }
+
+    def _run_preconditioning_lifecycle(
+        self,
+        pc_ctx: Dict,
+        slot_start: datetime,
+        slot_end: datetime,
+        previous_state: Dict,
+        dry_run: bool,
+        summary: Dict,
+        simulate_sold_mw: Optional[float] = None,
+        allow_market_ledger_fallback: bool = False,
+    ) -> Dict:
+        """Execute the manager-owned Strategy-12 lifecycle for one slot.
+
+        When preconditioning is active for this FSP the manager is the single
+        owner of ON/OFF intent for the scope assets, so this method fully
+        handles the slot and ``run()`` returns its result directly.
+        """
+        settings = pc_ctx["settings"]
+        scope_assets = pc_ctx["scope_assets"]
+        owner_tag = pc_ctx["owner_tag"]
+        strategy_id = pc_ctx["strategy_id"]
+        phase = self._resolve_preconditioning_phase(slot_start, settings)
+
+        summary["strategy_used"] = strategy_id
+        summary["flexibility_method"] = "preconditioned_binary"
+        summary["preconditioning"] = {
+            "active": True,
+            "strategy_id": strategy_id,
+            "owner_tag": owner_tag,
+            "phase": phase,
+            "scope_assets": list(scope_assets),
+            "window": {
+                "prepareStart": settings["prepare_start"],
+                "flexibilityStart": settings["flexibility_start"],
+                "maintainUntil": settings["maintain_until"],
+            },
+        }
+
+        self.logger.info("=" * 70)
+        self.logger.info("PRECONDITIONING LIFECYCLE - %s", self.fsp_id)
+        self.logger.info("=" * 70)
+        self.logger.info(
+            "PRECONDITIONING phase=%s strategy=%s assets=%d slot=%s",
+            phase, strategy_id, len(scope_assets),
+            slot_start.strftime("%Y-%m-%d %H:%M"),
+        )
+
+        weather_gate_result, weather_gate_metadata, lifecycle_allowed = (
+            self._resolve_preconditioning_weather_gate(
+                pc_ctx, phase, slot_start, previous_state
+            )
+        )
+        summary["preconditioning"]["weather_gate"] = weather_gate_result
+        if not lifecycle_allowed:
+            return self._complete_preconditioning_weather_gate_skip(
+                summary,
+                previous_state,
+                pc_ctx,
+                phase,
+                weather_gate_result,
+                weather_gate_metadata,
+            )
+        if weather_gate_result.get("enabled"):
+            aggregated = weather_gate_result.get("aggregated_temperature_c")
+            self.logger.info(
+                "WEATHER_GATE decision=%s reason=%s aggregated=%sC "
+                "threshold=%sC source=%s",
+                str(weather_gate_result.get("decision", "")).upper(),
+                weather_gate_result.get("reason"),
+                f"{aggregated:.1f}" if isinstance(aggregated, (int, float)) else "n/a",
+                weather_gate_result.get("threshold_c"),
+                weather_gate_result.get("source"),
+            )
+
+        # Resolve the current accepted-delivery selection only in the
+        # maintained-flexibility phase; preparation and release do not consult
+        # the market.
+        delivery: Dict = {"selected_off": set(), "allocations": {}, "bid_record_id": None}
+        if phase == "maintain":
+            delivery = self._resolve_current_delivery_selection(
+                pc_ctx, slot_start, slot_end, dry_run,
+                simulate_sold_mw, allow_market_ledger_fallback, summary,
+            )
+        selected_off = delivery["selected_off"]
+        delivery_allocations = delivery["allocations"]
+        delivery_bid_record_id = delivery["bid_record_id"]
+        summary["preconditioning"]["selected_for_delivery"] = sorted(selected_off)
+
+        desired = self._compute_preconditioning_desired_state(
+            phase, scope_assets, selected_off, previous_state, owner_tag,
+        )
+
+        # Preserve any state entries that are NOT owned by this lifecycle
+        # (defensive: the state file may be shared).  Rebuild scope entries.
+        new_state: Dict = {
+            asset_id: meta
+            for asset_id, meta in previous_state.items()
+            if asset_id not in scope_assets
+        }
+        gate_key = self._preconditioning_weather_gate_key(strategy_id)
+        if phase == "release":
+            new_state.pop(gate_key, None)
+        elif weather_gate_metadata is not None:
+            new_state[gate_key] = weather_gate_metadata
+
+        transitions = []
+        command_results = []
+        successful_commands = 0
+        failed_commands = 0
+        # Transport status of any command actually issued this slot, keyed by
+        # asset. Used to stamp delivery activation-record status truthfully.
+        emitted_status_by_asset: Dict[str, str] = {}
+
+        for asset_id in scope_assets:
+            want = desired.get(asset_id)
+            prev_meta = previous_state.get(asset_id)
+            prev_owned = self._is_owned_by_preconditioning(
+                previous_state, asset_id, owner_tag
+            )
+            prev_cmd = (
+                prev_meta.get("last_commanded_state")
+                if isinstance(prev_meta, dict) else None
+            )
+            prev_state_label = (
+                prev_meta.get("state") if isinstance(prev_meta, dict) else None
+            )
+
+            if want is None:
+                # Idle + unowned asset -> untouched, no ownership recorded.
+                continue
+
+            if phase in ("release", "idle"):
+                # Definitive release: always emit OFF for owned assets. Release
+                # is NOT a market activation and never produces an activation
+                # DB record. Ownership is cleared only after the OFF command is
+                # accepted; otherwise the previous entry is preserved so the
+                # next manager run naturally retries cleanup.
+                result = self._emit_preconditioning_command(asset_id, "OFF", dry_run)
+                status = (result or {}).get("status", "unknown")
+                emitted_status_by_asset[asset_id] = status
+                command_ok = status in self._COMMAND_SUCCESS_STATUSES
+                if command_ok:
+                    successful_commands += 1
+                else:
+                    failed_commands += 1
+                command_results.append({
+                    "asset_id": asset_id, "category": "release",
+                    "desired": "OFF", "status": status,
+                })
+                action = "OFF" if command_ok else "OFF_failed"
+                transitions.append((asset_id, prev_state_label, "released", action))
+                if not command_ok and isinstance(prev_meta, dict):
+                    new_state[asset_id] = prev_meta
+                self.logger.info(
+                    "PRECONDITIONING phase=%s asset=%s previous=%s action=OFF "
+                    "category=release status=%s ownership=%s",
+                    phase, asset_id, prev_state_label or "none", status,
+                    "cleared" if command_ok else "retained",
+                )
+                continue
+
+            # Preparation / maintained-flexibility phases.
+            lifecycle_state = "controlled" if want == "OFF" else "prepared"
+            # Business category (see Step 3.5 semantics):
+            #   preparation  : prepare-phase ON        (Category A, no DB record)
+            #   maintenance  : maintain-phase ON        (Category B, no DB record)
+            #   delivery     : maintain-phase OFF       (Category C, DB record)
+            if phase == "prepare":
+                category = "preparation"
+            else:  # maintain
+                category = "delivery" if want == "OFF" else "maintenance"
+
+            # Idempotency: only (re)issue a command when the desired state
+            # differs from the last manager-owned command, or when the asset is
+            # not yet owned by this lifecycle.
+            need_command = (not prev_owned) or (prev_cmd != want)
+            command_ok = True
+            if need_command:
+                result = self._emit_preconditioning_command(asset_id, want, dry_run)
+                status = (result or {}).get("status", "unknown")
+                emitted_status_by_asset[asset_id] = status
+                command_ok = status in self._COMMAND_SUCCESS_STATUSES
+                if command_ok:
+                    successful_commands += 1
+                else:
+                    failed_commands += 1
+                command_results.append({
+                    "asset_id": asset_id, "category": category,
+                    "desired": want, "status": status,
+                })
+                action = want if command_ok else f"{want}_failed"
+            else:
+                action = "none"
+
+            transitions.append((asset_id, prev_state_label, lifecycle_state, action))
+            self.logger.info(
+                "PRECONDITIONING phase=%s asset=%s previous=%s desired=%s "
+                "action=%s category=%s",
+                phase, asset_id, prev_state_label or "none", lifecycle_state,
+                action, category,
+            )
+
+            # Command-state bookkeeping (no telemetry confirmation available):
+            # advance to the desired lifecycle state when the command was
+            # accepted or was unnecessary (idempotent no-op). On a FAILED
+            # command, preserve the previous known state so the next per-slot
+            # run naturally re-asserts the desired state (implicit retry).
+            if need_command and not command_ok:
+                if isinstance(prev_meta, dict):
+                    new_state[asset_id] = prev_meta
+                # not previously owned -> leave unowned (no ownership on failure)
+                continue
+
+            asset_cfg = self.asset_mapping.get(asset_id, {})
+            prepared_since = (
+                prev_meta.get("prepared_since")
+                if (prev_owned and isinstance(prev_meta, dict)
+                    and prev_meta.get("prepared_since"))
+                else _format_aem_utc(slot_start)
+            )
+            new_state[asset_id] = {
+                "state": lifecycle_state,
+                "owner": owner_tag,
+                "strategy_id": strategy_id,
+                "asset_type": asset_cfg.get("type", "unknown"),
+                "last_commanded_state": want,
+                "prepared_since": prepared_since,
+                "slot_start": _format_aem_utc(slot_start),
+                "slot_end": _format_aem_utc(slot_end),
+            }
+
+        # ------------------------------------------------------------------
+        # Delivery bookkeeping (Category C only): persist activation DB records
+        # for maintain-phase selected-OFF delivery commands, reusing the normal
+        # activation-record API. Non-fatal on error (mirrors run() Step 5).
+        # ------------------------------------------------------------------
+        activation_records_written = 0
+        if phase == "maintain" and selected_off:
+            activation_records_written = self._persist_delivery_activations(
+                selected_off=selected_off,
+                delivery_allocations=delivery_allocations,
+                emitted_status_by_asset=emitted_status_by_asset,
+                bid_record_id=delivery_bid_record_id,
+                slot_start=slot_start,
+                slot_end=slot_end,
+                dry_run=dry_run,
+            )
+
+        summary["preconditioning"]["transitions"] = [
+            {
+                "asset_id": a,
+                "previous": prev,
+                "desired": desired_label,
+                "action": action,
+            }
+            for (a, prev, desired_label, action) in transitions
+        ]
+        summary["preconditioning"]["command_results"] = command_results
+        summary["preconditioning"]["delivery_assets"] = sorted(selected_off)
+        summary["preconditioning"]["successful_commands"] = successful_commands
+        summary["preconditioning"]["failed_commands"] = failed_commands
+        summary["preconditioning"]["delivery_activation_records_written"] = (
+            activation_records_written
+        )
+
+        # Batch/lifecycle observability metadata. A maintain batch can legitimately
+        # be MIXED (delivery OFF + maintenance ON), so we expose the phase and the
+        # explicit delivery subset rather than a single misleading label.
+        has_delivery = bool(selected_off)
+        batch_metadata = {
+            "lifecycle": "preconditioned_binary",
+            "phase": phase,
+            "strategy_id": strategy_id,
+            "has_delivery": has_delivery,
+            "delivery_assets": sorted(selected_off),
+        }
+        summary["preconditioning"]["batch_metadata"] = batch_metadata
+
+        # Publish queued commands (if RabbitMQ is configured). Per-command
+        # command_type ("curtail"/"restore") is unchanged; only the batch header
+        # gains richer lifecycle metadata.
+        published = None
+        if self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected():
+            slot_info = {
+                "fsp_id": self.fsp_id,
+                "slot_start": _format_aem_utc(slot_start),
+                "slot_end": _format_aem_utc(slot_end),
+                # Kept for backward compatibility; no longer the only semantic tag.
+                "command_type": "preconditioning",
+                "dry_run": dry_run,
+                **batch_metadata,
+            }
+            published = self.controller.publish_pending_commands(slot_info, dry_run=dry_run)
+            summary["rabbitmq_published"] = published
+            self.logger.info("Published %d preconditioning commands to RabbitMQ", published)
+
+        self._save_controlled_state(new_state)
+
+        # Top-level status: surface command failures without adding retries.
+        if failed_commands and successful_commands:
+            summary["status"] = "partial_success"
+        elif failed_commands and not successful_commands:
+            summary["status"] = "activation_failed"
+        elif published is not None:
+            summary["status"] = "queued"
+        # else: leave the default "success"
+
+        self.logger.info("=" * 70)
+        self.logger.info(
+            "PRECONDITIONING COMPLETE phase=%s owned_assets=%d has_delivery=%s "
+            "delivery_records=%d ok=%d failed=%d status=%s",
+            phase,
+            sum(
+                1 for meta in new_state.values()
+                if isinstance(meta, dict)
+                and meta.get("owner") == owner_tag
+                and meta.get("state") in self._PRECONDITIONING_STATES
+            ),
+            has_delivery,
+            activation_records_written,
+            successful_commands,
+            failed_commands,
+            summary["status"],
+        )
+        self.logger.info("=" * 70)
+        return summary
+
+    def _persist_delivery_activations(
+        self,
+        selected_off: set,
+        delivery_allocations: Dict[str, float],
+        emitted_status_by_asset: Dict[str, str],
+        bid_record_id,
+        slot_start: datetime,
+        slot_end: datetime,
+        dry_run: bool,
+    ) -> int:
+        """Persist activation DB records for maintain-phase delivery OFF commands.
+
+        Reuses ``bid_repo.save_asset_activations_batch`` (no new table/schema).
+        Records are written ONLY for the selected-OFF delivery subset (Category
+        C); preparation/maintenance/release commands never reach this method.
+        Failures are logged and swallowed so control commands are never
+        duplicated and the lifecycle is never re-run (mirrors run() Step 5).
+
+        Returns the number of activation records written (0 on error or when no
+        repository is configured).
+        """
+        bid_repo = getattr(self, "bid_repo", None)
+        if bid_repo is None:
+            self.logger.info(
+                "PRECONDITIONING no bid repository configured; skipping delivery "
+                "activation-record persistence"
+            )
+            return 0
+
+        # Status for an idempotent (already-OFF) delivery slot where no fresh
+        # command was issued: reflect the transport that WOULD carry it.
+        connected = bool(self.rabbitmq_publisher and self.rabbitmq_publisher.is_connected())
+        fallback_status = "queued" if connected else ("simulated" if dry_run else "success")
+
+        activation_records = []
+        for asset_id in sorted(selected_off):
+            asset_cfg = self.asset_mapping.get(asset_id, {})
+            capacity_kw = float(asset_cfg.get("capacity_kw", 0) or 0)
+            # Delivered downward flexibility = the allocator's per-asset block
+            # (switching the binary HP OFF removes its full ON-state power).
+            delivered_kw = float(delivery_allocations.get(asset_id, capacity_kw) or 0.0)
+            status = emitted_status_by_asset.get(asset_id, fallback_status)
+            activation_records.append({
+                "asset_id": asset_id,
+                "power_kw": delivered_kw,
+                "description": asset_cfg.get("description", asset_id),
+                "asset_type": asset_cfg.get("type"),
+                "percentage": 100.0 if capacity_kw > 0 else None,
+                "status": status,
+            })
+
+        if not activation_records:
+            return 0
+
+        if bid_record_id is None:
+            self.logger.warning(
+                "PRECONDITIONING writing %d delivery activation record(s) WITHOUT "
+                "bid_record_id linkage (schema allows NULL); current bid record "
+                "had no id", len(activation_records),
+            )
+
+        try:
+            saved = bid_repo.save_asset_activations_batch(
+                fsp_id=self.fsp_id,
+                slot_start=slot_start,
+                slot_end=slot_end,
+                activations=activation_records,
+                allocation_strategy="preconditioned_binary",
+                dry_run=dry_run,
+                bid_record_id=bid_record_id,
+            )
+            self.logger.info(
+                "PRECONDITIONING persisted delivery activation records: assets=%s "
+                "dry_run=%s bid_record_id=%s (repo reported %s)",
+                [r["asset_id"] for r in activation_records], dry_run, bid_record_id,
+                saved,
+            )
+            return len(activation_records)
+        except Exception as exc:
+            self.logger.error(
+                "PRECONDITIONING could not save delivery activation records: %s", exc
+            )
+            return 0
+
+    def _emit_preconditioning_command(
+        self, asset_id: str, desired: str, dry_run: bool
+    ) -> Dict:
+        """Emit an unambiguous binary ON/OFF command for a scope asset.
+
+        Reuses the existing manager command primitives:
+          * ON  -> ``restore_asset`` (discrete_state=ON, target_power=capacity);
+          * OFF -> ``curtail_asset(..., force_discrete_off=True)``
+                   (discrete_state=OFF, target_power=0).
+        """
+        if desired == "ON":
+            return self.controller.restore_asset(asset_id, dry_run=dry_run)
+        capacity_kw = float(self.asset_mapping.get(asset_id, {}).get("capacity_kw", 0) or 0)
+        return self.controller.curtail_asset(
+            asset_id,
+            capacity_kw,
+            dry_run=dry_run,
+            force_discrete_off=True,
+        )
+
     def run(
         self,
         slot_override: str = None,
@@ -4053,6 +5188,29 @@ class FlexibilityManager:
             "status": "success"
         }
 
+        # ==============================================================
+        # Strategy-12 maintained prepared portfolio lifecycle (Step 3).
+        #
+        # When the FSP's active strategy owns a preconditioning lifecycle,
+        # the manager becomes the single owner of ON/OFF intent for the
+        # scope assets and fully governs this slot here.  This is resolved
+        # from the FSP/CLI-configured active strategy (NOT merely a strategy
+        # existing in config, and NOT the bid record), so preparation can
+        # begin before the first evening bid record exists.
+        # ==============================================================
+        pc_ctx = self._resolve_preconditioning_context(fallback_strategy)
+        if pc_ctx is not None:
+            return self._run_preconditioning_lifecycle(
+                pc_ctx,
+                slot_start,
+                slot_end,
+                previous_state,
+                dry_run,
+                summary,
+                simulate_sold_mw=simulate_sold_mw,
+                allow_market_ledger_fallback=allow_market_ledger_fallback,
+            )
+
         strategy_info = None
         strategy_obj = None
         flexibility_method = None
@@ -4082,12 +5240,14 @@ class FlexibilityManager:
                     flexibility_method = strategy_obj.config.get("flexibility_method")
                     # Strategies whose bidder pre-computes a per-asset
                     # activation plan and stores it in bid_record_assets.
-                    # Persistence (strategy_8/9) and recent_profile
-                    # (strategy_10) both follow this contract, so they reuse
-                    # the same activation pipeline downstream.
+                    # Persistence (strategy_8/9), recent_profile (strategy_10)
+                    # and preconditioned_binary (strategy_12) all follow this
+                    # contract, so they reuse the same activation pipeline
+                    # downstream (binary HPs are switched OFF via force_off).
                     is_persistence_strategy = flexibility_method in (
                         "persistence",
                         "recent_profile",
+                        "preconditioned_binary",
                     )
                     summary["flexibility_method"] = flexibility_method
 
