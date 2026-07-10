@@ -8,6 +8,7 @@
   "baseline": {
     "source": "db",
     "shiftMinutes": 90,
+    "valueMultiplier": -1.0,
     "fileSettings": {
       "profileFile": "../data/baselines/example01.csv"
     },
@@ -103,7 +104,7 @@
             "forecasting_multiplier": 1.0,
             "activationCost": 2.5
           },
-          "strategy": "strategy_4",
+          "strategy": "strategy_11",
           "assets": ["ECM96.2", "ECM97.3", "ECM63.1", "ECM63.2"],
           "forecast":{
             "source": "aem",

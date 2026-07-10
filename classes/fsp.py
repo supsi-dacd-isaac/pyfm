@@ -167,15 +167,73 @@ class FSP(Player):
                 portfolio_total_w / 1e6,
             )
 
-    def update_portfolio_baseline(self, portfolio_id, baseline_dataframe):
+    @staticmethod
+    def _parse_baseline_value_multiplier(bs_cfg):
+        raw_multiplier = bs_cfg.get("valueMultiplier", 1.0)
+        if isinstance(raw_multiplier, bool):
+            raise ValueError("baseline.valueMultiplier must be a finite number")
+        try:
+            value_multiplier = float(raw_multiplier)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("baseline.valueMultiplier must be a finite number") from exc
+        if not math.isfinite(value_multiplier):
+            raise ValueError("baseline.valueMultiplier must be a finite number")
+        return value_multiplier
+
+    @staticmethod
+    def _build_baseline_upload_dataframe(baseline_dataframe, value_multiplier):
+        upload_dataframe = baseline_dataframe.copy(deep=True)
+        upload_dataframe.attrs = baseline_dataframe.attrs.copy()
+        upload_quantities = upload_dataframe["quantity"].astype(float) * value_multiplier
+        upload_dataframe["quantity"] = upload_quantities.mask(
+            upload_quantities == 0.0, 0.0
+        )
+        return upload_dataframe
+
+    def _log_baseline_upload_value_summary(
+        self, portfolio_id, calculated_dataframe, upload_dataframe, value_multiplier
+    ):
+        calculated_values = pd.to_numeric(
+            calculated_dataframe["quantity"], errors="coerce"
+        )
+        upload_values = pd.to_numeric(upload_dataframe["quantity"], errors="coerce")
+        if calculated_values.empty or upload_values.empty:
+            self.logger.info(
+                "Baseline value transformation portfolio=%s: valueMultiplier=%s, no quantities",
+                portfolio_id,
+                value_multiplier,
+            )
+            return
+
+        self.logger.info(
+            "Baseline value transformation portfolio=%s: valueMultiplier=%s, "
+            "calculated range=%.6f to %.6f MW, upload range=%.6f to %.6f MW",
+            portfolio_id,
+            value_multiplier,
+            calculated_values.min(),
+            calculated_values.max(),
+            upload_values.min(),
+            upload_values.max(),
+        )
+
+    def update_portfolio_baseline(
+        self, portfolio_id, baseline_dataframe, value_multiplier=1.0
+    ):
+        upload_dataframe = self._build_baseline_upload_dataframe(
+            baseline_dataframe, value_multiplier
+        )
+        self._log_baseline_upload_value_summary(
+            portfolio_id, baseline_dataframe, upload_dataframe, value_multiplier
+        )
+
         tmp_baseline_file = "%s%s%s.csv" % (
             self.cfg["baselines"]["tmpFolder"],
             os.sep,
             portfolio_id,
         )
-        baseline_dataframe.to_csv(tmp_baseline_file, index=False)
+        upload_dataframe.to_csv(tmp_baseline_file, index=False)
 
-        self.log_portfolio_baseline_summary(portfolio_id, baseline_dataframe)
+        self.log_portfolio_baseline_summary(portfolio_id, upload_dataframe)
 
         endpoint = "%s%s" % (
             self.nodes_interface.cfg["mainEndpoint"],
@@ -364,6 +422,13 @@ class FSP(Player):
         )
 
     def update_baselines(self, bs_cfg, dry_run=False):
+        try:
+            value_multiplier = self._parse_baseline_value_multiplier(bs_cfg)
+        except ValueError as exc:
+            self.logger.error("Invalid baseline configuration: %s", str(exc))
+            return False
+        self.logger.info("Baseline value multiplier: %s", value_multiplier)
+
         granularity_minutes = self.main_cfg["fm"]["granularity"]
         current_time_utc = datetime.utcnow()
         adjusted_time = current_time_utc.replace(
@@ -417,9 +482,15 @@ class FSP(Player):
                     "[DRY-RUN] Built baseline for portfolio %s; upload and InfluxDB save skipped",
                     k_p,
                 )
-                self.log_portfolio_baseline_summary(k_p, df)
+                upload_df = self._build_baseline_upload_dataframe(
+                    df, value_multiplier
+                )
+                self._log_baseline_upload_value_summary(
+                    k_p, df, upload_df, value_multiplier
+                )
+                self.log_portfolio_baseline_summary(k_p, upload_df)
                 continue
-            if self.update_portfolio_baseline(k_p, df) is False:
+            if self.update_portfolio_baseline(k_p, df, value_multiplier) is False:
                 self.logger.error("Baseline upload failed for portfolio %s", k_p)
                 return False
             if self.save_portfolio_baseline_to_influx(k_p, df, bs_cfg) is False:
