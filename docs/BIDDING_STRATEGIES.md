@@ -1,6 +1,6 @@
 # Bidding Strategies for Flexibility Market
 
-This document explains the bidding strategies configured for the FSP (Flexibility Service Provider) to participate in the flexibility market. It covers strategies `strategy_1` through `strategy_11` from the existing configuration and the Strategy 12 simulated heat-pump workflow.
+This document explains all 12 bidding strategies configured for the FSPs (Flexibility Service Providers) in `conf/test_fm01_aem.json`.
 
 ## Overview
 
@@ -12,15 +12,18 @@ The flexibility market allows FSPs to sell load reduction capabilities to the DS
 | ECM97.1 | Heat Pump | 15 kW | HP Cinema 1 |
 | ECM97.2 | Heat Pump | 15 kW | HP Cinema 2 |
 | ECM97.3 | Heat Pump | 30 kW | HP Cinema aggregate |
-| ECM63.1 | EV Charger | 11 kW | EV Charger 1 — discrete OCPP states (6.24–11.0 kW) |
-| ECM63.2 | EV Charger | 11 kW | EV Charger 2 — discrete OCPP states (6.24–11.0 kW) |
+| ECM63.1 | EV Charger | 11 kW | EV Charger 1 — 7 discrete OCPP states (6.93–11.0 kW) |
+| ECM63.2 | EV Charger | 11 kW | EV Charger 2 — 7 discrete OCPP states (6.93–11.0 kW) |
 | ECM62.10 | Simulated Heat Pump | 36.0 kW | Strategy 12 binary HP |
 | ECM68.3 | Simulated Heat Pump | 8.4 kW | Strategy 12 binary HP |
 | ECM162.1 | Simulated Heat Pump | 6.0 kW | Strategy 12 binary HP |
 
-The active FSP portfolio in `conf/test_fm01_aem.json` currently lists `ECM96.2`, `ECM97.3`, `ECM63.1`, and `ECM63.2`. Some strategies refer to all assets by type, so the final allowed set is the intersection of the strategy filter, asset mapping, and active FSP portfolio.
+The configuration has two active FSP portfolios:
 
-Strategy 12 uses a separate simulated HP portfolio. Its target assets are exactly `ECM62.10`, `ECM68.3`, and `ECM162.1`. Treat `ECM62.10` as one independent asset; do not substitute, aggregate, or fan out to `ECM62.1`, `ECM62.2`, or `ECM62.3`.
+- `supsi01` uses `strategy_11` by default and lists `ECM96.2`, `ECM97.3`, `ECM63.1`, and `ECM63.2`.
+- `supsi02` uses `strategy_12` by default and lists `ECM62.10`, `ECM68.3`, and `ECM162.1`.
+
+Some strategies refer to all assets by type, so the final allowed set is the intersection of the strategy filter, asset mapping, and the selected FSP portfolio. Treat `ECM62.10` as one independent asset; do not substitute, aggregate, or fan out to `ECM62.1`, `ECM62.2`, or `ECM62.3`.
 
 ### Key Concepts
 
@@ -44,7 +47,7 @@ Baseline persistence and bidding strategy persistence are separate concepts:
 - `baseline.dbSettings.strategy = "slot_persistence"` affects baseline generation/uploading.
 - `flexibility_method: "persistence"` inside a bidding strategy affects trader bidding flexibility for the selected strategy.
 
-In the current configuration, `strategy_8` and `strategy_9` are the persistence bidding strategies, `strategy_10` is the recent-profile bidding strategy for continuous EVs, and `strategy_11` is the recent-profile bidding strategy for discrete OCPP-controlled EVs. `strategy_12` is the simulated heat-pump preconditioned-binary strategy. `strategy_4` is historical/legacy.
+In the current configuration, `strategy_8` and `strategy_9` are the persistence bidding strategies, while `strategy_10` and `strategy_11` use recent-profile forecasting. Both configured EV assets are discrete OCPP-controlled assets, so both recent-profile strategies operate on discrete EV state mappings; Strategy 11 adds explicit discrete-EV policy settings. `strategy_12` is the simulated heat-pump preconditioned-binary strategy. `strategy_4` remains the recommended historical/legacy alternative, but it is not the configured default for either FSP.
 
 ## Current Strategy Summary
 
@@ -58,10 +61,10 @@ In the current configuration, `strategy_8` and `strategy_9` are the persistence 
 | `strategy_6` | Smart Preheat | Heat pumps | All HP assets in the active portfolio | Historical/legacy | 04:00-06:00 preheat, morning peak flexibility | Intent is taken from config preheat fields. |
 | `strategy_7` | Double Pre-heating | Heat pumps | `ECM96.2` | Historical/legacy | Morning and evening preheat/peak cycle | Intent is taken from config preheat fields. |
 | `strategy_8` | Persistence HP Strategy | Heat pumps | `ECM96.2`, `ECM97.3` | Persistence | Safer HP-only persistence bidding | Excludes EV chargers. |
-| `strategy_9` | Persistence HP + EV Strategy | HP + EV | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | Persistence | Persistence bidding including EV chargers | Monitor EV telemetry carefully. |
-| `strategy_10` | Recent-profile Short-term Flexibility (EV) | EV (HP-capable) | `ECM63.1`, `ECM63.2` | Recent profile | EV-only short-term profile bidding (continuous) | HPs excluded by `assets_filter`; warm-season deployment. Treats EVs as continuous. |
+| `strategy_9` | Persistence HP + EV Strategy | HP + EV | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | Persistence | Persistence bidding including discrete EV chargers | Monitor EV telemetry carefully. |
+| `strategy_10` | Recent-profile Short-term Flexibility (EV) | EV (HP-capable) | `ECM63.1`, `ECM63.2` | Recent profile | EV-only short-term profile bidding using the current discrete mappings | Historical continuous-EV approximation; current mappings make it discrete. |
 | `strategy_11` | Recent-profile discrete EV current-step flexibility | EV | `ECM63.1`, `ECM63.2` | Recent profile | Discrete OCPP current-step EV bidding | Maps flexibility to feasible OCPP power states; overdelivery-tolerant. |
-| `strategy_12` | Simulated HP preconditioned binary flexibility | Simulated HP | `ECM62.10`, `ECM68.3`, `ECM162.1` | Preconditioned binary | Weather-gated preparation and binary HP delivery | Uses lifecycle ownership: prepare ON, maintain selected OFF, release OFF. |
+| `strategy_12` | Preconditioned Binary HP Flexibility | Simulated HP | `ECM62.10`, `ECM68.3`, `ECM162.1` | Preconditioned binary | Scheduled preparation and binary HP delivery | Lifecycle enabled; weather gate currently disabled. |
 
 ---
 
@@ -88,7 +91,7 @@ A conservative strategy that only uses heat pumps, providing full-day coverage w
    │  MORNING PEAK      LATE MORNING     AFTERNOON      EVENING PEAK    OFF-PEAK
    │  06:30-09:00       09:00-12:00      12:00-16:00    16:00-19:00     19:00-06:30
    │  ────────────      ───────────      ───────────    ───────────     ───────────
-   │  15 kW @ 9.0       12 kW @ 8.5      8 kW @ 7.0     10 kW @ 9.5     6 kW @ 6.0
+   │  15 kW @ 9.0       12 kW @ 8.5      8 kW @ 7.0     15 kW @ 9.5     6 kW @ 6.0
    │  CHF/MW            CHF/MW           CHF/MW         CHF/MW          CHF/MW
 ```
 
@@ -97,11 +100,11 @@ A conservative strategy that only uses heat pumps, providing full-day coverage w
 | Morning Peak | 06:30-09:00 | 15 kW | 9.0 CHF/MW | High HP activity |
 | Late Morning | 09:00-12:00 | 12 kW | 8.5 CHF/MW | Moderate activity |
 | Afternoon | 12:00-16:00 | 8 kW | 7.0 CHF/MW | Lower activity |
-| Evening Peak | 16:00-19:00 | 10 kW | 9.5 CHF/MW | Second peak |
+| Evening Peak | 16:00-19:00 | 15 kW | 9.5 CHF/MW | Second peak |
 | Off-peak | 19:00-06:30 | 6 kW | 6.0 CHF/MW | Minimal activity |
 
 ### When to Use
-- Default conservative approach
+- Conservative full-day option
 - When EV charger availability is unreliable
 - For consistent, predictable market participation
 
@@ -119,21 +122,26 @@ Uses all assets (heat pumps + EV chargers) with special focus on evening hours w
 
 ### Assets Used
 - ✅ Heat pumps in the active portfolio (currently `ECM96.2`, `ECM97.3`)
-- ✅ All EV chargers (ECM63.1, ECM63.2) - evening only
+- ✅ All EV chargers (`ECM63.1`, `ECM63.2`) are strategy-eligible in every slot
+
+The evening slot is the only slot with an additional `ev_flexibility_mw` target and EV-specific economic fields. These fields do not act as a time-scoped asset filter.
 
 ### Time Schedule
 
-| Time Slot | Hours | HP Flexibility | EV Flexibility | Min Price |
-|-----------|-------|----------------|----------------|-----------|
-| Morning Peak | 07:00-10:00 | 12 kW | — | 8.0 CHF/MW |
+| Time Slot | Hours | Base Target | EV Add-on | Main Min Price |
+|-----------|-------|-------------|-----------|----------------|
+| Morning Peak | 07:00-10:00 | 15 kW | — | 8.0 CHF/MW |
 | Midday | 10:00-17:00 | 6 kW | — | 6.0 CHF/MW |
-| **Evening Peak** | 17:00-20:00 | 10 kW | **0.8 kW** | 9.5 / 10.0 CHF/MW |
+| **Evening Peak** | 17:00-20:00 | 15 kW | **0.8 kW** | 9.5 CHF/MW |
 | Off-peak | 20:00-07:00 | 5 kW | — | 5.5 CHF/MW |
 
-### Evening EV Bidding
+### Evening EV Configuration
 During 17:00-20:00:
-- HP flexibility: 10 kW @ 9.5 CHF/MW
-- EV flexibility: 0.8 kW @ 10.0 CHF/MW (higher price due to user impact)
+- Base flexibility target: 15 kW at the slot's 9.5 CHF/MW minimum
+- EV add-on target: 0.8 kW
+- EV-specific metadata: `ev_bid_price: 10.0` and `ev_activation_cost: 4.5`
+
+The current trader adds `ev_flexibility_mw` to the configured target but uses the main slot `bid_price` for order-price acceptance. The EV-specific price and activation-cost values do not create a second live order price.
 
 ### When to Use
 - When you want to test EV charger participation
@@ -191,7 +199,7 @@ An aggressive strategy that concentrates bidding during the morning peak when Ci
 ## Strategy 4: Hybrid (S3+S1) ⭐ RECOMMENDED
 
 ### Description
-Combines aggressive peak targets with full-day HP coverage. This is the configured default strategy for `supsi01`.
+Combines aggressive peak targets with full-day HP coverage. It is marked as recommended in the strategy description, but `supsi01` currently defaults to `strategy_11`.
 
 **Flexibility method:** historical/legacy. `strategy_4` does not set `flexibility_method: "persistence"`.
 
@@ -212,7 +220,7 @@ Combines aggressive peak targets with full-day HP coverage. This is the configur
     ┌─────────────────────────┐          ┌─────────────────────────────────┐
     │      AGGRESSIVE         │          │         CONSERVATIVE            │
     │    06:30 - 09:00        │          │       09:00 - 06:30             │
-    │    20 kW @ 9.0          │          │    Variable pricing             │
+    │    40 kW @ 9.0          │          │    Variable pricing             │
     └─────────────────────────┘          └─────────────────────────────────┘
 ```
 
@@ -224,14 +232,8 @@ Combines aggressive peak targets with full-day HP coverage. This is the configur
 | Evening Peak | 16:00-19:00 | 40 kW | 9.5 CHF/MW | Aggressive |
 | Off-peak | 19:00-06:30 | 6 kW | 6.0 CHF/MW | Conservative (S1) |
 
-### Expected Performance (30-day estimate)
-- Total slots activated: ~351
-- Total revenue: ~35.43 CHF
-- Activation costs: ~2.59 CHF
-- **Net profit: ~32.84 CHF**
-
 ### When to Use
-- **Default recommended strategy**
+- **Recommended historical/legacy strategy**
 - For maximum profitability
 - When you want balanced risk/reward
 - When you want the restored historical/legacy path, not persistence
@@ -241,31 +243,28 @@ Combines aggressive peak targets with full-day HP coverage. This is the configur
 ## Strategy 5: Hybrid2 (S3+S2)
 
 ### Description
-Combines the aggressive morning approach of Strategy 3 with Strategy 2's full-day coverage including EV chargers in the evening.
+Combines the aggressive morning approach of Strategy 3 with Strategy 2's full-day coverage and additional evening EV target.
 
 ### Rationale
 - Aggressive morning bidding (like S3)
-- Includes EV chargers during evening peak (like S2)
+- Adds an EV-specific quantity target during evening peak (like S2)
 - Tests EV participation while maintaining strong morning presence
 
 ### Assets Used
 - ✅ Heat pumps in the active portfolio (currently `ECM96.2`, `ECM97.3`)
-- ✅ EV chargers (ECM63.1, ECM63.2) - evening only
+- ✅ EV chargers (`ECM63.1`, `ECM63.2`) are strategy-eligible in every slot
+
+As in Strategy 2, only the evening slot adds an explicit EV target and EV-specific economic fields; it does not restrict EV eligibility to that slot.
 
 ### Time Schedule
 
-| Time Slot | Hours | HP Flexibility | EV Flexibility | Min Price |
-|-----------|-------|----------------|----------------|-----------|
+| Time Slot | Hours | Base Target | EV Add-on | Main Min Price |
+|-----------|-------|-------------|-----------|----------------|
 | **Morning Peak** | 06:30-09:00 | **20 kW** | — | **9.0 CHF/MW** |
 | Late Morning | 09:00-12:00 | 10 kW | — | 7.5 CHF/MW |
 | Afternoon | 12:00-17:00 | 6 kW | — | 6.0 CHF/MW |
-| **Evening Peak** | 17:00-20:00 | 10 kW | **0.8 kW** | 9.5 / 10.0 CHF/MW |
+| **Evening Peak** | 17:00-20:00 | 20 kW | **0.8 kW** | 9.5 CHF/MW |
 | Off-peak | 20:00-06:30 | 5 kW | — | 5.5 CHF/MW |
-
-### Expected Performance (30-day estimate)
-- Total HP slots activated: ~309
-- Total EV slots activated: ~54
-- **Net profit: ~28.42 CHF**
 
 ### When to Use
 - When you want to include EV chargers
@@ -396,7 +395,7 @@ EV-only short-term flexibility strategy based on a recent power profile rather t
 
 **Flexibility method:** recent profile via `flexibility_method: "recent_profile"`.
 
-Unlike `strategy_8` and `strategy_9`, this strategy does **not** use simple t-1h persistence. Instead, it estimates expected upcoming power from recent 15-minute measurements and bids a conservative fraction of that estimate.
+Unlike `strategy_8` and `strategy_9`, this strategy does **not** use simple lagged persistence. It estimates expected upcoming power from recent 15-minute measurements. Although the strategy name and JSON description reflect its original continuous-EV intent, the current `ECM63.1` and `ECM63.2` asset mappings explicitly set `modulation_type: "discrete"`. The effective configuration therefore applies the discrete factor and maps the result to configured OCPP states.
 
 ### Why It Was Introduced
 - EV charging power varies within a session; a single lagged sample is often a poor baseline.
@@ -412,34 +411,25 @@ Unlike `strategy_8` and `strategy_9`, this strategy does **not** use simple t-1h
 
 For each allowed asset at bid time:
 
-1. **Collect recent measurements** over the configured lookback window (default: 120 minutes of 15-min grouped samples).
-2. **Apply the current-power activity gate:** if the latest measurement is at or below `activeThresholdW` (default: 500 W), the asset contributes 0 flexibility.
-3. **Estimate expected power** as the configured lower quantile of recent samples (default: q25).
-4. **Cap expected power** at `nominal_power_w`.
-5. **Derive flexibility** from expected power using the asset modulation type:
-   - **Continuous / modulated assets** (EV chargers): `flexibility = continuousFactor × expected_power` (default factor: 0.5)
-   - **Discrete / ON-OFF assets** (heat pumps): `flexibility = discreteFactor × expected_power` (default factor: 1.0)
+1. **Choose the lookback:** the current discrete EV mappings use the configured 90-minute window. The 45/60-minute adaptive rules apply only to assets mapped as continuous.
+2. **Collect 15-minute grouped measurements** over that lookback.
+3. **Apply the current-power activity gate:** if the latest measurement is at or below `activeThresholdW` (5000 W), the asset contributes 0 flexibility.
+4. **Estimate expected power** as q25 of recent samples.
+5. **Cap expected power** at `nominal_power_w`.
+6. **Apply the configured modulation factor:** the current assets are discrete, so `discreteFactor: 1.0` is used. `continuousFactor: 0.5` would apply only if an allowed asset were mapped as continuous.
+7. **Map to a feasible OCPP state:** the desired flexibility is converted to an achievable curtailment using the asset's configured states, currently `6.93` through `11.0` kW.
 
-Example for an active EV charger:
-
-| Step | Value |
-|------|-------|
-| Recent samples (kW) | 4, 8, 12, 16 |
-| q25 expected power | 7 kW |
-| Continuous factor | 0.5 |
-| Available flexibility | **3.5 kW** |
-
-If expected charging power were 8 kW with the default factor, available flexibility would be **4 kW**.
+The JSON description still says "last 2h", but `recentProfileSettings.lookbackMinutes` is `90`; the strategy-owned setting is the effective value.
 
 ### Difference vs Persistence (`strategy_8` / `strategy_9`)
 
 | Aspect | Persistence (`strategy_8` / `strategy_9`) | Recent profile (`strategy_10`) |
 |--------|-------------------------------------------|--------------------------------|
 | Baseline source | Single lagged measurement (e.g. t-90 min) | Lower quantile of recent lookback window |
-| Typical use | HP and mixed HP+EV persistence validation | Short-term modulated EV charging |
+| Typical use | HP and mixed HP+EV persistence validation | Short-term EV profile estimation |
 | EV treatment | Uses lagged EV power as baseline | Uses recent charging profile (q25) |
 | Current-power gate | Yes | Yes |
-| Overdelivery | Disallowed (gated method) | Disallowed (gated method) |
+| Discrete mapping | Uses the configured asset modulation in allocation/activation | Applies discrete OCPP mapping with the current asset mappings |
 | Activation path | Persistence bid-record / flexi_manager path | Same persistence activation infrastructure |
 
 Both persistence and recent-profile strategies are **gated methods**: they require a fresh current measurement, skip unsafe assets, and reuse the same bid-record activation pipeline in `trader_fsp.py` and `flexi_manager.py`.
@@ -447,7 +437,7 @@ Both persistence and recent-profile strategies are **gated methods**: they requi
 ### Recent-profile Behaviour
 - Requires at least `minSamples` recent measurements (default: 2); otherwise the asset contributes 0 flexibility.
 - Missing, failed, or stale current measurements skip the affected asset under `missingMeasurementPolicy: "skip_asset"`.
-- Recommended bid quantity uses the same no-overdelivery conservative logic as persistence strategies.
+- Recommended bid quantity is constrained to an achievable discrete allocation for the current EV mappings.
 - `bid_record_assets` stores the selected allocation only, not the full asset list.
 
 ### Strategy-owned Settings
@@ -460,15 +450,18 @@ bidding_strategies.strategy_10.recentProfileSettings
 
 They are **not** global `flexibility.recentProfileSettings` anymore. For backward compatibility, a legacy global block is still accepted with a warning if the strategy block is missing.
 
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `lookbackMinutes` | 120 | Recent measurement window |
+| Setting | Configured value | Purpose |
+|---------|------------------|---------|
+| `lookbackMinutes` | 90 | Fallback recent measurement window |
 | `quantile` | 0.25 | Conservative expected-power estimate (q25) |
-| `continuousFactor` | 0.5 | Flexibility fraction for modulated assets |
-| `discreteFactor` | 1.0 | Flexibility fraction for ON/OFF assets |
-| `activeThresholdW` | 500 | Current-power activity gate |
+| `continuousFactor` | 0.5 | Used only for assets mapped as continuous |
+| `discreteFactor` | 1.0 | Effective factor for the current EV mappings |
+| `activeThresholdW` | 5000 | Current-power activity gate |
+| `maxConsecutiveActivationSlots` | 4 | Maximum consecutive controlled slots |
+| `cooldownSlotsAfterMaxActivation` | 2 | Released slots after reaching the cap |
 | `minSamples` | 2 | Minimum recent samples required |
 | `missingMeasurementPolicy` | `skip_asset` | Safe handling when data is missing |
+| `adaptiveLookback` | enabled for `continuous` | Defines 45/60-minute windows at load ratios 0.80/0.65; inactive for the current discrete EV mappings |
 
 ### When to Use
 - When testing short-term EV flexibility based on current charging behaviour
@@ -478,13 +471,14 @@ They are **not** global `flexibility.recentProfileSettings` anymore. For backwar
 ### Caution
 - Start with `--dry-run` and inspect per-asset recent-profile logs before live bidding.
 - HP support is architecturally ready but currently disabled via `assets_filter`.
+- Strategy 10 is not a continuous fallback with the current shared EV asset mappings. Continuous operation requires changing or overriding those mappings.
 
 ---
 
 ## Strategy 11: Recent-profile Discrete EV Current-step Flexibility
 
 ### Description
-EV-only strategy that combines recent-profile reference power estimation with discrete OCPP current-step power states. Unlike `strategy_10`, which treats EV chargers as continuously modulated assets, `strategy_11` models them as multi-level discrete assets whose power can only be set to one of 8 predefined OCPP current steps.
+EV-only strategy that combines recent-profile reference power estimation with discrete OCPP current-step power states. Both configured chargers expose 7 power states. Compared with `strategy_10`, Strategy 11 uses a shorter fixed lookback, a higher activity threshold, a smaller discrete factor, and explicit discrete-EV policy settings.
 
 **Flexibility method:** recent profile via `flexibility_method: "recent_profile"`.
 
@@ -495,21 +489,21 @@ EV-only strategy that combines recent-profile reference power estimation with di
 - Overdelivery (sending slightly more curtailment than requested) is preferred over underdelivery to meet market obligations.
 
 ### Assets Used
-- ✅ ECM63.1 (EV Charger 1) — `modulation_type: "discrete"`, 8 OCPP states
-- ✅ ECM63.2 (EV Charger 2) — `modulation_type: "discrete"`, 8 OCPP states
+- ✅ ECM63.1 (EV Charger 1) — `modulation_type: "discrete"`, 7 OCPP states
+- ✅ ECM63.2 (EV Charger 2) — `modulation_type: "discrete"`, 7 OCPP states
 - ❌ Heat pumps excluded (EV-only strategy)
 
 ### EV Charger Discrete States
 
-Both chargers are configured with 8 feasible OCPP power states (kW):
+Both chargers are configured with 7 feasible OCPP power states (kW):
 
 ```
-6.24  6.93  7.62  8.31  9.01  9.70  10.39  11.0
+6.93  7.62  8.31  9.01  9.70  10.39  11.0
 ```
 
 Key constraints:
 - **No 0 kW state**: normal flexibility activation never commands the charger to stop entirely.
-- **No states below 6 kW**: low-current OCPP commands caused unstable charger behavior in testing.
+- **Effective minimum state is 6.93 kW**: the configured `min_target_power_kw` is 6.24 kW, but that setting filters states and does not create the missing 6.24 kW state.
 - **Maximum state is 11.0 kW**: full charger capacity.
 
 ### Bidding Logic
@@ -540,13 +534,12 @@ Example with reference = 11.0 kW:
 | 8.31 kW | 2.69 kW |
 | 7.62 kW | 3.38 kW |
 | 6.93 kW | 4.07 kW |
-| 6.24 kW | 4.76 kW |
 
 | Desired Flexibility | Selected Target | Actual Curtailment | Reason |
 |--------------------|-----------------|-------------------|--------|
 | 2.0 kW | 8.31 kW | 2.69 kW | Smallest curtailment ≥ 2.0 |
 | 1.0 kW | 9.70 kW | 1.30 kW | Smallest curtailment ≥ 1.0 |
-| 5.5 kW | 6.24 kW | 4.76 kW | No curtailment ≥ 5.5; maximum reachable |
+| 5.5 kW | 6.93 kW | 4.07 kW | No curtailment ≥ 5.5; maximum reachable |
 
 The bid's `available_flexibility_kw` is the **actual discrete curtailment**, not the raw continuous desired value.
 
@@ -554,13 +547,13 @@ The bid's `available_flexibility_kw` is the **actual discrete curtailment**, not
 
 | Aspect | `strategy_10` | `strategy_11` |
 |--------|---------------|---------------|
-| EV modulation type | `continuous` | `discrete` |
-| Control command | Arbitrary kW setpoint | One of 8 OCPP states |
-| Flexibility quantity | Raw `factor × expected` | Mapped to nearest feasible discrete curtailment |
-| Minimum power | 0 kW | 6.24 kW (OCPP stability floor) |
-| Overdelivery | Disallowed in bidding | Tolerated in activation (preferred over underdelivery) |
+| EV modulation type | `discrete` with current asset mappings | `discrete` |
+| Control command | One of 7 OCPP states | One of 7 OCPP states |
+| Discrete factor | 1.0 | 0.5 |
+| Effective minimum power | 6.93 kW | 6.93 kW |
+| Explicit discrete policy | No `discreteEvSettings` block | `smallest_overdelivery`, zero disabled, requested floor 6.24 kW |
 | Active threshold | 5000 W | 6000 W |
-| Lookback | 90 min (adaptive) | 45 min |
+| Lookback | 90 min for current discrete mappings; adaptive block applies only to continuous assets | 45 min |
 
 ### Activation Behaviour
 
@@ -593,26 +586,26 @@ bidding_strategies.strategy_11.discreteEvSettings
 | `lookbackMinutes` | 45 | Recent measurement window |
 | `quantile` | 0.25 | Conservative expected-power estimate (q25) |
 | `discreteFactor` | 0.5 | Flexibility fraction for discrete EV assets |
-| `activeThresholdW` | 6000 | Current-power activity gate (above OCPP floor) |
+| `activeThresholdW` | 6000 | Current-power activity gate; below the effective 6.93 kW target floor |
 | `minSamples` | 2 | Minimum recent samples required |
 | `selection_policy` | `smallest_overdelivery` | Prefer minimal overdelivery |
 | `allow_zero_state` | `false` | Never command 0 kW |
-| `min_target_power_kw` | 6.24 | Minimum OCPP target (stability floor) |
+| `min_target_power_kw` | 6.24 | Lower-bound filter; effective floor is 6.93 kW because 6.24 is absent from the asset states |
 
 ### When to Use
 - When controlling real EV chargers through OCPP integer current limits
 - When the chargers cannot accept arbitrary continuous power setpoints
-- When low-current commands (below 6 kW) must be avoided for stability
+- When low-current commands below the configured 6.93 kW floor must be avoided for stability
 - After validating EV telemetry and OCPP state transitions on `ECM63.1` and `ECM63.2`
 
 ### Caution
 - Start with `--dry-run` and verify that selected target states match expected OCPP behaviour.
-- The 8-state configuration assumes a specific charger model and voltage; adjust `discrete_states_kw` if the charger hardware or site voltage differs.
-- `strategy_10` remains available as the continuous approximation for EVs and can be used as a fallback.
+- The 7-state configuration assumes a specific charger model and voltage; adjust `discrete_states_kw` if the charger hardware or site voltage differs.
+- Strategy 10 uses different recent-profile parameters, but it is also discrete under the current shared asset mapping.
 
 ---
 
-## Strategy 12: Simulated HP Preconditioned Binary Flexibility
+## Strategy 12: Preconditioned Binary HP Flexibility
 
 ### Description
 Strategy 12 is the simulated heat-pump flexibility strategy for binary ON/OFF HP assets. It is designed for a controlled workflow where the HP portfolio is prepared before the delivery window, validated through telemetry, and then used for discrete OFF delivery.
@@ -642,13 +635,13 @@ Strategy 12 is the simulated heat-pump flexibility strategy for binary ON/OFF HP
 
 ### Weather Gate
 
-Strategy 12 has a strategy-owned weather gate that answers one question:
+Strategy 12 has a strategy-owned weather gate that can answer one question:
 
 ```text
 Should Strategy 12 prepare the HP portfolio today?
 ```
 
-When the weather gate is disabled, Strategy 12 behaves as the original lifecycle. When enabled, it evaluates the configured forecast window, usually the later delivery/cooling period, and opens only when the aggregated forecast temperature meets the configured threshold.
+The weather gate is **currently disabled** with `weatherGateSettings.enabled: false`. The enabled preconditioning lifecycle therefore runs without a temperature admission decision. If the gate is enabled, it reads `flexibility.temperature.forecast`, evaluates 17:00-20:00 using the maximum temperature, and opens when that value reaches the configured 24.0 C threshold.
 
 The intended cooling-oriented decision is:
 
@@ -669,11 +662,13 @@ Strategy 12 is not a normal stateless activation strategy. Its lifecycle is owne
 | Phase | Time | Desired state | Notes |
 |-------|------|---------------|-------|
 | Idle | Before 14:00 | No new preparation | Stale Strategy 12 ownership may be cleaned up by OFF commands. |
-| Prepare | 14:00-17:00 | All Strategy 12 assets ON | Only entered when the daily weather gate admits the day. |
+| Prepare | 14:00-17:00 | All Strategy 12 assets ON | Unconditional while the weather gate is disabled; gate-controlled if enabled. |
 | Maintain | 17:00-20:00 | Selected delivery assets OFF; non-selected assets ON | The selected OFF assets provide contracted flexibility. |
 | Release | At/after 20:00 | All Strategy 12-owned assets OFF | Ownership is cleared only after the OFF command is accepted. |
 
-Once the daily weather gate opens and ownership is acquired, the lifecycle remains stable for that day. Later forecast changes must not toggle the portfolio ON/OFF every manager run.
+When the weather gate is enabled and admits the day, ownership remains stable for that day. Later forecast changes must not toggle the portfolio ON/OFF every manager run.
+
+The 14:00-17:00 `time_slots` entry is only a non-bidding marker. Its `is_preheat_period` flag does not drive `flexi_actuator.py`; lifecycle commands come from the separate enabled `preconditioningSettings` block and are owned by `flexi_manager.py`.
 
 ### Bidding Logic
 
@@ -735,7 +730,8 @@ There is no explicit retry counter, backoff, or sleep loop. The periodic manager
 
 ### When to Use
 - When testing simulated HP flexibility with the external simulator.
-- When a weather-gated preconditioning workflow is required.
+- When a scheduled preconditioning workflow is required.
+- After enabling and validating `weatherGateSettings`, when temperature-gated preparation is required.
 - When binary HP availability must be proven from recent telemetry before bidding.
 - When validating the full simulated command and measurement loop for `ECM62.10`, `ECM68.3`, and `ECM162.1`.
 
@@ -743,6 +739,7 @@ There is no explicit retry counter, backoff, or sleep loop. The periodic manager
 - Do not use `ECM62.1`, `ECM62.2`, or `ECM62.3` for Strategy 12.
 - Confirm simulator command consumption from `simulatedAssetCommands` before live tests.
 - Confirm simulator measurements publish active power in W with exact `device_name` values.
+- Do not interpret the preconditioning time-slot marker as an actuator trigger; the enabled manager lifecycle is configured separately.
 - Use dry-run and local/fake simulator tests before any live closed-loop run.
 
 ---
@@ -752,21 +749,21 @@ There is no explicit retry counter, backoff, or sleep loop. The periodic manager
 | Strategy | Forecasting logic | Asset types | Control |
 |----------|-------------------|-------------|---------|
 | `strategy_8` | Persistence (lagged baseline) | HP | ON/OFF |
-| `strategy_9` | Persistence (lagged baseline) | HP + EV | Mixed |
-| `strategy_10` | Recent profile q25 | EV (currently) | Continuous modulated |
+| `strategy_9` | Persistence (lagged baseline) | HP + EV | Mixed, with discrete EV mappings |
+| `strategy_10` | Recent profile q25; 90-minute lookback for current mappings | EV (currently) | Discrete OCPP under current mappings |
 | `strategy_11` | Recent profile q25 + discrete mapping | EV (discrete) | OCPP current-step |
-| `strategy_12` | Preconditioned binary + weather gate | Simulated HP | Binary ON/OFF lifecycle |
+| `strategy_12` | Preconditioned binary; weather gate disabled | Simulated HP | Binary ON/OFF lifecycle |
 
 | Metric | S1 | S2 | S3 | S4 | S5 | S6 | S7 | S8 | S9 | S10 | S11 | S12 |
 |--------|----|----|----|----|----|----|----|----|----|-----|-----|-----|
 | Flexibility method | Historical | Historical | Historical | Historical | Historical | Historical | Historical | Persistence | Persistence | Recent profile | Recent profile | Preconditioned binary |
 | Uses EV chargers | No | Yes | No | No | Yes | No | No | No | Yes | Yes | Yes | No |
-| EV modulation | — | — | — | — | — | — | — | — | Continuous | Continuous | Discrete (OCPP) | — |
+| EV asset mapping | — | Discrete | — | — | Discrete | — | — | — | Discrete | Discrete | Discrete | — |
 | Explicit asset filter | No | No | `ECM97.3` | `ECM96.2`, `ECM97.3` | No | No | `ECM96.2` | `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2`, `ECM96.2`, `ECM97.3` | `ECM63.1`, `ECM63.2` | `ECM63.1`, `ECM63.2` | `ECM62.10`, `ECM68.3`, `ECM162.1` |
-| Preheat / preconditioning | No | No | No | No | No | Yes | Yes | No | No | No | No | Yes, lifecycle-owned |
+| Preheat / preconditioning | No | No | No | No | No | Yes | Yes | No | No | No | No | Yes, lifecycle-owned; weather gate off |
 | Gated current-state method | No | No | No | No | No | No | No | Yes | Yes | Yes | Yes | Yes, binary telemetry validation |
-| Discrete state mapping | No | No | No | No | No | No | No | No | No | No | Yes | Binary OFF/ON |
-| Strategy-owned forecast settings | No | No | No | No | No | No | No | No | No | `recentProfileSettings` | `recentProfileSettings`, `discreteEvSettings` | `preconditionedBinarySettings`, `weatherGateSettings` |
+| Discrete state mapping | No | EV mapping | No | No | EV mapping | No | No | No | EV mapping | Yes with current mapping | Yes | Binary OFF/ON |
+| Strategy-owned forecast settings | No | No | No | No | No | No | No | No | No | `recentProfileSettings` | `recentProfileSettings`, `discreteEvSettings` | `preconditionedBinarySettings`, `preconditioningSettings`, `weatherGateSettings` |
 
 ---
 
@@ -776,8 +773,7 @@ There is no explicit retry counter, backoff, or sleep loop. The periodic manager
 Each strategy defines which assets can participate:
 - Heat pumps only: `strategy_1`, `strategy_3`, `strategy_4`, `strategy_6`, `strategy_7`, `strategy_8`
 - Heat pumps plus EV chargers: `strategy_2`, `strategy_5`, `strategy_9`
-- EV chargers only (continuous): `strategy_10`
-- EV chargers only (discrete OCPP): `strategy_11`
+- EV chargers only (recent profile, discrete under the current mappings): `strategy_10`, `strategy_11`
 - Simulated binary heat pumps only: `strategy_12`
 - Specific asset filters: `strategy_3`, `strategy_4`, `strategy_7`, `strategy_8`, `strategy_9`, `strategy_10`, `strategy_11`, `strategy_12`
 
@@ -803,9 +799,7 @@ In strategy mode, logs distinguish portfolio availability from strategy availabi
 For `strategy_12`, available flexibility is the sum of binary blocks whose telemetry proves they are currently ON and eligible under `preconditioned_binary`. A prepared asset that is not selected for current delivery remains ON during the maintain window; selected assets are switched OFF for delivery.
 
 ### 4. Price Acceptance
-Orders are only placed when the DSO's offered price meets the strategy's minimum:
-- Morning peak: Higher minimum prices (9.0-9.5 CHF/MW)
-- Off-peak: Lower minimum prices (5.0-6.0 CHF/MW)
+Orders are only placed when the DSO's offered price meets the active slot's main `bid_price`. Across the current strategies, morning-slot minimums range from 7.5 to 10.5 CHF/MW, while bidding off-peak minimums range from 4.5 to 6.0 CHF/MW. Strategy 12 uses 11.5 CHF/MW for its 17:00-20:00 delivery window and zero-price markers outside that window.
 
 ---
 
@@ -817,11 +811,11 @@ Strategies are configured in `conf/test_fm01_aem.json`:
 "bidding_strategies": {
   "strategy_4": {
     "name": "Hybrid (S3+S1)",
-    "description": "Morning peak aggressive + full day HP coverage",
+    "description": "Morning peak aggressive (S3) + full day HP coverage (S1) - RECOMMENDED",
     "asset_types": ["heat_pump"],
     "assets_filter": ["ECM96.2", "ECM97.3"],
     "time_slots": [
-      {"name": "Morning Peak", "start": "06:30", "end": "09:00", 
+      {"name": "Morning Peak (Aggressive)", "start": "06:30", "end": "09:00",
        "flexibility_mw": 0.040, "bid_price": 9.0, "activation_cost": 2.5},
       ...
     ]
@@ -849,17 +843,28 @@ Recent-profile strategies include strategy-owned forecast settings:
   "assets_filter": ["ECM63.1", "ECM63.2"],
   "flexibility_method": "recent_profile",
   "recentProfileSettings": {
-    "lookbackMinutes": 120,
+    "lookbackMinutes": 90,
     "quantile": 0.25,
     "continuousFactor": 0.5,
     "discreteFactor": 1.0,
-    "activeThresholdW": 500,
+    "activeThresholdW": 5000,
+    "maxConsecutiveActivationSlots": 4,
+    "cooldownSlotsAfterMaxActivation": 2,
     "minSamples": 2,
-    "missingMeasurementPolicy": "skip_asset"
+    "missingMeasurementPolicy": "skip_asset",
+    "adaptiveLookback": {
+      "enabled": true,
+      "appliesTo": "continuous",
+      "mode": "load_ratio",
+      "rules": [
+        {"minLoadRatio": 0.80, "lookbackMinutes": 45},
+        {"minLoadRatio": 0.65, "lookbackMinutes": 60}
+      ]
+    }
   },
   "time_slots": [
     {"name": "Morning Peak", "start": "06:30", "end": "09:00",
-     "flexibility_mw": 0.011, "bid_price": 9.0, "activation_cost": 2.5},
+     "flexibility_mw": 0.011, "bid_price": 7.5, "activation_cost": 2.5},
     ...
   ]
 }
@@ -870,12 +875,14 @@ Discrete EV strategies add a `discreteEvSettings` block:
 ```json
 "strategy_11": {
   "name": "Recent-profile discrete EV current-step flexibility",
+  "enabled": true,
   "asset_types": ["ev_charger"],
   "assets_filter": ["ECM63.1", "ECM63.2"],
   "flexibility_method": "recent_profile",
   "recentProfileSettings": {
     "lookbackMinutes": 45,
     "quantile": 0.25,
+    "continuousFactor": 0.5,
     "discreteFactor": 0.5,
     "activeThresholdW": 6000,
     "minSamples": 2,
@@ -896,25 +903,36 @@ Settings resolution order for `recentProfileSettings`:
 2. legacy global `flexibility.recentProfileSettings` (warning fallback)
 3. built-in defaults
 
-Preconditioned-binary strategies use Strategy 12-owned settings. A representative configuration shape is:
+Preconditioned-binary strategies use Strategy 12-owned settings. The relevant current configuration fields are:
 
 ```json
 "strategy_12": {
-  "name": "Simulated HP preconditioned binary flexibility",
+  "name": "Preconditioned Binary HP Flexibility",
+  "enabled": true,
+  "implementation_status": "preconditioned_binary_method_live",
   "asset_types": ["heat_pump"],
   "assets_filter": ["ECM62.10", "ECM68.3", "ECM162.1"],
   "flexibility_method": "preconditioned_binary",
+  "nominal_portfolio_flexibility_mw": 0.0504,
   "preconditionedBinarySettings": {
-    "stateToleranceW": 100,
+    "maxCurrentMeasurementAgeMinutes": 30,
     "minSamples": 2,
     "requireLatestOn": true,
     "minOnRatio": 0.8,
-    "maxCurrentMeasurementAgeMinutes": 30,
+    "stateToleranceW": 100,
     "missingMeasurementPolicy": "skip_asset"
   },
-  "weatherGateSettings": {
+  "preconditioningSettings": {
     "enabled": true,
-    "source": "constant",
+    "prepareStart": "14:00",
+    "flexibilityStart": "17:00",
+    "maintainUntil": "20:00",
+    "releaseAction": "force_off",
+    "ownerTag": "strategy_12"
+  },
+  "weatherGateSettings": {
+    "enabled": false,
+    "source": "flexibility.temperature.forecast",
     "temperatureThresholdC": 24.0,
     "evaluationStart": "17:00",
     "evaluationEnd": "20:00",
@@ -922,8 +940,16 @@ Preconditioned-binary strategies use Strategy 12-owned settings. A representativ
     "missingForecastPolicy": "skip_preconditioning"
   },
   "time_slots": [
-    {"name": "Delivery Window", "start": "17:00", "end": "20:00",
-     "flexibility_mw": 0.0504, "bid_price": 9.0, "activation_cost": 1.0}
+    {"name": "Pre-conditioning (configuration only)",
+     "start": "14:00", "end": "17:00", "flexibility_mw": 0.0,
+     "bid_price": 0.0, "activation_cost": 0.0, "is_preheat_period": true},
+    {"name": "Evening Peak Flex (preconditioned_binary)",
+     "start": "17:00", "end": "20:00", "flexibility_mw": 0.0504,
+     "bid_price": 11.5, "activation_cost": 0.8,
+     "target_window": true, "target_flexibility_mw": 0.0504},
+    {"name": "Off-window (no bid)",
+     "start": "20:00", "end": "14:00", "flexibility_mw": 0.0,
+     "bid_price": 0.0, "activation_cost": 0.0}
   ]
 }
 ```
@@ -947,11 +973,15 @@ The Strategy 12 asset mapping must use exact simulated asset IDs and binary stat
 Use equivalent entries for `ECM68.3` (`[0.0, 8.4]`) and `ECM162.1` (`[0.0, 6.0]`).
 
 ### FSP Configuration
-Each FSP can have a default strategy:
+Each configured FSP has its own portfolio and default strategy:
 ```json
 "supsi01": {
-  "strategy": "strategy_4",
-  ...
+  "strategy": "strategy_11",
+  "assets": ["ECM96.2", "ECM97.3", "ECM63.1", "ECM63.2"]
+},
+"supsi02": {
+  "strategy": "strategy_12",
+  "assets": ["ECM62.10", "ECM68.3", "ECM162.1"]
 }
 ```
 
@@ -971,7 +1001,7 @@ python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
     --fsp supsi01 --strategy strategy_8 --dry-run
 ```
 
-Recent-profile dry run (continuous EV):
+Recent-profile dry run (current discrete EV mappings):
 
 ```bash
 python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
@@ -1006,6 +1036,8 @@ python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json \
 ```
 
 ### Evaluate Strategy Performance
+The legacy evaluator defines most strategy slot assumptions internally rather than loading every current `bidding_strategies` value. Treat its output as a scenario estimate and verify its internal definitions before comparing results with live configuration.
+
 ```bash
 python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
     --start_date 2025-12-01 --end_date 2025-12-31
@@ -1018,9 +1050,9 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 1. **Use `strategy_4`** when you want the configured recommended historical/legacy HP hybrid.
 2. **Use `strategy_8`** when validating persistence bidding with the safer HP-only asset set.
 3. **Use `strategy_9`** only after validating EV telemetry quality, because it includes EV chargers.
-4. **Use `strategy_10`** when testing recent-profile EV bidding with continuous modulation (legacy approximation).
+4. **Use `strategy_10`** when testing its 90-minute recent-profile EV parameters; current EV mappings make its bidding and activation discrete.
 5. **Use `strategy_11`** for real OCPP EV chargers with discrete current-step states; this is the preferred strategy for production EV activation on `ECM63.1` and `ECM63.2`.
-6. **Use `strategy_12`** when testing simulated binary HP flexibility with weather-gated preparation and simulator measurement feedback.
+6. **Use `strategy_12`** when testing scheduled simulated binary HP preparation and simulator measurement feedback. Enable and validate the weather gate separately if temperature admission is required.
 7. **Use `strategy_6` or `strategy_7`** when specifically testing the configured preheat schedules.
 8. **Use dry-run first** before enabling live bidding for any strategy.
 
@@ -1042,7 +1074,7 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 | **Recommended Bid** | Quantity used for bidding after strategy filtering and achievable-flexibility logic |
 | **Recent profile** | Short-term flexibility method using a lower quantile of recent measurements |
 | **Persistence current-state gate** | Rule that assets below `activeThresholdW` contribute zero flexibility |
-| **Gated flexibility method** | Real-time method (`persistence`, `recent_profile`) that gates bids on current measurements and reuses the persistence activation path |
+| **Gated flexibility method** | Method that gates bids on current measurements; `persistence` and `recent_profile` reuse the persistence activation path, while `preconditioned_binary` uses the Strategy 12 lifecycle |
 | **Discrete states** | Finite set of power levels an asset can be commanded to; for OCPP EVs these correspond to integer current limits |
 | **OCPP current-step** | A specific integer current limit sent to the charger via OCPP; each step maps to a fixed kW power level |
 | **Overdelivery-tolerant selection** | Policy that prefers slightly more curtailment than requested over less, when exact discrete match is unavailable |
