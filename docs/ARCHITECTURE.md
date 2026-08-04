@@ -6,24 +6,53 @@ This document provides a high-level overview of the pyfm system: a Python framew
 
 ## System Overview
 
-pyfm implements an end-to-end flexibility market workflow for a Flexibility Service Provider (FSP). The FSP manages a portfolio of physical assets (heat pumps and EV chargers) and participates in a 15-minute-resolution energy flexibility market operated on the NODES platform.
+pyfm implements an end-to-end flexibility-market workflow for two configured Flexibility Service Providers (FSPs). The FSPs manage real heat pumps and EV chargers plus a separate simulated heat-pump portfolio in a 15-minute NODES market.
 
-The system is organized around four sequential pipeline stages, each implemented as an independent scheduled process:
+The operational flow has shared market and database handoffs, followed by two different RabbitMQ routes:
 
+```text
+InfluxDB -> baseline_updater.py -> NODES baselines --+
+trader_dso.py ------------------> NODES buy orders   +-> NODES market/trades
+trader_fsp.py <------------------ NODES baselines    |
+trader_fsp.py ------------------> NODES sell orders -+
+      |
+      +-> PostgreSQL bid records and selected assets
+
+PostgreSQL records + NODES accepted trades -> flexi_manager.py
+                                                |
+                                                +-> realAssetCommands
+                                                |        -> forwarder.py -> AEM/HTTP target
+                                                |
+                                                +-> simulatedAssetCommands
+                                                         -> external simulator
+                                                                  |
+                                                                  +-> simulatedAssetMeasures
+                                                                           -> forwarder.py
+                                                                           -> configured target
 ```
-┌──────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│   BASELINE   │     │  TRADING &       │     │   ACTIVATION     │     │   FORWARDING     │
-│   UPDATER    │────▶│  BIDDING         │────▶│   MANAGER        │────▶│   (RabbitMQ +    │
-│              │     │                  │     │                  │     │    Forwarder)    │
-│ baseline_    │     │ trader_dso.py    │     │ flexi_manager.py │     │ forwarder.py     │
-│ updater.py   │     │ trader_fsp.py    │     │                  │     │                  │
-└──────────────┘     └──────────────────┘     └──────────────────┘     └──────────────────┘
-    InfluxDB             NODES API               PostgreSQL              RabbitMQ
-    NODES API            PostgreSQL               NODES API              HTTP / AEM API
-                         InfluxDB                 RabbitMQ
-```
 
-All components share a common JSON configuration file (e.g. `conf/test_fm01_aem.json`) and a private connections overlay (`conf/private/conns.json`) containing credentials for NODES, PostgreSQL, InfluxDB, and RabbitMQ.
+Simulated commands do not pass through `forwarder.py`; the external simulator consumes them directly. The forwarder consumes real commands and simulated measurements.
+
+The market and control components load `conf/test_fm01_aem.json` and merge the configured private `conf/private/conns.json` overlay. The forwarder has its own target configuration and also resolves RabbitMQ/API connection details from the private overlay.
+
+### Current Configuration Snapshot
+
+| Setting | Configured value |
+|---------|------------------|
+| Location | Lugano (`46.0037`, `8.9511`) |
+| Market | `Opentunity-CH`, Switzerland |
+| Community / DSO | `ECM` / `AEM` |
+| Market granularity | 15 minutes |
+| Order and baseline target shift | 90 minutes |
+| Baseline source / strategy | InfluxDB-backed `db` / `slot_persistence` |
+| Global flexibility fallback | `persistence` |
+
+| FSP | Default strategy | Assigned assets | Command path |
+|-----|------------------|-----------------|--------------|
+| `supsi01` | `strategy_11` | `ECM96.2`, `ECM97.3`, `ECM63.1`, `ECM63.2` | `realAssetCommands` |
+| `supsi02` | `strategy_12` | `ECM62.10`, `ECM68.3`, `ECM162.1` | `simulatedAssetCommands` |
+
+The asset mapping contains additional assets that are not assigned to these FSP portfolios. Strategy eligibility is always intersected with the selected FSP portfolio. `ECM62.10` is one independent 36 kW simulated asset, not an alias for `ECM62.1`, `ECM62.2`, or `ECM62.3`.
 
 ---
 
@@ -40,9 +69,16 @@ The baseline is the reference power consumption profile for each asset portfolio
 - Aggregates asset-level baselines into a portfolio-level baseline.
 - Uploads the baseline to the NODES platform and optionally saves it to InfluxDB.
 
-**Operational mode:** In the current deployment, `slot_persistence` is used. Each 15-minute run computes the next open target slot by reading the measured power at a configured lag (e.g. 90 minutes) and uploading that single baseline interval. Different assets can have different lag overrides to accommodate telemetry latency differences.
+**Current operational mode:**
 
-**Scheduling:** Runs every 15 minutes, ahead of the trading window, to keep baselines fresh for upcoming market slots.
+- `baseline.source` is `db` and `baseline.dbSettings.strategy` is `slot_persistence`.
+- `shiftMinutes: 90` selects the target horizon 90 minutes after the current 15-minute boundary.
+- `upcomingHoursToQuery: 24` builds the candidate horizon, while `uploadOnlyComputableHorizon: true` and `maxSlotsToUpload: 1` limit each run to the first computable target slot.
+- Every asset assigned to either current FSP has `baseline_persistence_go_back_minutes: 120`, so its source measurement is taken 120 minutes before the target slot. The 90-minute shift and 120-minute source lag are separate settings.
+- `missingMeasurementPolicy: "zero_fill_asset"` contributes zero for an asset whose source measurement is missing instead of failing the entire portfolio.
+- `valueMultiplier: -1.0` inverts the aggregated baseline sign before upload.
+
+**Scheduling:** The deployment examples run the updater every 15 minutes. Scheduling is external to the JSON configuration.
 
 **Detailed documentation:**
 
@@ -65,22 +101,31 @@ The DSO agent computes how much flexibility the grid needs for a future 15-minut
 The FSP agent responds to DSO flexibility requests by:
 
 1. Downloading current baselines from NODES.
-2. Computing available flexibility from the asset portfolio, using either historical patterns or real-time persistence measurements.
+2. Computing available flexibility from the asset portfolio using the selected strategy's historical, persistence, recent-profile, or preconditioned-binary method.
 3. Applying a bidding strategy that determines which assets to include, the bid quantity, and the price for the current time-of-day window.
 4. Posting Sell orders to the NODES market.
 5. Recording bid details (strategy, assets, quantities) in PostgreSQL for the activation stage.
 
-**Discretization-aware bidding:** The FSP correctly handles the physical constraints of discrete assets (heat pumps: ON/OFF only) and continuous assets (EV chargers: any power level). Bids reflect only quantities that can actually be delivered, avoiding delivery mismatches.
+**Discretization-aware bidding:** Every asset in the current mapping is discrete. Heat pumps have binary OFF/ON states, while `ECM63.1` and `ECM63.2` expose seven OCPP power states from 6.93 to 11.0 kW. The engine also supports continuous assets, but none are currently mapped as continuous. Recommended bids are constrained to achievable allocations.
 
-**Bidding strategies:** The system supports multiple configurable strategies (currently `strategy_1` through `strategy_11`), each defining allowed asset types, time-of-day windows, flexibility targets, and prices. Strategies can use different flexibility methods: historical averages, slot persistence, or recent-profile forecasting.
+**Bidding strategies:** The configuration contains `strategy_1` through `strategy_12`:
 
-**Scheduling:** The FSP trader runs every 15 minutes (at minutes :05, :20, :35, :50) and bids 90 minutes ahead of the delivery slot (`fm.ordersTimeShift = 90`).
+| Strategies | Flexibility method | Current role |
+|------------|--------------------|--------------|
+| `strategy_1`-`strategy_7` | Historical/legacy | Legacy schedules; no explicit method override |
+| `strategy_8`, `strategy_9` | `persistence` | Current-state-gated lagged flexibility |
+| `strategy_10`, `strategy_11` | `recent_profile` | Quantile-based EV forecasting with the current discrete EV mappings |
+| `strategy_12` | `preconditioned_binary` | Telemetry-gated simulated binary-HP flexibility |
+
+The global `flexibility.method` is `persistence`, but strategy mode resolves the method from the selected strategy: strategies without an explicit `flexibility_method` remain historical/legacy. `supsi01` defaults to Strategy 11 and `supsi02` defaults to Strategy 12.
+
+**Scheduling:** The deployment examples run the FSP trader at minutes `:05`, `:20`, `:35`, and `:50`. The code rounds the current UTC time down to a 15-minute boundary and then applies `fm.ordersTimeShift: 90`; the cron schedule itself is not stored in this JSON file.
 
 **Detailed documentation:**
 
 - [README_trader_dso.md](README_trader_dso.md) -- DSO agent configuration, pricing model, and execution steps
 - [README_trader_fsp.md](README_trader_fsp.md) -- FSP agent, persistence mode, discretization-aware bidding, strategy selection
-- [BIDDING_STRATEGIES.md](BIDDING_STRATEGIES.md) -- full reference for all 11 bidding strategies with configuration examples
+- [BIDDING_STRATEGIES.md](BIDDING_STRATEGIES.md) -- full reference for all 12 bidding strategies with current configuration examples
 - [FLEXIBILITY_ANALYSIS.md](FLEXIBILITY_ANALYSIS.md) -- how available flexibility is calculated (historical and persistence modes)
 - [README_simulate_strategy_bidding.md](README_simulate_strategy_bidding.md) -- historical replay tool for strategy evaluation without market interaction
 
@@ -88,25 +133,36 @@ The FSP agent responds to DSO flexibility requests by:
 
 ### 3. Activation
 
-After the market clears and trades are accepted, the activation stage delivers the promised flexibility by controlling physical assets.
+The activation manager handles normal accepted-trade delivery and the separate Strategy 12 preconditioning lifecycle.
 
 **What it does:**
 
-1. Reads the bid record from PostgreSQL to recover which strategy was used and which assets are allowed.
-2. Queries NODES for accepted trades to determine the actual sold quantity (not the bid quantity).
-3. Allocates the sold quantity across allowed assets using a modulation-aware algorithm that respects discrete (ON/OFF) and continuous (linear) constraints.
-4. Generates curtailment commands (switch OFF for heat pumps, reduce power for EV chargers).
-5. Tracks previously controlled assets via a state file and automatically generates restore commands when assets are no longer needed.
-6. Publishes all commands to RabbitMQ for downstream forwarding.
-7. Records activation details in PostgreSQL (`public.asset_activations`).
+1. Resolves the selected FSP and active strategy, including any enabled strategy-owned lifecycle.
+2. Reads the bid record from PostgreSQL to recover the strategy and selected bid assets for the target slot.
+3. Queries the local market ledger and then NODES accepted trades to determine the actual sold quantity, not merely the offered quantity.
+4. Allocates the sold quantity across allowed assets using modulation-aware achievable-flexibility logic.
+5. Generates curtailment commands: binary OFF for heat pumps and a feasible lower OCPP state for the currently discrete EV chargers.
+6. Tracks controlled or lifecycle-owned assets in persistent state and generates restore/cleanup commands when required.
+7. Publishes commands to the `rabbitCommandSection` selected by each asset mapping.
+8. Records delivery activations in PostgreSQL (`public.asset_activations`).
 
-**Allocation strategies:** The default `modulation_aware` strategy allocates to discrete assets first using subset-sum optimization, then fills remaining flexibility with continuous assets. Alternative strategies include `proportional`, `priority`, and `cost_optimal`.
+**Allocation strategies:** The default `modulation_aware` strategy allocates discrete assets using achievable combinations and can then fill any remainder with continuous assets. The latter capability is available to the engine even though the current configuration has no continuous mappings. Alternative strategies include `proportional`, `priority`, and `cost_optimal`.
 
-**Autonomous mode:** When no bid record exists for a slot, the manager can optionally analyze historical DSO demand patterns to predict upcoming price increases and recommend (or execute) pre-activation of heat pump assets.
+**Strategy 12 lifecycle:** `supsi02` has `preconditioningSettings.enabled: true`:
+
+| Phase | Configured time | Manager intent |
+|-------|-----------------|----------------|
+| Prepare | 14:00-17:00 | Command all `ECM62.10`, `ECM68.3`, and `ECM162.1` assets ON |
+| Maintain | 17:00-20:00 | Keep non-selected assets ON and command selected delivery assets OFF |
+| Release | At/after 20:00 | Command all lifecycle-owned assets OFF and clear ownership after acceptance |
+
+The Strategy 12 weather gate is configured but currently disabled, so temperature does not gate preparation. Preparation, release, and idle-cleanup commands are lifecycle operations; only delivery OFF commands create activation records.
+
+**Autonomous mode:** The general no-bid analyzer is enabled with a 3-hour lookahead, 7 historical days, and a 20% price-increase threshold. `preactivation_enabled` is `false`, so it can recommend pre-activation but does not publish autonomous pre-activation commands. This subsystem is separate from the enabled Strategy 12 lifecycle.
 
 **Manual activation:** The `flexi_actuator.py` script provides a one-shot CLI for forcing individual assets on/off without running the full manager workflow.
 
-**Scheduling:** Runs every 15 minutes (at minutes :14, :29, :44, :59), just before the delivery slot begins.
+**Scheduling:** Deployment examples run the manager at minutes `:14`, `:29`, `:44`, and `:59`, just before the next delivery boundary. Scheduling is external to the JSON configuration.
 
 **Detailed documentation:**
 
@@ -118,12 +174,13 @@ After the market clears and trades are accepted, the activation stage delivers t
 
 ### 4. Forwarding
 
-The forwarding layer decouples command generation from physical device actuation using RabbitMQ as a message broker.
+RabbitMQ decouples command generation from consumers, but the consumer differs by section: the pyfm forwarder handles real commands and simulated measurements, while the external simulator handles simulated commands.
 
 **What it does:**
 
-- Consumes control commands from RabbitMQ queues.
-- Translates generic curtail/restore commands into protocol-specific HTTP requests for configured targets (e.g. the AEM API).
+- Consumes real control commands from `realAssetCommands`.
+- Consumes simulated measurement envelopes from `simulatedAssetMeasures`.
+- Translates supported messages into protocol-specific HTTP requests for configured targets such as the AEM API.
 - Supports dry-run (log only) and live (HTTP POST) modes, with the payload `dry_run` flag providing an additional safety layer.
 - Handles retries, timeouts, and per-target configuration.
 
@@ -131,13 +188,13 @@ The forwarding layer decouples command generation from physical device actuation
 
 | Section | Producer | Consumer | Purpose |
 |---------|----------|----------|---------|
-| `realAssetCommands` | flexi_manager / flexi_actuator | forwarder | Real physical asset commands |
-| `simulatedAssetCommands` | flexi_manager / flexi_actuator | External simulator (not in pyfm) | Commands for simulated assets |
-| `simulatedAssetMeasures` | External simulator | forwarder | Simulated measurement results |
+| `realAssetCommands` | `flexi_manager.py` / `flexi_actuator.py` | `forwarder.py` | Real physical asset commands |
+| `simulatedAssetCommands` | `flexi_manager.py` / `flexi_actuator.py` | External simulator, not pyfm | Commands for simulated assets |
+| `simulatedAssetMeasures` | External simulator | `forwarder.py` | Simulated measurements forwarded to the configured target |
 
-Each asset's `rabbitCommandSection` in `asset_mapping` determines which path its commands follow.
+Each asset's `rabbitCommandSection` in `asset_mapping` determines its command path. All real heat pumps and EV chargers map to `realAssetCommands`; all `ECM62.*`, `ECM68.3`, and `ECM162.1` simulated heat pumps map to `simulatedAssetCommands`. `simulatedAssetMeasures` is a measurement source and is not a valid asset command destination.
 
-**Scheduling:** The forwarder runs as a long-lived consumer process (typically a Docker service), continuously listening for commands.
+**Scheduling:** The forwarder runs as a long-lived consumer process, typically a Docker service, with the standard section selection `realAssetCommands,simulatedAssetMeasures`. It must not consume `simulatedAssetCommands` in the standard simulator topology.
 
 **Detailed documentation:**
 
@@ -152,10 +209,12 @@ Each asset's `rabbitCommandSection` in `asset_mapping` determines which path its
 
 | Service | Role | Used By |
 |---------|------|---------|
-| **NODES API** | Flexibility market platform (baselines, orders, trades, settlements) | All components |
-| **InfluxDB** | Time-series storage for asset measurements and generated baselines | baseline_updater, trader_fsp |
-| **PostgreSQL** | Bid records, demand records, market ledger, asset activations | trader_fsp, flexi_manager |
-| **RabbitMQ** | Message broker for command forwarding | flexi_manager, forwarder |
+| **NODES API** | Flexibility market platform for baselines, orders, trades, and settlements | baseline updater, DSO/FSP traders, flexibility manager |
+| **InfluxDB** | Time-series storage queried for asset measurements and used for generated baselines | baseline updater, FSP trader |
+| **PostgreSQL** | Bid records, selected bid assets, demand records, market ledger, and delivery activations | FSP trader, flexibility manager |
+| **RabbitMQ** | Section-based transport for real commands, simulated commands, and simulated measurements | manager, actuator, forwarder, external simulator |
+| **AEM / HTTP APIs** | Downstream real-command and measurement targets | forwarder |
+| **External simulator** | Consumes simulated HP commands and publishes simulated measurements | Strategy 12 path |
 
 ### Database Handoff
 
@@ -175,36 +234,39 @@ trader_fsp.py                              flexi_manager.py
 
 ### End-to-End Timeline for a Single Delivery Slot
 
-For a delivery slot at `12:15-12:30 UTC`:
+For a normal `supsi01` delivery slot at `12:15-12:30 UTC`, assuming the documented cron examples:
 
 | Wall Clock (UTC) | Component | Action |
 |-------------------|-----------|--------|
-| ~12:00 (rolling) | `baseline_updater.py` | Uploads baseline for the 12:15 slot using 90-min lagged measurements |
-| 10:50 | `trader_fsp.py` | Bids for 12:15 slot (90 min ahead), writes bid record to PostgreSQL |
+| 10:45 | `baseline_updater.py` | Selects the 12:15 target (`+90 min`), reads each assigned asset at 10:15 (`target - 120 min`), and uploads one baseline slot |
+| 10:50 | `trader_fsp.py` | Floors time to 10:45, applies `+90 min`, bids for 12:15, and writes the bid record and selected assets |
 | 10:50 - 12:14 | NODES market | Clears orders, matches trades |
 | 12:14 | `flexi_manager.py` | Reads bid record, queries accepted trades, allocates flexibility, publishes commands |
-| 12:14 | `forwarder.py` | Receives commands from RabbitMQ, forwards HTTP requests to AEM API |
-| 12:15 - 12:30 | Physical assets | Deliver flexibility (heat pumps OFF, EV chargers reduced) |
+| 12:14 | `forwarder.py` | Consumes `realAssetCommands` and sends configured HTTP requests |
+| 12:15 - 12:30 | Real assets | Deliver flexibility using binary HP states or feasible EV OCPP states |
 | 12:29 | `flexi_manager.py` | Next slot: restores assets no longer needed, activates new ones |
+
+Strategy 12 adds schedule-driven manager work outside this accepted-trade sequence: preparation from 14:00-17:00, maintain/delivery from 17:00-20:00, and release at or after 20:00. Its commands go to the external simulator, not the forwarder.
 
 ---
 
 ## Operational Workflow
 
-The scheduled cron jobs that drive the system are documented in detail in [jobs_shortflex_workflow.md](jobs_shortflex_workflow.md). The key points:
+The scheduled cron jobs are deployment concerns rather than JSON settings. A configuration-aligned example runs the same pipeline once per FSP and lets each FSP use its configured default strategy:
 
 ```cron
-# Baseline updater (every 15 minutes)
+# Real portfolio baseline and trading
 */15 * * * * .venv/bin/python scripts/baseline_updater.py --config_file conf/test_fm01_aem.json --fsp supsi01
-
-# FSP trader (minutes :05, :20, :35, :50)
-5,20,35,50 * * * * .venv/bin/python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json --fsp supsi01 --strategy strategy_4
-
-# Flexibility manager (minutes :14, :29, :44, :59)
+5,20,35,50 * * * * .venv/bin/python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json --fsp supsi01
 14,29,44,59 * * * * .venv/bin/python scripts/flexi_manager.py --config_file conf/test_fm01_aem.json --fsp supsi01 --live --rabbitmq
+
+# Simulated Strategy 12 portfolio
+*/15 * * * * .venv/bin/python scripts/baseline_updater.py --config_file conf/test_fm01_aem.json --fsp supsi02
+5,20,35,50 * * * * .venv/bin/python scripts/trader_fsp.py --config_file conf/test_fm01_aem.json --fsp supsi02
+14,29,44,59 * * * * .venv/bin/python scripts/flexi_manager.py --config_file conf/test_fm01_aem.json --fsp supsi02 --live --rabbitmq
 ```
 
-The forwarder runs as a persistent Docker service consuming from `realAssetCommands` and `simulatedAssetMeasures`.
+Without a CLI `--strategy` override, `supsi01` selects `strategy_11` and `supsi02` selects `strategy_12`. The forwarder runs as a persistent Docker service consuming `realAssetCommands` and `simulatedAssetMeasures`; the external simulator separately consumes `simulatedAssetCommands`.
 
 **Detailed documentation:** [jobs_shortflex_workflow.md](jobs_shortflex_workflow.md) -- execution timeline, config dependencies, dry-run vs production behavior, and debugging checklist.
 
@@ -216,7 +278,7 @@ Beyond the operational pipeline, the repository includes several analysis and ev
 
 | Tool | Purpose | Documentation |
 |------|---------|---------------|
-| Strategy Evaluator | Backtest bidding strategies against historical market data | [README_strategy_evaluator.md](../scripts/README_strategy_evaluator.md) |
+| Strategy Evaluator | Legacy scenario evaluator with internal strategy definitions; not every current JSON slot value is loaded | [README_strategy_evaluator.md](../scripts/README_strategy_evaluator.md) |
 | Strategy Simulator | Replay production bidding logic without market interaction | [README_simulate_strategy_bidding.md](README_simulate_strategy_bidding.md) |
 | Baseline Forecast Evaluator | Compare baseline forecasts against actual measurements | [baseline_forecast_evaluator.md](baseline_forecast_evaluator.md) |
 | AEM WTP/Demand Analysis | Analyze DSO willingness-to-pay patterns and demand heatmaps | [README_aem_wtp_demand_analysis.md](README_aem_wtp_demand_analysis.md) |
@@ -235,14 +297,18 @@ Strategy design documents:
 
 ## Key Design Decisions
 
-1. **PostgreSQL as the trader-to-manager handoff:** Bid records in PostgreSQL are the sole coordination mechanism. There is no file-based or message-based handoff between trading and activation.
+1. **PostgreSQL as the normal trader-to-manager handoff:** Bid records and selected bid assets coordinate accepted-trade delivery. Strategy 12 preparation and cleanup are instead driven by its active configuration and persistent lifecycle ownership.
 
-2. **NODES accepted trades as the activation trigger:** The manager activates flexibility based on what was actually sold (accepted trades), not what was offered (bid quantity). This prevents over-activation.
+2. **NODES accepted trades as the normal delivery trigger:** The manager delivers the quantity actually sold, not merely the bid quantity. Strategy 12 prepare/release phases are schedule-driven lifecycle operations rather than sold-flexibility activations.
 
 3. **Strategy awareness through the full pipeline:** The bidding strategy chosen at trading time is persisted in the bid record and honored at activation time, ensuring that only the assets included in the bid are activated.
 
 4. **Separation of baseline and flexibility persistence:** Baseline uploading (`slot_persistence`) and bidding flexibility (`flexibility_method: "persistence"`) are independent configurations that can be mixed with other modes.
 
-5. **Decoupled forwarding:** Command generation (flexi_manager) is separated from physical actuation (forwarder) via RabbitMQ, enabling independent scaling, protocol translation, and robust dry-run testing.
+5. **Decoupled command consumption:** Command generation in `flexi_manager.py` is separated from consumers through RabbitMQ. The forwarder handles the real path, while the external simulator handles simulated commands.
 
-6. **Discretization awareness:** Both the bidding and activation stages correctly handle the physical constraints of ON/OFF assets (heat pumps) vs continuously modulatable assets (EV chargers), preventing delivery mismatches.
+6. **Discretization awareness:** The engine supports binary, multi-state, and continuous assets. In the current configuration all mappings are discrete: heat pumps are binary and EV chargers use seven OCPP states from 6.93 to 11.0 kW.
+
+7. **Strategy-scoped flexibility methods:** Historical, persistence, recent-profile, and preconditioned-binary strategies coexist without the global persistence fallback changing strategies that omit an explicit method.
+
+8. **Section-owned command routing:** Real commands go through the forwarder, simulated commands go directly to the external simulator, and simulated measurements return through the forwarder.
