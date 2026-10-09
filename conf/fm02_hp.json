@@ -235,7 +235,7 @@
     }
   },
   "autonomous": {
-    "enabled": true,
+    "enabled": false,
     "lookahead_hours": 3,
     "historical_days": 7,
     "price_increase_threshold_pct": 20,
