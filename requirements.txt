@@ -18,5 +18,9 @@ urllib3==2.2.1
 scikit-learn==1.5.1
 joblib==1.4.2
 
-# Test runner
-pytest==9.0.2
+quantile-forest==1.4.2
+matplotlib==3.9.2
+
+# Mode 2 dataset builder (Parquet + calendar holidays)
+pyarrow==16.1.0
+holidays==0.53
