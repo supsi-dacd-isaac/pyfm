@@ -21,13 +21,18 @@ class FSP(Player):
         """
         super().__init__(fsp_cfg, main_cfg, logger)
 
-        # Get identifier of NODES platform
-        res = self.get_organization_id()
-        self.nodes_id = res["items"][0]["id"]
+        # Resolve and validate the configured NODES organization.
+        organization = self._resolve_configured_organization()
+        self.nodes_id = organization["id"]
+        self.organization = organization
 
-        # Portfolios owned by the FSP
+        # Portfolios owned by the FSP. New configurations select one explicit
+        # portfolio; legacy configurations without a selector retain the old
+        # all-portfolios behaviour.
+        portfolio_items = self.get_portfolios().get("items", [])
+        portfolio_items = self._select_configured_portfolios(portfolio_items)
         self.portfolios = {}
-        for p in self.get_portfolios()["items"]:
+        for p in portfolio_items:
             self.portfolios[p["id"]] = Portfolio(p["id"], p)
 
         # Asset owned by the FSP
@@ -43,9 +48,74 @@ class FSP(Player):
 
         # Assign assets to portfolios
         self.set_portfolios_assets()
+        self._validate_configured_portfolio_assets()
 
         # Baselines
         self.baselines = {}
+
+    def _resolve_configured_organization(self):
+        response = self.get_organization_id()
+        organizations = response.get("items", []) if isinstance(response, dict) else []
+        expected_id = self.cfg.get("organizationId")
+        expected_name = self.cfg.get("name")
+        matches = [
+            organization
+            for organization in organizations
+            if (not expected_id or organization.get("id") == expected_id)
+            and (not expected_name or organization.get("name") == expected_name)
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Unable to resolve exactly one configured NODES organization "
+                "(id=%r, name=%r); matched %d"
+                % (expected_id, expected_name, len(matches))
+            )
+        return matches[0]
+
+    def _select_configured_portfolios(self, portfolio_items):
+        expected_id = self.cfg.get("portfolioId")
+        expected_name = self.cfg.get("portfolioName")
+        if not expected_id and not expected_name:
+            return portfolio_items
+
+        matches = [
+            portfolio
+            for portfolio in portfolio_items
+            if (not expected_id or portfolio.get("id") == expected_id)
+            and (not expected_name or portfolio.get("name") == expected_name)
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Unable to resolve exactly one configured NODES portfolio "
+                "(id=%r, name=%r) for organization %r; matched %d"
+                % (expected_id, expected_name, self.nodes_id, len(matches))
+            )
+        self.logger.info(
+            "Selected configured NODES portfolio: id=%s name=%s",
+            matches[0].get("id"),
+            matches[0].get("name"),
+        )
+        return matches
+
+    def _validate_configured_portfolio_assets(self):
+        if not self.cfg.get("portfolioId") and not self.cfg.get("portfolioName"):
+            return
+
+        expected_assets = set(self.cfg.get("assets", []))
+        actual_assets = set()
+        for portfolio_id in self.portfolios:
+            actual_assets.update(self.get_portfolio_asset_names(portfolio_id))
+
+        if actual_assets != expected_assets:
+            raise RuntimeError(
+                "Configured portfolio asset mismatch: expected=%s actual=%s missing=%s unexpected=%s"
+                % (
+                    sorted(expected_assets),
+                    sorted(actual_assets),
+                    sorted(expected_assets - actual_assets),
+                    sorted(actual_assets - expected_assets),
+                )
+            )
 
     def set_assets_mpids(self):
         for k_p in self.portfolios.keys():

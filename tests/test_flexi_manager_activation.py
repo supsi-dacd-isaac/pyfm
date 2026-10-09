@@ -2928,3 +2928,356 @@ def test_comfort_N_existing_continuation_still_works(tmp_path):
     saved = _load_state(state_file)
     assert saved["ECM63.1"]["state"] == "controlled"
     assert saved["ECM63.1"]["consecutive_activation_slots"] == 2
+
+
+# =============================================================================
+# STRATEGY 13 HP OFF-ONLY ACTIVATION TESTS
+# =============================================================================
+
+_HP_OFF_ONLY_STRATEGY_ID = "strategy_13"
+
+
+def _hp_off_only_strategy_config():
+    return {
+        "name": "Conservative HP OFF-only Strategy",
+        "description": "test HP OFF-only strategy",
+        "asset_types": ["heat_pump"],
+        "assets_filter": ["ECM96.2", "ECM97.3"],
+        "flexibility_method": "hp_off_only",
+        "hpOffOnlySettings": {
+            "controlMode": "off_only",
+            "allowPreheating": False,
+            "baselineGoBackMinutes": 1440,
+            "recentWindowMinutes": 60,
+            "quantile": 0.25,
+            "minSamples": 3,
+            "minActiveRatio": 0.75,
+            "activeThresholdW": 500,
+            "maxCurrentMeasurementAgeMinutes": 30,
+            "defaultSafetyFactor": 1.0,
+            "missingMeasurementPolicy": "skip_asset",
+            "bidStepKw": 1.0,
+            "minimumBidKw": 1.0,
+        },
+        "time_slots": [{
+            "name": "All day",
+            "start": "00:00",
+            "end": "23:59",
+            "flexibility_mw": 0.036,
+            "bid_price": 9.0,
+            "activation_cost": 2.5,
+        }],
+    }
+
+
+def _hp_asset(capacity_kw, description):
+    return {
+        "type": "heat_pump",
+        "description": description,
+        "capacity_kw": capacity_kw,
+        "modulation_type": "discrete",
+        "discrete_states_kw": [0.0, capacity_kw],
+        "device_name_tag": description.lower().replace(" ", "_"),
+        "pod": "ECM96" if capacity_kw == 6.0 else "ECM97",
+    }
+
+
+class TrackingMeasurementProvider(FakeMeasurementProvider):
+    def __init__(self, measurements=None):
+        super().__init__(measurements)
+        self.calls = []
+
+    def get_latest_power(self, asset_id, current_time_utc, max_age_minutes):
+        self.calls.append((asset_id, max_age_minutes))
+        return super().get_latest_power(asset_id, current_time_utc, max_age_minutes)
+
+
+class DisconnectedRabbitPublisher:
+    def is_connected(self):
+        return False
+
+
+_NO_MEASUREMENT_PROVIDER = object()
+
+
+def _new_hp_off_only_manager(
+    tmp_path,
+    bid_record_assets,
+    measurement_provider=_NO_MEASUREMENT_PROVIDER,
+    previous_state=None,
+    rabbitmq_publisher=None,
+    autonomous=None,
+):
+    asset_mapping = {
+        "ECM96.2": _hp_asset(6.0, "HP small"),
+        "ECM97.3": _hp_asset(30.0, "HP large"),
+    }
+    config = {
+        "fm": {
+            "community": "test",
+            "granularity": 15,
+            "actors": {
+                "fsps": {
+                    "supsi02": {
+                        "name": "SUPSI_HP",
+                        "strategy": _HP_OFF_ONLY_STRATEGY_ID,
+                        "assets": list(asset_mapping),
+                    }
+                }
+            },
+        },
+        "asset_mapping": asset_mapping,
+        "bidding_strategies": {
+            _HP_OFF_ONLY_STRATEGY_ID: _hp_off_only_strategy_config(),
+        },
+        "autonomous": autonomous or {"enabled": False},
+    }
+    state_file = str(tmp_path / "hp_state.json")
+    if previous_state is not None:
+        _write_previous_state(state_file, previous_state)
+
+    manager = fm.FlexibilityManager(
+        config=config,
+        fsp_id="supsi02",
+        nodes_interface=FakeNodesInterface(),
+        bid_repo=None,
+        logger=_logger(),
+        nodes_authenticated=False,
+        rabbitmq_publisher=rabbitmq_publisher,
+        demand_repo=None,
+        state_file=state_file,
+    )
+    manager.organization_id = "org-hp"
+    manager.market_handler = FakeMarketHandler([])
+    if measurement_provider is not _NO_MEASUREMENT_PROVIDER:
+        manager.activation_measurement_provider = measurement_provider
+
+    bid_handler = FakeBidHandler()
+    bid_handler.bid_record = {
+        "id": "bid-hp-off-only-1",
+        "total_quantity_mw": sum(
+            row.get("available_flexibility_kw", 0.0) for row in bid_record_assets
+        ) / 1000.0,
+        "assets_to_activate": bid_record_assets,
+        "strategy": {
+            "id": _HP_OFF_ONLY_STRATEGY_ID,
+            "name": "Conservative HP OFF-only Strategy",
+        },
+    }
+    manager.bid_handler = bid_handler
+    return manager, state_file
+
+
+def _fresh_hp_measurement(power_w, age_minutes=5.0):
+    return {
+        "valid": True,
+        "timestamp_utc": "2026-10-08T11:55:00Z",
+        "power_w": power_w,
+        "age_minutes": age_minutes,
+    }
+
+
+def test_hp_off_only_fresh_active_hp_receives_off_and_reports_delivery_risk(tmp_path):
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+    })
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "simulated"
+    assert result["discrete_state"] == "OFF"
+    assert result["target_power_kw"] == pytest.approx(0.0)
+    assert result["activation_current_power_kw"] == pytest.approx(4.2)
+    assert result["estimated_delivery_kw"] == pytest.approx(4.2)
+    assert result["delivery_shortfall_risk_kw"] == pytest.approx(1.8)
+    assert result["delivery_at_risk"] is True
+    assert summary["hp_off_only_commanded_assets"] == ["ECM96.2"]
+    assert summary["hp_off_only_estimated_delivery_kw"] == pytest.approx(4.2)
+    assert summary["hp_off_only_delivery_shortfall_risk_kw"] == pytest.approx(1.8)
+    assert provider.calls == [("ECM96.2", 30)]
+
+
+@pytest.mark.parametrize("power_w", [0.0, 499.9, 500.0])
+def test_hp_off_only_at_or_below_500w_is_ineligible_and_receives_no_off(
+    tmp_path, power_w
+):
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(power_w),
+    })
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["target_power_kw"] is None
+    assert "at or below" in result["skip_reason"]
+    assert manager.controller._pending_commands == []
+    assert summary["hp_off_only_commanded_assets"] == []
+    assert summary["total_flexibility_deliverable_kw"] == pytest.approx(0.0)
+    assert summary["status"] == "activation_failed"
+
+
+@pytest.mark.parametrize(
+    ("measurement_provider", "expected_reason"),
+    [
+        (_NO_MEASUREMENT_PROVIDER, "no activation measurement provider"),
+        (TrackingMeasurementProvider({}), "no valid current measurement"),
+        (
+            TrackingMeasurementProvider({
+                "ECM96.2": _fresh_hp_measurement(4000.0, age_minutes=31.0),
+            }),
+            "stale or future-dated",
+        ),
+    ],
+)
+def test_hp_off_only_missing_or_stale_telemetry_fails_closed(
+    tmp_path, measurement_provider, expected_reason
+):
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=measurement_provider,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert expected_reason in result["skip_reason"]
+    assert manager.controller._pending_commands == []
+
+
+def test_hp_off_only_partial_acceptance_checks_and_commands_selected_subset_only(tmp_path):
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(5500.0),
+        "ECM97.3": _fresh_hp_measurement(20000.0),
+    })
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [
+            {"asset_id": "ECM97.3", "available_flexibility_kw": 30.0},
+            {"asset_id": "ECM96.2", "available_flexibility_kw": 6.0},
+        ],
+        measurement_provider=provider,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    assert summary["allocations"] == pytest.approx({"ECM96.2": 6.0})
+    assert set(summary["control_results"]) == {"ECM96.2"}
+    assert summary["control_results"]["ECM96.2"]["discrete_state"] == "OFF"
+    assert provider.calls == [("ECM96.2", 30)]
+
+
+def test_ineligible_previously_controlled_hp_is_restored_not_switched_off(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-10-08T11:45:00",
+            "slot_end": "2026-10-08T12:00:00",
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(300.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    assert summary["control_results"]["ECM96.2"]["status"] == "skipped"
+    commands = manager.controller._pending_commands
+    assert len(commands) == 1
+    assert commands[0]["command_type"] == "restore"
+    assert commands[0]["payload"]["discrete_state"] == "ON"
+    assert _load_state(state_file) == {}
+
+
+def test_default_manager_state_files_are_isolated_per_fsp():
+    config = {
+        "fm": {
+            "community": "test",
+            "actors": {
+                "fsps": {
+                    "supsi01": {"name": "SUPSI_EV", "assets": []},
+                    "supsi02": {"name": "SUPSI_HP", "assets": []},
+                }
+            },
+        },
+        "asset_mapping": {},
+        "bidding_strategies": {},
+        "autonomous": {"enabled": False},
+    }
+    ev_manager = fm.FlexibilityManager(
+        config, "supsi01", FakeNodesInterface(), None, _logger()
+    )
+    hp_manager = fm.FlexibilityManager(
+        config, "supsi02", FakeNodesInterface(), None, _logger()
+    )
+
+    assert ev_manager.state_file != hp_manager.state_file
+    assert ev_manager.state_file.endswith("flexi_manager_state_supsi01.json")
+    assert hp_manager.state_file.endswith("flexi_manager_state_supsi02.json")
+
+
+def test_hp_off_only_blocks_preactivation_even_when_autonomous_config_enables_it(tmp_path):
+    publisher = DisconnectedRabbitPublisher()
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        rabbitmq_publisher=publisher,
+        autonomous={"enabled": True, "preactivation_enabled": True},
+    )
+    manager.config["bidding_strategies"][_HP_OFF_ONLY_STRATEGY_ID][
+        "preconditioningSettings"
+    ] = {"enabled": True}
+
+    assert manager.hp_off_only_policy_active is True
+    assert manager.autonomous_preactivation_enabled is False
+    assert manager._resolve_preconditioning_context() is None
+
+    result = manager._send_preactivation_command(
+        "ECM96.2", fm.datetime(2026, 10, 8, 12, 0)
+    )
+    assert result["status"] == "skipped"
+    assert "prohibits pre-heating/ON commands" in result["skip_reason"]
+    assert "target_state" not in result
+    assert manager.controller._pending_commands == []

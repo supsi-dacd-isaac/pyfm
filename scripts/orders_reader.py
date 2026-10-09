@@ -83,7 +83,7 @@ if __name__ == "__main__":
     # Print orders performed by FSPs
     for fsp_identifier in cfg["fm"]["actors"]["fsps"].keys():
         fsp = FSP(cfg["fm"]["actors"]["fsps"][fsp_identifier], cfg["nodesAPI"], logger)
-        fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
+        fsp.set_organization(filter_dict={"name": fsp.cfg["name"]})
 
         fsp_orders = fsp.get_orders(
             filter_dict={

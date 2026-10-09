@@ -118,7 +118,7 @@ def test_ev_discrete_states_config():
     assert "ECM63.2" in s11["assets_filter"]
     assert s11["flexibility_method"] == "recent_profile"
     assert s11["discreteEvSettings"]["selection_policy"] == "smallest_overdelivery"
-    assert s11["discreteEvSettings"]["allow_zero_state"] is True
+    assert s11["discreteEvSettings"]["allow_zero_state"] is False
 
 
 # ===================================================================

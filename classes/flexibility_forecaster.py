@@ -71,6 +71,112 @@ def resolve_recent_profile_settings(
     }
 
 
+def resolve_hp_off_only_settings(
+    main_cfg: dict,
+    strategy_config: Optional[dict] = None,
+    strategy_id: Optional[str] = None,
+    logger=None,
+    granularity: int = 15,
+) -> Dict:
+    """Resolve and validate settings for conservative OFF-only HP bidding."""
+    strategy_settings = (strategy_config or {}).get("hpOffOnlySettings")
+    global_settings = main_cfg.get("flexibility", {}).get("hpOffOnlySettings")
+
+    if strategy_settings:
+        raw = strategy_settings
+        source = (
+            f"bidding_strategies.{strategy_id}.hpOffOnlySettings"
+            if strategy_id
+            else "strategy.hpOffOnlySettings"
+        )
+    elif global_settings:
+        raw = global_settings
+        source = "flexibility.hpOffOnlySettings"
+        if logger is not None:
+            logger.warning(
+                "hpOffOnlySettings not found on strategy %s; falling back to "
+                "flexibility.hpOffOnlySettings",
+                strategy_id or "unknown",
+            )
+    else:
+        raw = {}
+        source = "defaults"
+        if logger is not None and strategy_id:
+            logger.warning(
+                "hpOffOnlySettings not found for strategy %s or globally; "
+                "using built-in defaults",
+                strategy_id,
+            )
+
+    def fail(message: str):
+        raise ValueError(f"Invalid hpOffOnlySettings ({source}): {message}")
+
+    try:
+        baseline_go_back = int(raw.get("baselineGoBackMinutes", 1440))
+        recent_window = int(raw.get("recentWindowMinutes", 60))
+        quantile = float(raw.get("quantile", 0.25))
+        min_samples = int(raw.get("minSamples", 3))
+        min_active_ratio = float(raw.get("minActiveRatio", 0.75))
+        active_threshold_w = float(raw.get("activeThresholdW", 500))
+        max_age = int(raw.get("maxCurrentMeasurementAgeMinutes", 30))
+        safety_factor = float(raw.get("defaultSafetyFactor", 1.0))
+        bid_step_kw = float(raw.get("bidStepKw", 1.0))
+        minimum_bid_kw = float(raw.get("minimumBidKw", bid_step_kw))
+    except (TypeError, ValueError) as exc:
+        fail(f"non-numeric value ({exc})")
+
+    control_mode = str(raw.get("controlMode", "off_only")).strip().lower()
+    allow_preheating = raw.get("allowPreheating", False)
+    missing_policy = raw.get("missingMeasurementPolicy", "skip_asset")
+    granularity = int(granularity) if granularity else 15
+
+    if control_mode != "off_only":
+        fail("controlMode must be 'off_only'")
+    if allow_preheating is not False:
+        fail("allowPreheating must be false for real HP assets")
+    if baseline_go_back <= 0 or baseline_go_back % granularity != 0:
+        fail("baselineGoBackMinutes must be positive and granularity-aligned")
+    if recent_window <= 0 or recent_window % granularity != 0:
+        fail("recentWindowMinutes must be positive and granularity-aligned")
+    if min_samples < 1:
+        fail("minSamples must be >= 1")
+    if recent_window < min_samples * granularity:
+        fail("recentWindowMinutes must contain at least minSamples slots")
+    if not 0.0 <= quantile <= 1.0:
+        fail("quantile must be within [0, 1]")
+    if not 0.0 <= min_active_ratio <= 1.0:
+        fail("minActiveRatio must be within [0, 1]")
+    if active_threshold_w < 0:
+        fail("activeThresholdW must be >= 0")
+    if max_age <= 0:
+        fail("maxCurrentMeasurementAgeMinutes must be > 0")
+    if not 0.0 < safety_factor <= 1.0:
+        fail("defaultSafetyFactor must be within (0, 1]")
+    if bid_step_kw <= 0:
+        fail("bidStepKw must be > 0")
+    if minimum_bid_kw <= 0:
+        fail("minimumBidKw must be > 0")
+    if missing_policy not in ("skip_asset", "fail_portfolio"):
+        fail("missingMeasurementPolicy must be 'skip_asset' or 'fail_portfolio'")
+
+    return {
+        "source": source,
+        "control_mode": control_mode,
+        "allow_preheating": allow_preheating,
+        "baseline_go_back_minutes": baseline_go_back,
+        "recent_window_minutes": recent_window,
+        "quantile": quantile,
+        "min_samples": min_samples,
+        "min_active_ratio": min_active_ratio,
+        "active_threshold_w": active_threshold_w,
+        "max_current_measurement_age_minutes": max_age,
+        "default_safety_factor": safety_factor,
+        "missing_measurement_policy": missing_policy,
+        "bid_step_kw": bid_step_kw,
+        "minimum_bid_kw": minimum_bid_kw,
+    }
+
+
 def resolve_preconditioned_binary_settings(
     main_cfg: dict,
     strategy_config: Optional[dict] = None,
@@ -545,6 +651,20 @@ class FlexibilityForecaster:
 
         self._strategy_config = strategy_config or {}
 
+        # OFF-only HP bidding is deliberately passive: it may curtail a heat
+        # pump that is already consuming, but it never commands an HP ON to
+        # manufacture flexibility. The strategy-owned settings are validated
+        # before any telemetry query is made.
+        self.hp_off_only_settings = None
+        if self.method == "hp_off_only":
+            self.hp_off_only_settings = resolve_hp_off_only_settings(
+                main_cfg=main_cfg,
+                strategy_config=strategy_config,
+                strategy_id=strategy_id,
+                logger=logger,
+                granularity=self.granularity,
+            )
+
         # Recent-profile settings are strategy-owned (strategy_10+). They are
         # loaded only when the active method is recent_profile.
         self.recent_profile_settings_source = None
@@ -654,6 +774,31 @@ class FlexibilityForecaster:
                 self.default_persistence_safety_factor,
                 self.persistence_missing_measurement_policy,
                 self.max_current_measurement_age_minutes,
+            )
+        elif self.method == "hp_off_only":
+            settings = self.hp_off_only_settings
+            self.logger.info(
+                "HP OFF-only settings (source=%s): controlMode=%s, "
+                "allowPreheating=%s, baselineGoBackMinutes=%s, "
+                "recentWindowMinutes=%s, quantile=%.3f, minSamples=%s, "
+                "minActiveRatio=%.3f, activeThresholdW=%.1f, "
+                "maxCurrentMeasurementAgeMinutes=%s, safetyFactor=%.3f, "
+                "bidStepKw=%.3f, minimumBidKw=%.3f, "
+                "missingMeasurementPolicy=%s",
+                settings["source"],
+                settings["control_mode"],
+                settings["allow_preheating"],
+                settings["baseline_go_back_minutes"],
+                settings["recent_window_minutes"],
+                settings["quantile"],
+                settings["min_samples"],
+                settings["min_active_ratio"],
+                settings["active_threshold_w"],
+                settings["max_current_measurement_age_minutes"],
+                settings["default_safety_factor"],
+                settings["bid_step_kw"],
+                settings["minimum_bid_kw"],
+                settings["missing_measurement_policy"],
             )
         elif self.method == "recent_profile":
             self.logger.info(
@@ -2017,6 +2162,404 @@ class FlexibilityForecaster:
 
         return breakdown
 
+    def _get_asset_flexibility_breakdown_hp_off_only(
+        self,
+        period_from: datetime,
+        current_time_utc: Optional[datetime] = None,
+        asset_ids: Optional[List[str]] = None,
+    ) -> Dict[str, Dict]:
+        """
+        Estimate conservative HP flexibility for binary OFF-only control.
+
+        An HP can contribute only when it is naturally and stably consuming.
+        Available flexibility is the lower of:
+        - the same target slot 24 hours earlier (settlement baseline proxy),
+        - Strategy-8-style short-term persistence,
+        - a lower quantile of recently completed measurements,
+        - the configured OFF-only capacity and nominal power.
+
+        The result is quantized downward to the NODES bidding step. No code in
+        this path can command an HP ON or perform preheating.
+        """
+        settings = self.hp_off_only_settings
+        if settings is None:
+            self.logger.error("HP OFF-only settings were not initialized")
+            return {}
+
+        target_slot_utc = pd.Timestamp(period_from)
+        if target_slot_utc.tzinfo is None:
+            target_slot_utc = target_slot_utc.tz_localize("UTC")
+        else:
+            target_slot_utc = target_slot_utc.tz_convert("UTC")
+
+        now_utc = pd.Timestamp(current_time_utc or datetime.utcnow())
+        if now_utc.tzinfo is None:
+            now_utc = now_utc.tz_localize("UTC")
+        else:
+            now_utc = now_utc.tz_convert("UTC")
+
+        completed_window_end_utc = now_utc.floor(f"{self.granularity}min")
+        recent_window_start_utc = completed_window_end_utc - pd.Timedelta(
+            minutes=settings["recent_window_minutes"]
+        )
+        selected_asset_ids = asset_ids or list(self.asset_capacities.keys())
+        breakdown = {}
+
+        def missing_result(
+            asset_id: str,
+            mapping: Dict,
+            reason: str,
+            short_go_back_minutes: Optional[int],
+            baseline_go_back_minutes: Optional[int],
+        ) -> Dict:
+            try:
+                nominal_power_w = float(mapping.get("nominal_power_w", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                nominal_power_w = 0.0
+            try:
+                capacity_kw = float(mapping.get("capacity_kw", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                capacity_kw = 0.0
+            return {
+                "description": self.asset_descriptions.get(asset_id, asset_id),
+                "asset_type": mapping.get("type", "unknown"),
+                "nominal_capacity_kw": capacity_kw,
+                "typical_load_kw": 0.0,
+                "baseline_power_w": 0.0,
+                "settlement_baseline_power_w": None,
+                "short_term_power_w": None,
+                "recent_quantile_power_w": None,
+                "baseline_source_time_utc": None,
+                "short_term_source_time_utc": None,
+                "flexibility_persistence_go_back_minutes": short_go_back_minutes,
+                "baseline_persistence_go_back_minutes": baseline_go_back_minutes,
+                "current_measured_power_w": 0.0,
+                "gate_measurement_time_utc": None,
+                "current_measurement_age_minutes": None,
+                "active_threshold_w": settings["active_threshold_w"],
+                "is_currently_active": False,
+                "safety_factor": settings["default_safety_factor"],
+                "flexibility_factor": settings["default_safety_factor"],
+                "nominal_power_w": nominal_power_w,
+                "occupancy_probability": None,
+                "available_flexibility_w": 0.0,
+                "available_flexibility_kw": 0.0,
+                "max_flexibility_kw": capacity_kw,
+                "estimation_method": "hp_off_only",
+                "is_available_for_flexibility": False,
+                "hp_off_only_control_mode": "off_only",
+                "hp_off_only_preheating_allowed": False,
+                "hp_off_only_rejection_reason": reason,
+            }
+
+        for asset_id in selected_asset_ids:
+            mapping = self.asset_mapping.get(asset_id, {})
+            if not isinstance(mapping, dict) or mapping.get("type") != "heat_pump":
+                self.logger.warning(
+                    "Skipping HP OFF-only flexibility for %s: asset is not a configured heat pump",
+                    asset_id,
+                )
+                continue
+
+            try:
+                configured_capacity_kw = float(mapping.get("capacity_kw", 0.0))
+                configured_states_kw = sorted(
+                    {
+                        float(state)
+                        for state in mapping.get("discrete_states_kw", [])
+                    }
+                )
+            except (TypeError, ValueError):
+                configured_capacity_kw = 0.0
+                configured_states_kw = []
+            is_binary_off_only_asset = (
+                mapping.get("modulation_type") == "discrete"
+                and np.isfinite(configured_capacity_kw)
+                and configured_capacity_kw > 0
+                and len(configured_states_kw) == 2
+                and abs(configured_states_kw[0]) <= 1e-9
+                and abs(configured_states_kw[1] - configured_capacity_kw) <= 1e-9
+            )
+            if not is_binary_off_only_asset:
+                reason = "asset_not_binary_off_only"
+                self.logger.error(
+                    "HP OFF-only asset=%s rejected: %s "
+                    "(modulation_type=%s, states_kw=%s, capacity_kw=%s)",
+                    asset_id,
+                    reason,
+                    mapping.get("modulation_type"),
+                    mapping.get("discrete_states_kw"),
+                    mapping.get("capacity_kw"),
+                )
+                if settings["missing_measurement_policy"] == "fail_portfolio":
+                    return {}
+                breakdown[asset_id] = missing_result(
+                    asset_id,
+                    mapping,
+                    reason,
+                    None,
+                    settings["baseline_go_back_minutes"],
+                )
+                continue
+
+            short_go_back_minutes = self._resolve_asset_flexibility_go_back_minutes(
+                asset_id, mapping
+            )
+            try:
+                baseline_go_back_minutes = int(
+                    mapping.get(
+                        "baseline_persistence_go_back_minutes",
+                        settings["baseline_go_back_minutes"],
+                    )
+                )
+            except (TypeError, ValueError):
+                baseline_go_back_minutes = None
+
+            invalid_lag = (
+                short_go_back_minutes is None
+                or baseline_go_back_minutes is None
+                or not self._validate_persistence_alignment(
+                    baseline_go_back_minutes,
+                    "asset_mapping.%s.baseline_persistence_go_back_minutes"
+                    % asset_id,
+                )
+            )
+            if invalid_lag:
+                if settings["missing_measurement_policy"] == "fail_portfolio":
+                    return {}
+                breakdown[asset_id] = missing_result(
+                    asset_id,
+                    mapping,
+                    "invalid_persistence_lag",
+                    short_go_back_minutes,
+                    baseline_go_back_minutes,
+                )
+                continue
+
+            baseline_source_utc = target_slot_utc - pd.Timedelta(
+                minutes=baseline_go_back_minutes
+            )
+            short_source_utc = target_slot_utc - pd.Timedelta(
+                minutes=short_go_back_minutes
+            )
+            interval = pd.Timedelta(minutes=self.granularity)
+
+            if short_source_utc + interval > completed_window_end_utc:
+                reason = "short_term_source_slot_not_complete"
+                self.logger.warning(
+                    "HP OFF-only asset=%s rejected: %s (source=%s, completed_through=%s)",
+                    asset_id,
+                    reason,
+                    short_source_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    completed_window_end_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                )
+                if settings["missing_measurement_policy"] == "fail_portfolio":
+                    return {}
+                breakdown[asset_id] = missing_result(
+                    asset_id,
+                    mapping,
+                    reason,
+                    short_go_back_minutes,
+                    baseline_go_back_minutes,
+                )
+                continue
+
+            baseline_series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=baseline_source_utc.to_pydatetime(),
+                end_time_utc=(baseline_source_utc + interval).to_pydatetime(),
+            )
+            short_series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=short_source_utc.to_pydatetime(),
+                end_time_utc=(short_source_utc + interval).to_pydatetime(),
+            )
+            recent_series = self._query_grouped_asset_series(
+                asset_id=asset_id,
+                start_time_utc=recent_window_start_utc.to_pydatetime(),
+                end_time_utc=completed_window_end_utc.to_pydatetime(),
+            )
+
+            if any(series is None for series in (baseline_series, short_series, recent_series)):
+                reason = "measurement_query_failed"
+                if settings["missing_measurement_policy"] == "fail_portfolio":
+                    return {}
+                breakdown[asset_id] = missing_result(
+                    asset_id,
+                    mapping,
+                    reason,
+                    short_go_back_minutes,
+                    baseline_go_back_minutes,
+                )
+                continue
+
+            baseline_value = baseline_series.reindex(
+                pd.DatetimeIndex([baseline_source_utc])
+            ).iloc[0]
+            short_value = short_series.reindex(
+                pd.DatetimeIndex([short_source_utc])
+            ).iloc[0]
+            recent_values = recent_series.dropna()
+            recent_values = recent_values[
+                np.isfinite(recent_values.to_numpy()) & (recent_values.to_numpy() >= 0)
+            ]
+
+            required_reference_missing = (
+                pd.isna(baseline_value)
+                or pd.isna(short_value)
+                or recent_values.empty
+            )
+            if not required_reference_missing:
+                required_reference_missing = (
+                    not np.isfinite(float(baseline_value))
+                    or not np.isfinite(float(short_value))
+                    or float(baseline_value) < 0
+                    or float(short_value) < 0
+                )
+            if required_reference_missing:
+                reason = "required_reference_measurement_missing"
+                if settings["missing_measurement_policy"] == "fail_portfolio":
+                    return {}
+                breakdown[asset_id] = missing_result(
+                    asset_id,
+                    mapping,
+                    reason,
+                    short_go_back_minutes,
+                    baseline_go_back_minutes,
+                )
+                continue
+
+            valid_sample_count = len(recent_values)
+            active_mask = recent_values > settings["active_threshold_w"]
+            active_sample_count = int(active_mask.sum())
+            active_ratio = active_sample_count / valid_sample_count
+            latest_measurement_time_utc = recent_values.index[-1]
+            latest_power_w = float(recent_values.iloc[-1])
+            latest_age_minutes = float(
+                (now_utc - latest_measurement_time_utc).total_seconds() / 60.0
+            )
+            recent_quantile_power_w = float(
+                recent_values.quantile(settings["quantile"])
+            )
+            baseline_power_w = float(baseline_value)
+            short_term_power_w = float(short_value)
+            nominal_power_w = float(mapping.get("nominal_power_w", 0.0) or 0.0)
+            capacity_kw = float(mapping.get("capacity_kw", 0.0) or 0.0)
+            capacity_w = capacity_kw * 1000.0
+            safety_factor = float(
+                mapping.get(
+                    "hp_off_only_safety_factor",
+                    settings["default_safety_factor"],
+                )
+            )
+
+            rejection_reason = None
+            if valid_sample_count < settings["min_samples"]:
+                rejection_reason = "insufficient_recent_samples"
+            elif latest_age_minutes > settings["max_current_measurement_age_minutes"]:
+                rejection_reason = "latest_measurement_too_old"
+            elif latest_power_w <= settings["active_threshold_w"]:
+                rejection_reason = "latest_measurement_not_active"
+            elif active_ratio < settings["min_active_ratio"]:
+                rejection_reason = "recent_active_ratio_below_minimum"
+            elif nominal_power_w <= 0 or capacity_w <= 0:
+                rejection_reason = "invalid_power_capacity"
+            elif not 0.0 < safety_factor <= 1.0:
+                rejection_reason = "invalid_asset_safety_factor"
+
+            conservative_reference_w = max(
+                0.0,
+                min(
+                    baseline_power_w,
+                    short_term_power_w,
+                    recent_quantile_power_w,
+                    nominal_power_w,
+                    capacity_w,
+                ),
+            )
+            raw_available_kw = conservative_reference_w * safety_factor / 1000.0
+            step_kw = settings["bid_step_kw"]
+            quantized_available_kw = (
+                np.floor((raw_available_kw + 1e-12) / step_kw) * step_kw
+            )
+            quantized_available_kw = float(max(0.0, quantized_available_kw))
+            if quantized_available_kw < settings["minimum_bid_kw"]:
+                quantized_available_kw = 0.0
+                if rejection_reason is None:
+                    rejection_reason = "below_minimum_bid_after_quantization"
+            if rejection_reason is not None:
+                quantized_available_kw = 0.0
+
+            is_currently_active = latest_power_w > settings["active_threshold_w"]
+            is_available = rejection_reason is None and quantized_available_kw > 0
+            self.logger.info(
+                "HP OFF-only asset=%s target=%s baseline_24h=%.2f W "
+                "short_persistence=%.2f W recent_q%.0f=%.2f W latest=%.2f W "
+                "age=%.1f min active_ratio=%.3f cap=%.2f kW safety=%.3f "
+                "raw=%.3f kW quantized=%.3f kW available=%s reason=%s",
+                asset_id,
+                target_slot_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                baseline_power_w,
+                short_term_power_w,
+                settings["quantile"] * 100,
+                recent_quantile_power_w,
+                latest_power_w,
+                latest_age_minutes,
+                active_ratio,
+                capacity_kw,
+                safety_factor,
+                raw_available_kw,
+                quantized_available_kw,
+                is_available,
+                rejection_reason or "none",
+            )
+
+            breakdown[asset_id] = {
+                "description": self.asset_descriptions.get(asset_id, asset_id),
+                "asset_type": mapping.get("type", "heat_pump"),
+                "nominal_capacity_kw": capacity_kw,
+                "typical_load_kw": conservative_reference_w / 1000.0,
+                "baseline_power_w": conservative_reference_w,
+                "settlement_baseline_power_w": baseline_power_w,
+                "short_term_power_w": short_term_power_w,
+                "recent_quantile_power_w": recent_quantile_power_w,
+                "baseline_source_time_utc": baseline_source_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "short_term_source_time_utc": short_source_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "flexibility_persistence_go_back_minutes": short_go_back_minutes,
+                "baseline_persistence_go_back_minutes": baseline_go_back_minutes,
+                "current_measured_power_w": latest_power_w,
+                "gate_measurement_time_utc": latest_measurement_time_utc.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "current_measurement_age_minutes": latest_age_minutes,
+                "active_threshold_w": settings["active_threshold_w"],
+                "is_currently_active": is_currently_active,
+                "safety_factor": safety_factor,
+                "flexibility_factor": safety_factor,
+                "nominal_power_w": nominal_power_w,
+                "occupancy_probability": None,
+                "available_flexibility_w": quantized_available_kw * 1000.0,
+                "available_flexibility_kw": quantized_available_kw,
+                "max_flexibility_kw": capacity_kw * safety_factor,
+                "estimation_method": "hp_off_only",
+                "is_available_for_flexibility": is_available,
+                "hp_off_only_control_mode": "off_only",
+                "hp_off_only_preheating_allowed": False,
+                "hp_off_only_recent_valid_samples": valid_sample_count,
+                "hp_off_only_recent_active_samples": active_sample_count,
+                "hp_off_only_recent_active_ratio": active_ratio,
+                "hp_off_only_recent_quantile": settings["quantile"],
+                "hp_off_only_raw_available_kw": raw_available_kw,
+                "hp_off_only_bid_step_kw": step_kw,
+                "hp_off_only_rejection_reason": rejection_reason,
+            }
+
+        return breakdown
+
     def _get_asset_flexibility_breakdown_recent_profile(
         self,
         period_from: datetime,
@@ -2705,6 +3248,13 @@ class FlexibilityForecaster:
                 asset_ids=asset_ids,
             )
 
+        if self.method == "hp_off_only":
+            return self._get_asset_flexibility_breakdown_hp_off_only(
+                period_from=period_from,
+                current_time_utc=current_time_utc,
+                asset_ids=asset_ids,
+            )
+
         if self.method == "recent_profile":
             return self._get_asset_flexibility_breakdown_recent_profile(
                 period_from=period_from,
@@ -3011,6 +3561,7 @@ class FlexibilityForecaster:
         # strategy_10 (recent_profile).
         is_gated_method = self.method in (
             "persistence",
+            "hp_off_only",
             "recent_profile",
             "preconditioned_binary",
         )

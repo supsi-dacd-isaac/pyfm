@@ -70,10 +70,19 @@ class NODESInterface:
             }
 
     def get_new_token(self, player_cfg, tkn_file_name):
+        credentials_id = player_cfg.get("credentialsId", player_cfg["id"])
+        player_credentials = self.cfg.get("players", {}).get(credentials_id)
+        if player_credentials is None:
+            self.logger.error(
+                "No NODES API credentials configured for player '%s'"
+                % credentials_id
+            )
+            return False
+
         payload = {
             "grant_type": self.cfg["grantType"],
-            "client_id": self.cfg["players"][player_cfg["id"]]["clientId"],
-            "client_secret": self.cfg["players"][player_cfg["id"]]["secretId"],
+            "client_id": player_credentials["clientId"],
+            "client_secret": player_credentials["secretId"],
             "scope": self.cfg["scope"],
         }
 

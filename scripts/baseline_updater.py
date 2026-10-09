@@ -62,7 +62,7 @@ if __name__ == "__main__":
     user_info = fsp.nodes_interface.get_user_info()
 
     fsp.set_markets(filter_dict={"name": cfg["fm"]["marketName"]})
-    fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
+    fsp.set_organization(filter_dict={"name": fsp.cfg["name"]})
 
     fsp.print_user_info(user_info)
     fsp.print_player_info()

@@ -62,7 +62,7 @@ if __name__ == "__main__":
     user_info = fsp.nodes_interface.get_user_info()
 
     fsp.set_markets(filter_dict={"name": cfg["fm"]["marketName"]})
-    fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
+    fsp.set_organization(filter_dict={"name": fsp.cfg["name"]})
 
     logger.info("market id: %s" % fsp.markets[0]["id"])
     logger.info("market name: %s" % fsp.markets[0]["name"])

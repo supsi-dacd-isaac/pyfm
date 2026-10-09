@@ -287,7 +287,12 @@ def replay_single_timestamp(
     )
     allowed_assets = strategy.allowed_assets if hasattr(strategy, "allowed_assets") else None
 
-    gated_methods = {"persistence", "recent_profile"}
+    gated_methods = {
+        "persistence",
+        "hp_off_only",
+        "recent_profile",
+        "preconditioned_binary",
+    }
     is_gated = strategy_flexibility_method in gated_methods
 
     breakdown = flex_forecaster.get_asset_flexibility_breakdown(
@@ -319,6 +324,8 @@ def replay_single_timestamp(
         elif not info.get("is_available_for_flexibility", True) and is_gated:
             if not info.get("is_currently_active", True):
                 skip_reason = "inactive"
+            elif info.get("hp_off_only_rejection_reason"):
+                skip_reason = info["hp_off_only_rejection_reason"]
             elif info.get("recent_profile_skip_reason"):
                 skip_reason = info["recent_profile_skip_reason"]
             else:

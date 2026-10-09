@@ -50,6 +50,7 @@ from classes.bidding_strategy import BiddingStrategy, StrategyManager
 from classes.flexibility_forecaster import (
     _get_discrete_ev_states,
     _select_discrete_ev_target_for_curtailment,
+    resolve_hp_off_only_settings,
 )
 
 # For statistics
@@ -149,6 +150,36 @@ EV_COMFORT_GUARD_DEFAULTS = {
     # activation cap is reached.
     "cooldown_slots_after_max_activation": 2,
 }
+
+
+BID_RECORD_ACTIVATION_METHODS = frozenset({
+    "persistence",
+    "hp_off_only",
+    "recent_profile",
+    "preconditioned_binary",
+})
+
+
+def uses_bid_record_activation_plan(flexibility_method: Optional[str]) -> bool:
+    """Return whether activation must use the exact bid-time asset plan."""
+    if flexibility_method is None:
+        return False
+    return str(flexibility_method).strip().lower() in BID_RECORD_ACTIVATION_METHODS
+
+
+def _default_state_file_for_fsp(fsp_id: str) -> str:
+    """Return an FSP-specific state path safe for concurrent managers."""
+    safe_fsp_id = "".join(
+        char if char.isalnum() or char in ("-", "_", ".") else "_"
+        for char in str(fsp_id or "unknown_fsp")
+    )
+    safe_fsp_id = safe_fsp_id.strip(".") or "unknown_fsp"
+    return os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "..",
+        "logs",
+        f"flexi_manager_state_{safe_fsp_id}.json",
+    )
 
 
 class ActivationMeasurementProvider:
@@ -3163,10 +3194,7 @@ class FlexibilityManager:
         self.nodes_authenticated = nodes_authenticated
         self.rabbitmq_publisher = rabbitmq_publisher
         self.rabbitmq_config = rabbitmq_config or config.get("rabbitMQ", {})
-        self.state_file = state_file or os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "logs", "flexi_manager_state.json",
-        )
+        self.state_file = state_file or _default_state_file_for_fsp(fsp_id)
         
         # Get community from config (fm.community)
         self.community = config.get("fm", {}).get("community", "")
@@ -3208,6 +3236,16 @@ class FlexibilityManager:
             "preactivation_enabled",
             True,
         )
+        self.hp_off_only_policy_active = (
+            self._active_strategy_flexibility_method() == "hp_off_only"
+        )
+        if self.hp_off_only_policy_active and self.autonomous_preactivation_enabled:
+            logger.warning(
+                "Disabling autonomous pre-activation for FSP %s: the active "
+                "hp_off_only strategy prohibits pre-heating/ON commands",
+                self.fsp_id,
+            )
+            self.autonomous_preactivation_enabled = False
         
         # Initialize price predictor for autonomous mode
         self.price_predictor = None
@@ -3439,11 +3477,18 @@ class FlexibilityManager:
             if preactivation_assets:
                 if not self.autonomous_preactivation_enabled:
                     self.logger.info("")
+                    skipped_reason = (
+                        "disabled_by_hp_off_only_policy"
+                        if self.hp_off_only_policy_active
+                        else "disabled_by_configuration"
+                    )
                     self.logger.info(
-                        "Pre-activation command execution is disabled by configuration; skipping command publication"
+                        "Pre-activation command execution is disabled (%s); "
+                        "skipping command publication",
+                        skipped_reason,
                     )
                     summary["preactivation_executed"] = False
-                    summary["preactivation_skipped_reason"] = "disabled_by_configuration"
+                    summary["preactivation_skipped_reason"] = skipped_reason
                 elif dry_run:
                     self.logger.info("")
                     self.logger.info("[DRY-RUN] Would send pre-heating (ON) commands to %d heat pump(s)",
@@ -3510,6 +3555,22 @@ class FlexibilityManager:
         :param slot_start: Start of the slot
         :return: Result dictionary
         """
+        if self._active_strategy_flexibility_method() == "hp_off_only":
+            reason = (
+                "pre-activation blocked: active hp_off_only strategy prohibits "
+                "pre-heating/ON commands"
+            )
+            self.logger.warning("%s for %s", reason, asset_id)
+            return {
+                "asset_id": asset_id,
+                "command": "preactivate",
+                "status": "skipped",
+                "skip_reason": reason,
+                "message": reason,
+                "slot_start": _format_aem_utc(slot_start),
+                "slot_end": _format_aem_utc(slot_start + timedelta(minutes=15)),
+            }
+
         asset_config = self.asset_mapping.get(asset_id, {})
         description = asset_config.get("description", asset_id)
         asset_type = asset_config.get("type", "heat_pump")
@@ -3609,6 +3670,158 @@ class FlexibilityManager:
             "skip_reason": skip_reason,
             "message": skip_reason,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def _evaluate_hp_off_only_activation(
+        self,
+        asset_id: str,
+        curtailment_kw: float,
+        activation_cfg: Dict,
+    ) -> Dict:
+        """Fail closed unless fresh telemetry proves a Strategy 13 HP is active.
+
+        Eligibility requires power strictly above ``active_threshold_w``.  Live
+        power also provides an estimated delivery and shortfall-risk diagnostic;
+        it does not rewrite the market-cleared allocation.
+        """
+        threshold_w = float(activation_cfg["active_threshold_w"])
+        max_age_minutes = int(activation_cfg["max_measurement_age_minutes"])
+        diagnostics = {
+            "eligible": False,
+            "active_threshold_w": threshold_w,
+            "max_measurement_age_minutes": max_age_minutes,
+            "allocated_curtailment_kw": float(curtailment_kw),
+            "activation_current_power_w": None,
+            "activation_current_power_kw": None,
+            "activation_measurement_timestamp_utc": None,
+            "activation_measurement_age_minutes": None,
+            "estimated_delivery_kw": 0.0,
+            "delivery_shortfall_risk_kw": float(curtailment_kw),
+            "delivery_at_risk": True,
+            "skip_reason": None,
+        }
+
+        def ineligible(reason: str) -> Dict:
+            diagnostics["skip_reason"] = reason
+            self.logger.warning(
+                "HP OFF-only activation eligibility for %s: allocated=%.3f kW, "
+                "threshold=%.0f W, decision=%s",
+                asset_id,
+                curtailment_kw,
+                threshold_w,
+                reason,
+            )
+            return diagnostics
+
+        if self.activation_measurement_provider is None:
+            return ineligible(
+                "skipped: no activation measurement provider available for "
+                "hp_off_only eligibility"
+            )
+
+        measurement = self.activation_measurement_provider.get_latest_power(
+            asset_id=asset_id,
+            current_time_utc=datetime.now(timezone.utc).replace(tzinfo=None),
+            max_age_minutes=max_age_minutes,
+        )
+        if not isinstance(measurement, dict) or not measurement.get("valid"):
+            reason = (
+                measurement.get("reason", "unknown")
+                if isinstance(measurement, dict)
+                else "invalid_response"
+            )
+            return ineligible(
+                "skipped: no valid current measurement for hp_off_only "
+                f"eligibility (reason={reason})"
+            )
+
+        current_power_w = _coerce_optional_float(measurement.get("power_w"))
+        age_minutes = _coerce_optional_float(measurement.get("age_minutes"))
+        if (
+            current_power_w is None
+            or not math.isfinite(current_power_w)
+            or age_minutes is None
+            or not math.isfinite(age_minutes)
+        ):
+            return ineligible(
+                "skipped: invalid power or age in current hp_off_only measurement"
+            )
+
+        diagnostics.update({
+            "activation_current_power_w": current_power_w,
+            "activation_current_power_kw": current_power_w / 1000.0,
+            "activation_measurement_timestamp_utc": str(
+                measurement.get("timestamp_utc", "")
+            ),
+            "activation_measurement_age_minutes": age_minutes,
+        })
+
+        if age_minutes < 0 or age_minutes > max_age_minutes:
+            return ineligible(
+                "skipped: current hp_off_only measurement is stale or future-dated "
+                f"(age={age_minutes:.1f} min, allowed=0..{max_age_minutes} min)"
+            )
+
+        # Bid-time active samples use a strict greater-than comparison, so a
+        # reading exactly at the threshold is also ineligible at activation.
+        if current_power_w <= threshold_w:
+            return ineligible(
+                f"skipped: current HP power {current_power_w:.0f} W is at or below "
+                f"the {threshold_w:.0f} W eligibility threshold"
+            )
+
+        current_power_kw = current_power_w / 1000.0
+        shortfall_risk_kw = max(float(curtailment_kw) - current_power_kw, 0.0)
+        diagnostics.update({
+            "eligible": True,
+            "estimated_delivery_kw": current_power_kw,
+            "delivery_shortfall_risk_kw": shortfall_risk_kw,
+            "delivery_at_risk": shortfall_risk_kw > 1e-9,
+        })
+        self.logger.info(
+            "HP OFF-only activation eligibility for %s:\n"
+            "  activation_current_power=%.3f kW\n"
+            "  measurement_age=%.1f min (max=%d)\n"
+            "  active_threshold=%.3f kW\n"
+            "  allocated_curtailment=%.3f kW\n"
+            "  estimated_delivery=%.3f kW\n"
+            "  delivery_shortfall_risk=%.3f kW\n"
+            "  decision=eligible; send OFF",
+            asset_id,
+            current_power_kw,
+            age_minutes,
+            max_age_minutes,
+            threshold_w / 1000.0,
+            curtailment_kw,
+            current_power_kw,
+            shortfall_risk_kw,
+        )
+        return diagnostics
+
+    def _build_hp_off_only_skip_result(
+        self,
+        asset_id: str,
+        asset_config: Dict,
+        modulation_type: str,
+        curtailment_kw: float,
+        diagnostics: Dict,
+    ) -> Dict:
+        """Build a control result for an ineligible Strategy 13 HP."""
+        reason = diagnostics.get("skip_reason") or "skipped: HP is not eligible"
+        return {
+            "asset_id": asset_id,
+            "description": asset_config.get("description", asset_id),
+            "asset_type": asset_config.get("type", "unknown"),
+            "modulation_type": modulation_type,
+            "requested_curtailment_kw": curtailment_kw,
+            "actual_curtailment_kw": 0.0,
+            "target_power_kw": None,
+            "status": "skipped",
+            "skip_activation": True,
+            "skip_reason": reason,
+            "message": reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            **diagnostics,
         }
 
     def _resolve_recent_profile_activation_current(
@@ -4179,6 +4392,19 @@ class FlexibilityManager:
             return configured
         return None
 
+    def _active_strategy_flexibility_method(
+        self, fallback_strategy: Optional[str] = None
+    ) -> Optional[str]:
+        """Return the normalized method of the FSP-selected strategy."""
+        strategy_id = self._resolve_active_strategy_id(fallback_strategy)
+        if not strategy_id:
+            return None
+        strategy_cfg = self.config.get("bidding_strategies", {}).get(strategy_id, {})
+        raw_method = strategy_cfg.get("flexibility_method")
+        if raw_method is None:
+            return None
+        return str(raw_method).strip().lower().replace("-", "_")
+
     def _resolve_preconditioning_context(
         self, fallback_strategy: Optional[str] = None
     ) -> Optional[Dict]:
@@ -4195,6 +4421,15 @@ class FlexibilityManager:
         strategies_cfg = self.config.get("bidding_strategies", {})
         strategy_cfg = strategies_cfg.get(active_strategy_id)
         if not strategy_cfg:
+            return None
+
+        if self._active_strategy_flexibility_method(fallback_strategy) == "hp_off_only":
+            if strategy_cfg.get("preconditioningSettings"):
+                self.logger.error(
+                    "Ignoring preconditioningSettings for active strategy %s: "
+                    "hp_off_only prohibits pre-heating/ON commands",
+                    active_strategy_id,
+                )
             return None
 
         settings = self._parse_preconditioning_settings(
@@ -5240,14 +5475,13 @@ class FlexibilityManager:
                     flexibility_method = strategy_obj.config.get("flexibility_method")
                     # Strategies whose bidder pre-computes a per-asset
                     # activation plan and stores it in bid_record_assets.
-                    # Persistence (strategy_8/9), recent_profile (strategy_10)
-                    # and preconditioned_binary (strategy_12) all follow this
-                    # contract, so they reuse the same activation pipeline
-                    # downstream (binary HPs are switched OFF via force_off).
-                    is_persistence_strategy = flexibility_method in (
-                        "persistence",
-                        "recent_profile",
-                        "preconditioned_binary",
+                    # Persistence (strategy_8/9), recent_profile (strategy_10),
+                    # preconditioned_binary (strategy_12), and hp_off_only
+                    # (strategy_13) all follow this contract, so they reuse
+                    # the same activation pipeline downstream. Binary HPs are
+                    # switched OFF via force_off; none are forced ON here.
+                    is_persistence_strategy = uses_bid_record_activation_plan(
+                        flexibility_method
                     )
                     summary["flexibility_method"] = flexibility_method
 
@@ -5764,6 +5998,26 @@ class FlexibilityManager:
         deliverable_allocated = 0.0
 
         activation_current_cfg = _resolve_activation_current_config(strategy_obj, self.config)
+        hp_off_only_activation_cfg = None
+        if flexibility_method == "hp_off_only":
+            hp_settings = resolve_hp_off_only_settings(
+                self.config,
+                strategy_config=strategy_obj.config if strategy_obj else None,
+                strategy_id=strategy_info.get("id") if strategy_info else None,
+                logger=self.logger,
+                granularity=self.config.get("fm", {}).get("granularity", 15),
+            )
+            hp_off_only_activation_cfg = {
+                "active_threshold_w": hp_settings["active_threshold_w"],
+                "max_measurement_age_minutes": hp_settings[
+                    "max_current_measurement_age_minutes"
+                ],
+                "settings_source": hp_settings["source"],
+            }
+            summary["hp_off_only_activation_policy"] = dict(
+                hp_off_only_activation_cfg
+            )
+            summary["hp_off_only_activation_checks"] = {}
         ev_comfort_cfg = _resolve_ev_comfort_guard_config(strategy_obj, self.config)
         current_slot_start_str = _format_aem_utc(slot_start)
         slot_duration = slot_end - slot_start
@@ -5810,6 +6064,53 @@ class FlexibilityManager:
 
             if is_discrete_ev:
                 force_discrete_off = False
+
+            if hp_off_only_activation_cfg is not None:
+                if asset_type != "heat_pump" or mod_type != "discrete":
+                    reason = (
+                        "skipped: hp_off_only can activate only discrete heat pumps "
+                        f"(asset_type={asset_type}, modulation_type={mod_type})"
+                    )
+                    hp_diagnostics = {
+                        "eligible": False,
+                        "active_threshold_w": hp_off_only_activation_cfg[
+                            "active_threshold_w"
+                        ],
+                        "max_measurement_age_minutes": hp_off_only_activation_cfg[
+                            "max_measurement_age_minutes"
+                        ],
+                        "allocated_curtailment_kw": float(curtailment_kw),
+                        "activation_current_power_w": None,
+                        "activation_current_power_kw": None,
+                        "activation_measurement_timestamp_utc": None,
+                        "activation_measurement_age_minutes": None,
+                        "estimated_delivery_kw": 0.0,
+                        "delivery_shortfall_risk_kw": float(curtailment_kw),
+                        "delivery_at_risk": True,
+                        "skip_reason": reason,
+                    }
+                else:
+                    hp_diagnostics = self._evaluate_hp_off_only_activation(
+                        asset_id=asset_id,
+                        curtailment_kw=curtailment_kw,
+                        activation_cfg=hp_off_only_activation_cfg,
+                    )
+
+                summary["hp_off_only_activation_checks"][asset_id] = hp_diagnostics
+                if not hp_diagnostics["eligible"]:
+                    summary["control_results"][asset_id] = (
+                        self._build_hp_off_only_skip_result(
+                            asset_id,
+                            asset_config,
+                            mod_type,
+                            curtailment_kw,
+                            hp_diagnostics,
+                        )
+                    )
+                    continue
+                activation_current_power_kw = hp_diagnostics[
+                    "activation_current_power_kw"
+                ]
 
             if enters_ev_comfort_guard:
                 if asset_type == "ev_charger":
@@ -6010,6 +6311,8 @@ class FlexibilityManager:
                 strategy_cfg=strategy_obj.config if strategy_obj else None,
             )
             summary["control_results"][asset_id] = result
+            if hp_off_only_activation_cfg is not None:
+                result.update(hp_diagnostics)
             if result.get("status") in ["success", "simulated", "queued"]:
                 current_curtailed.add(asset_id)
                 deliverable_allocated += curtailment_kw
@@ -6022,6 +6325,29 @@ class FlexibilityManager:
             summary["skipped_assets"] = skipped_assets
             summary["skipped_flexibility_kw"] = sum(
                 allocations.get(asset_id, 0.0) for asset_id in skipped_assets
+            )
+
+        if hp_off_only_activation_cfg is not None:
+            successful_statuses = {"success", "simulated", "queued"}
+            commanded_hp_assets = [
+                asset_id
+                for asset_id, check in summary["hp_off_only_activation_checks"].items()
+                if check.get("eligible")
+                and summary["control_results"].get(asset_id, {}).get("status")
+                in successful_statuses
+            ]
+            summary["hp_off_only_commanded_assets"] = commanded_hp_assets
+            summary["hp_off_only_estimated_delivery_kw"] = sum(
+                summary["hp_off_only_activation_checks"][asset_id].get(
+                    "estimated_delivery_kw", 0.0
+                )
+                for asset_id in commanded_hp_assets
+            )
+            summary["hp_off_only_delivery_shortfall_risk_kw"] = sum(
+                summary["hp_off_only_activation_checks"][asset_id].get(
+                    "delivery_shortfall_risk_kw", 0.0
+                )
+                for asset_id in commanded_hp_assets
             )
 
         # Queue restore commands for previously controlled assets that are
@@ -6159,7 +6485,7 @@ class FlexibilityManager:
         )
         if skipped_assets:
             self.logger.error(
-                "Continuous activation skipped for %d asset(s); skipped flexibility %.2f kW",
+                "Activation skipped for %d asset(s); skipped flexibility %.2f kW",
                 len(skipped_assets),
                 summary.get("skipped_flexibility_kw", 0.0),
             )
@@ -6170,7 +6496,7 @@ class FlexibilityManager:
         if successful == 0 and summary["control_results"]:
             summary["status"] = "activation_failed"
             summary["message"] = (
-                "No deliverable flexibility after continuous reference-power validation"
+                "No deliverable flexibility after activation-time eligibility validation"
             )
         elif failed > 0:
             summary["status"] = "partial_success"
@@ -6292,7 +6618,7 @@ Examples:
         "--state-file",
         default=None,
         help="Path to the controlled-asset state file "
-             "(default: logs/flexi_manager_state.json)"
+             "(default: logs/flexi_manager_state_<fsp>.json)"
     )
     
     # RabbitMQ arguments

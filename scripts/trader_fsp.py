@@ -207,15 +207,21 @@ def _log_recent_profile_asset_diagnostics(logger, asset_id, info):
         logger.info(line)
 
 
-def _recent_profile_reference_power_fields(asset_info):
+def _gated_reference_power_fields(asset_info):
     """
-    Extract the strategy_10 reference power already used to derive flexibility.
+    Extract the bid-time reference power used to derive gated flexibility.
 
     Recent-profile bidding stores the quantile-derived expected power in the
     persistence-shaped baseline fields so downstream consumers can share the
-    same bid-record contract.
+    same bid-record contract. HP OFF-only bidding stores its conservative
+    reference for auditability; activation remains binary OFF-only.
     """
-    if asset_info.get("estimation_method") != "recent_profile":
+    estimation_method = asset_info.get("estimation_method")
+    reference_sources = {
+        "recent_profile": "recent_profile_baseline",
+        "hp_off_only": "hp_off_only_conservative_target",
+    }
+    if estimation_method not in reference_sources:
         return {
             "reference_power_kw": None,
             "reference_power_source": None,
@@ -230,8 +236,13 @@ def _recent_profile_reference_power_fields(asset_info):
 
     return {
         "reference_power_kw": float(baseline_power_w) / 1000,
-        "reference_power_source": "recent_profile_baseline",
+        "reference_power_source": reference_sources[estimation_method],
     }
+
+
+def _recent_profile_reference_power_fields(asset_info):
+    """Backward-compatible alias for gated bid reference extraction."""
+    return _gated_reference_power_fields(asset_info)
 
 
 def build_persistence_assets_to_activate(portfolio_strategy_contexts):
@@ -261,7 +272,7 @@ def build_persistence_assets_to_activate(portfolio_strategy_contexts):
                 "asset_type": info.get("asset_type", "unknown"),
                 "available_flexibility_kw": float(power_kw),
                 "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
-                **_recent_profile_reference_power_fields(info),
+                **_gated_reference_power_fields(info),
             })
 
         for asset_id, details in allocation.get("continuous", {}).items():
@@ -276,7 +287,7 @@ def build_persistence_assets_to_activate(portfolio_strategy_contexts):
                 "asset_type": info.get("asset_type", "unknown"),
                 "available_flexibility_kw": float(power_kw),
                 "flexibility_factor": float(info.get("flexibility_factor", 0.5)),
-                **_recent_profile_reference_power_fields(info),
+                **_gated_reference_power_fields(info),
             })
 
     return assets_to_activate
@@ -754,6 +765,8 @@ def resolve_strategy_flexibility_method(strategy, logger):
         "recent-profile": "recent_profile",
         "recentprofile": "recent_profile",
         "profile": "recent_profile",
+        "hp-off-only": "hp_off_only",
+        "hpoffonly": "hp_off_only",
         "preconditioned-binary": "preconditioned_binary",
         "preconditionedbinary": "preconditioned_binary",
     }
@@ -762,6 +775,7 @@ def resolve_strategy_flexibility_method(strategy, logger):
     if method not in {
         "historical",
         "persistence",
+        "hp_off_only",
         "recent_profile",
         "preconditioned_binary",
     }:
@@ -786,7 +800,7 @@ if __name__ == "__main__":
     arg_parser.add_argument("--fsp", help="FSP identifier", required=True)
     arg_parser.add_argument(
         "--strategy",
-        help="Bidding strategy to use. Options include strategy_1 through strategy_10. "
+        help="Bidding strategy to use (must exist in bidding_strategies). "
              "If not specified and FSP has no strategy configured, uses simple baseline-based bidding."
     )
     arg_parser.add_argument(
@@ -973,7 +987,7 @@ if __name__ == "__main__":
     user_info = fsp.nodes_interface.get_user_info()
 
     fsp.set_markets(filter_dict={"name": cfg["fm"]["marketName"]})
-    fsp.set_organization(filter_dict={"name": fsp.cfg["id"]})
+    fsp.set_organization(filter_dict={"name": fsp.cfg["name"]})
 
     logger.info("market id: %s" % fsp.markets[0]["id"])
     logger.info("market name: %s" % fsp.markets[0]["name"])
@@ -1067,6 +1081,7 @@ if __name__ == "__main__":
     # Both feed the same portfolio-scoped activation pipeline via bid records.
     gated_flexibility_methods = {
         "persistence",
+        "hp_off_only",
         "recent_profile",
         "preconditioned_binary",
     }
@@ -1076,7 +1091,27 @@ if __name__ == "__main__":
         else flex_forecaster.method in gated_flexibility_methods
     )
     if use_persistence_flexibility:
-        if flex_forecaster.method == "recent_profile":
+        if flex_forecaster.method == "hp_off_only":
+            settings = flex_forecaster.hp_off_only_settings
+            logger.info(
+                "HP OFF-only flexibility mode (strategy_13): "
+                "target_slot_utc=%s, baselineGoBackMinutes=%s, "
+                "shortPersistenceByAsset=true, recentWindowMinutes=%s, "
+                "quantile=%.3f, minSamples=%s, minActiveRatio=%.3f, "
+                "activeThresholdW=%.1f, bidStepKw=%.3f, "
+                "allowPreheating=%s, controlMode=%s",
+                slot_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                settings["baseline_go_back_minutes"],
+                settings["recent_window_minutes"],
+                settings["quantile"],
+                settings["min_samples"],
+                settings["min_active_ratio"],
+                settings["active_threshold_w"],
+                settings["bid_step_kw"],
+                settings["allow_preheating"],
+                settings["control_mode"],
+            )
+        elif flex_forecaster.method == "recent_profile":
             logger.info(
                 "Recent-profile flexibility mode (strategy_10 / recent-profile; not persistence): "
                 "settings_source=%s, target_slot_utc=%s, lookbackMinutes=%s, quantile=%.3f, "
@@ -1124,7 +1159,9 @@ if __name__ == "__main__":
             portfolio_strategy_contexts = {}
 
         logger.info("-" * 70)
-        if flex_forecaster.method == "recent_profile":
+        if flex_forecaster.method == "hp_off_only":
+            logger.info("Portfolio-scoped HP OFF-only flexibility breakdown:")
+        elif flex_forecaster.method == "recent_profile":
             logger.info(
                 "Portfolio-scoped recent-profile flexibility breakdown:"
             )
@@ -1371,9 +1408,9 @@ if __name__ == "__main__":
             assets_to_activate = []
             if use_strategy_mode and strategy and portfolio_strategy_contexts is not None:
                 if strategy_flexibility_method in gated_flexibility_methods:
-                    # Persistence and recent_profile share the same activation
-                    # plan shape (driven by the per-asset breakdown computed
-                    # in this run), so they reuse the same builder.
+                    # Gated strategies share the same activation-plan shape,
+                    # driven by the exact per-asset allocation computed in
+                    # this run, so they reuse the same builder.
                     assets_to_activate = build_persistence_assets_to_activate(
                         portfolio_strategy_contexts
                     )
