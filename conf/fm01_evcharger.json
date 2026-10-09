@@ -98,7 +98,7 @@
       "fsps": {
         "supsi01": {
           "id": "SUPSI1",
-          "credentialsId": "SUPSI",
+          "credentialsId": "SUPSI01",
           "organizationId": "f3f32d1a-6e80-4f81-ad5e-884d2d9fc923",
           "name": "SUPSI_EV",
           "portfolioId": "068aa3f3-f0cb-4dd1-9acc-b30d0081e8bf",
