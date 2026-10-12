@@ -617,7 +617,9 @@
         "defaultSafetyFactor": 1.0,
         "missingMeasurementPolicy": "skip_asset",
         "bidStepKw": 1.0,
-        "minimumBidKw": 1.0
+        "minimumBidKw": 1.0,
+        "maxConsecutiveActivationSlots": 2,
+        "cooldownSlotsAfterMaxActivation": 2
       },
       "time_slots": [
         {

@@ -580,7 +580,7 @@ The same EV comfort guard as strategy_10 applies to strategy_11:
 | `maxConsecutiveActivationSlots` | 4 | Maximum consecutive 15-min slots under control |
 | `cooldownSlotsAfterMaxActivation` | 2 | Slots released after reaching the cap |
 
-After 4 consecutive activation slots, the charger is restored and enters a 2-slot cooldown. This prevents indefinite curtailment of EV charging sessions. The guard does **not** apply to heat pumps.
+After 4 consecutive activation slots, the charger is restored and enters a 2-slot cooldown. This prevents indefinite curtailment of EV charging sessions. Strategy 13 heat pumps use a separate HP-owned continuation guard with their own limits.
 
 ### Strategy-owned Settings
 
@@ -862,8 +862,12 @@ Strategy 13 reuses the bid-record activation-plan path:
 
 1. Read the exact positive per-asset allocation stored when the bid was created.
 2. Restrict activation to those stored assets; do not fall back to every strategy or portfolio asset.
-3. For every selected discrete HP, call the controller with `force_discrete_off=True`.
-4. Send an OFF command for delivery.
+3. For a new activation, require fresh live power strictly above 500 W.
+4. For an adjacent-slot continuation, use the persisted controlled state and the accepted current-slot bid plan as the eligibility basis. The live-power gate is intentionally bypassed because the previous OFF command has driven that measurement toward 0 W.
+5. For every eligible selected HP, call the controller with `force_discrete_off=True` and send an OFF/0 kW command.
+6. Track consecutive controlled slots. After two slots, restore the HP to ON and keep it released for two cooldown slots.
+
+Only an immediately adjacent controlled slot is a continuation. A gap, expired cooldown, or new control sequence requires fresh telemetry above 500 W again. No accepted trade or rotation to another HP restores the previously controlled asset. Active cooldown state persists even through slots with no accepted trade.
 
 There is no preconditioning lifecycle and no preheating command. A normal post-delivery restore may release the OFF override by sending the enabled state again, but that does not force the compressor to consume and must not be interpreted as preheating.
 
@@ -888,6 +892,8 @@ bidding_strategies.strategy_13.hpOffOnlySettings
 | `missingMeasurementPolicy` | `skip_asset` | Fail the affected asset closed |
 | `bidStepKw` | 1.0 | Downward quantity granularity |
 | `minimumBidKw` | 1.0 | Minimum non-zero per-asset contribution |
+| `maxConsecutiveActivationSlots` | 2 | Maximum consecutive 15-minute OFF slots |
+| `cooldownSlotsAfterMaxActivation` | 2 | Number of 15-minute slots for which the HP remains released after reaching the cap |
 
 ### Difference vs Strategy 8
 
@@ -1173,7 +1179,9 @@ The production HP configuration adds Strategy 13 with strategy-owned OFF-only se
     "defaultSafetyFactor": 1.0,
     "missingMeasurementPolicy": "skip_asset",
     "bidStepKw": 1.0,
-    "minimumBidKw": 1.0
+    "minimumBidKw": 1.0,
+    "maxConsecutiveActivationSlots": 2,
+    "cooldownSlotsAfterMaxActivation": 2
   },
   "time_slots": [
     {"name": "Morning Peak (Conservative)", "start": "06:30", "end": "09:00",
@@ -1347,7 +1355,7 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 | **Discrete states** | Finite set of power levels an asset can be commanded to; for OCPP EVs these correspond to integer current limits |
 | **OCPP current-step** | A specific integer current limit sent to the charger via OCPP; each step maps to a fixed kW power level |
 | **Overdelivery-tolerant selection** | Policy that prefers slightly more curtailment than requested over less, when exact discrete match is unavailable |
-| **Comfort cooldown guard** | Mechanism limiting consecutive EV activation slots and enforcing a cooldown period to protect user charging sessions |
+| **Comfort cooldown guard** | Strategy-owned mechanism limiting consecutive activation slots and enforcing release time; EV and Strategy 13 HP limits are configured independently |
 | **Preconditioned binary** | Strategy 12 flexibility method that bids only binary HP blocks whose recent telemetry proves they are ON |
 | **Weather gate** | Strategy 12 daily decision that controls whether the simulated HP portfolio should be prepared |
 | **Lifecycle ownership** | Persistent Strategy 12 state indicating that the manager prepared or controls an asset and must later release it |

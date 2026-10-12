@@ -675,9 +675,12 @@ Example contents after curtailing two assets:
 ```json
 {
   "ECM96.2": {
+    "state": "controlled",
     "asset_type": "heat_pump",
     "slot_start": "2026-04-27T12:15:00",
-    "slot_end": "2026-04-27T12:30:00"
+    "slot_end": "2026-04-27T12:30:00",
+    "consecutive_activation_slots": 1,
+    "control_sequence_start": "2026-04-27T12:15:00"
   },
   "ECM63.1": {
     "asset_type": "ev_charger",
@@ -704,6 +707,14 @@ This handles three scenarios:
 | No trades | ECM96.2=OFF | (empty) | Restore ECM96.2 to ON |
 | Asset rotated out | ECM96.2=OFF, ECM97.1=OFF | ECM97.1 only | Restore ECM96.2, keep ECM97.1 OFF |
 | All assets still needed | ECM96.2=OFF | ECM96.2 | Re-send ECM96.2 OFF for new slot |
+
+For Strategy 13 HPs, an immediately adjacent selection is a continuation. The
+manager does not reapply the 500 W activity gate because the preceding OFF
+command intentionally makes live power approach 0 W. It keeps the HP OFF for at
+most `maxConsecutiveActivationSlots` (currently 2), then sends one ON/restore
+command and preserves a cooldown entry for
+`cooldownSlotsAfterMaxActivation` (currently 2) slots. A new sequence after a
+gap or expired cooldown must pass the fresh `power > 500 W` check again.
 
 If the state file cannot be read (missing, corrupted), the manager logs a warning and continues with an empty state. If it cannot be written, it logs an error but does not crash after commands were already published.
 

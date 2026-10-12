@@ -122,6 +122,12 @@ def resolve_hp_off_only_settings(
         safety_factor = float(raw.get("defaultSafetyFactor", 1.0))
         bid_step_kw = float(raw.get("bidStepKw", 1.0))
         minimum_bid_kw = float(raw.get("minimumBidKw", bid_step_kw))
+        max_consecutive_activation_slots = int(
+            raw.get("maxConsecutiveActivationSlots", 2)
+        )
+        cooldown_slots_after_max_activation = int(
+            raw.get("cooldownSlotsAfterMaxActivation", 2)
+        )
     except (TypeError, ValueError) as exc:
         fail(f"non-numeric value ({exc})")
 
@@ -156,6 +162,10 @@ def resolve_hp_off_only_settings(
         fail("bidStepKw must be > 0")
     if minimum_bid_kw <= 0:
         fail("minimumBidKw must be > 0")
+    if max_consecutive_activation_slots < 1:
+        fail("maxConsecutiveActivationSlots must be >= 1")
+    if cooldown_slots_after_max_activation < 0:
+        fail("cooldownSlotsAfterMaxActivation must be >= 0")
     if missing_policy not in ("skip_asset", "fail_portfolio"):
         fail("missingMeasurementPolicy must be 'skip_asset' or 'fail_portfolio'")
 
@@ -174,6 +184,10 @@ def resolve_hp_off_only_settings(
         "missing_measurement_policy": missing_policy,
         "bid_step_kw": bid_step_kw,
         "minimum_bid_kw": minimum_bid_kw,
+        "max_consecutive_activation_slots": max_consecutive_activation_slots,
+        "cooldown_slots_after_max_activation": (
+            cooldown_slots_after_max_activation
+        ),
     }
 
 

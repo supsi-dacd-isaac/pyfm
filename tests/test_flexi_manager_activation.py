@@ -2958,6 +2958,8 @@ def _hp_off_only_strategy_config():
             "missingMeasurementPolicy": "skip_asset",
             "bidStepKw": 1.0,
             "minimumBidKw": 1.0,
+            "maxConsecutiveActivationSlots": 2,
+            "cooldownSlotsAfterMaxActivation": 2,
         },
         "time_slots": [{
             "name": "All day",
@@ -2970,6 +2972,50 @@ def _hp_off_only_strategy_config():
     }
 
 
+def test_production_hp_off_only_continuation_limits_are_two_plus_two():
+    import json
+
+    config_path = REPO_ROOT / "conf" / "fm02_hp.json"
+    config = json.loads(config_path.read_text())
+    strategy = config["bidding_strategies"][_HP_OFF_ONLY_STRATEGY_ID]
+    resolved = fm.resolve_hp_off_only_settings(
+        config,
+        strategy_config=strategy,
+        strategy_id=_HP_OFF_ONLY_STRATEGY_ID,
+        granularity=config["fm"].get("granularity", 15),
+    )
+
+    assert resolved["max_consecutive_activation_slots"] == 2
+    assert resolved["cooldown_slots_after_max_activation"] == 2
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "expected_error"),
+    [
+        ("maxConsecutiveActivationSlots", 0, "maxConsecutiveActivationSlots"),
+        (
+            "cooldownSlotsAfterMaxActivation",
+            -1,
+            "cooldownSlotsAfterMaxActivation",
+        ),
+        ("maxConsecutiveActivationSlots", "invalid", "non-numeric value"),
+    ],
+)
+def test_hp_off_only_rejects_invalid_continuation_settings(
+    key, value, expected_error
+):
+    strategy = _hp_off_only_strategy_config()
+    strategy["hpOffOnlySettings"][key] = value
+
+    with pytest.raises(ValueError, match=expected_error):
+        fm.resolve_hp_off_only_settings(
+            {"flexibility": {}},
+            strategy_config=strategy,
+            strategy_id=_HP_OFF_ONLY_STRATEGY_ID,
+            granularity=15,
+        )
+
+
 def _hp_asset(capacity_kw, description):
     return {
         "type": "heat_pump",
@@ -2979,6 +3025,7 @@ def _hp_asset(capacity_kw, description):
         "discrete_states_kw": [0.0, capacity_kw],
         "device_name_tag": description.lower().replace(" ", "_"),
         "pod": "ECM96" if capacity_kw == 6.0 else "ECM97",
+        "rabbitCommandSection": "realAssetCommands",
     }
 
 
@@ -2995,6 +3042,19 @@ class TrackingMeasurementProvider(FakeMeasurementProvider):
 class DisconnectedRabbitPublisher:
     def is_connected(self):
         return False
+
+
+class RecordingRabbitPublisher:
+    def __init__(self):
+        self.calls = []
+
+    def is_connected(self):
+        return True
+
+    def publish_batch_commands(self, commands, slot_info=None):
+        import copy
+        self.calls.append((copy.deepcopy(commands), copy.deepcopy(slot_info)))
+        return len(commands)
 
 
 _NO_MEASUREMENT_PROVIDER = object()
@@ -3029,6 +3089,13 @@ def _new_hp_off_only_manager(
         "asset_mapping": asset_mapping,
         "bidding_strategies": {
             _HP_OFF_ONLY_STRATEGY_ID: _hp_off_only_strategy_config(),
+        },
+        "rabbitMQ": {
+            "realAssetCommands": {
+                "exchange": "flexi_commands",
+                "queue": "flexi_commands_queue",
+                "routingKey": "real_asset.command",
+            },
         },
         "autonomous": autonomous or {"enabled": False},
     }
@@ -3105,6 +3172,9 @@ def test_hp_off_only_fresh_active_hp_receives_off_and_reports_delivery_risk(tmp_
     assert summary["hp_off_only_estimated_delivery_kw"] == pytest.approx(4.2)
     assert summary["hp_off_only_delivery_shortfall_risk_kw"] == pytest.approx(1.8)
     assert provider.calls == [("ECM96.2", 30)]
+    state = _load_state(manager.state_file)
+    assert state["ECM96.2"]["consecutive_activation_slots"] == 1
+    assert state["ECM96.2"]["control_sequence_start"] == "2026-10-08T12:00:00"
 
 
 @pytest.mark.parametrize("power_w", [0.0, 499.9, 500.0])
@@ -3196,13 +3266,17 @@ def test_hp_off_only_partial_acceptance_checks_and_commands_selected_subset_only
     assert provider.calls == [("ECM96.2", 30)]
 
 
-def test_ineligible_previously_controlled_hp_is_restored_not_switched_off(tmp_path):
+def test_hp_off_only_adjacent_controlled_hp_continues_off_below_threshold(tmp_path):
     previous_state = {
         "ECM96.2": {
             "state": "controlled",
             "asset_type": "heat_pump",
             "slot_start": "2026-10-08T11:45:00",
             "slot_end": "2026-10-08T12:00:00",
+            "target_power_kw": 0.0,
+            "consecutive_activation_slots": 1,
+            "control_sequence_start": "2026-10-08T11:45:00",
+            "strategy_id": "strategy_13",
         }
     }
     publisher = DisconnectedRabbitPublisher()
@@ -3223,12 +3297,399 @@ def test_ineligible_previously_controlled_hp_is_restored_not_switched_off(tmp_pa
         simulate_sold_mw=0.006,
     )
 
-    assert summary["control_results"]["ECM96.2"]["status"] == "skipped"
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "queued"
+    assert result["discrete_state"] == "OFF"
+    assert result["target_power_kw"] == pytest.approx(0.0)
+    assert result["is_continuation"] is True
+    assert result["eligibility_basis"] == "controlled_state_continuation"
+    assert provider.calls == []
+    commands = manager.controller._pending_commands
+    assert len(commands) == 1
+    assert commands[0]["command_type"] == "curtail"
+    assert commands[0]["payload"]["discrete_state"] == "OFF"
+    state = _load_state(state_file)
+    assert state["ECM96.2"]["consecutive_activation_slots"] == 2
+    assert state["ECM96.2"]["control_sequence_start"] == "2026-10-08T11:45:00"
+
+
+def test_hp_off_only_continuation_works_without_measurement_provider(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-10-08T11:45:00",
+            "slot_end": "2026-10-08T12:00:00",
+            "consecutive_activation_slots": 1,
+        }
+    }
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        previous_state=previous_state,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "simulated"
+    assert result["discrete_state"] == "OFF"
+    assert result["is_continuation"] is True
+    assert _load_state(state_file)["ECM96.2"][
+        "consecutive_activation_slots"
+    ] == 2
+
+
+def test_hp_off_only_third_consecutive_slot_restores_and_enters_cooldown(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-10-08T11:45:00",
+            "slot_end": "2026-10-08T12:00:00",
+            "consecutive_activation_slots": 2,
+            "control_sequence_start": "2026-10-08T11:30:00",
+            "strategy_id": "strategy_13",
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(0.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["eligibility_basis"] == "max_consecutive_activation_guard"
+    assert provider.calls == []
+    commands = manager.controller._pending_commands
+    assert len(commands) == 1
+    assert commands[0]["command_type"] == "restore"
+    assert commands[0]["payload"]["discrete_state"] == "ON"
+    state = _load_state(state_file)
+    assert state["ECM96.2"]["state"] == "cooldown"
+    assert state["ECM96.2"]["cooldown_until_slot_start"] == (
+        "2026-10-08T12:30:00"
+    )
+    assert state["ECM96.2"]["last_consecutive_activation_slots"] == 2
+
+
+def test_hp_off_only_cooldown_blocks_without_repeated_restore(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "cooldown",
+            "asset_type": "heat_pump",
+            "cooldown_started_slot": "2026-10-08T12:00:00",
+            "cooldown_until_slot_start": "2026-10-08T12:30:00",
+            "cooldown_slots_after_max_activation": 2,
+            "last_consecutive_activation_slots": 2,
+            "strategy_id": "strategy_13",
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(5000.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:15:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["eligibility_basis"] == "comfort_cooldown"
+    assert provider.calls == []
+    assert manager.controller._pending_commands == []
+    assert _load_state(state_file)["ECM96.2"]["state"] == "cooldown"
+
+
+def test_hp_off_only_cooldown_survives_a_slot_with_no_accepted_trade(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "cooldown",
+            "asset_type": "heat_pump",
+            "cooldown_started_slot": "2026-10-08T12:00:00",
+            "cooldown_until_slot_start": "2026-10-08T12:30:00",
+            "cooldown_slots_after_max_activation": 2,
+            "last_consecutive_activation_slots": 2,
+            "strategy_id": "strategy_13",
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:15:00Z",
+        dry_run=True,
+    )
+
+    assert summary["status"] == "no_trades"
+    assert manager.controller._pending_commands == []
+    state = _load_state(state_file)
+    assert state["ECM96.2"]["state"] == "cooldown"
+    assert state["ECM96.2"]["cooldown_until_slot_start"] == (
+        "2026-10-08T12:30:00"
+    )
+
+
+def test_hp_off_only_controlled_hp_is_restored_when_next_slot_has_no_trade(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-10-08T11:45:00",
+            "slot_end": "2026-10-08T12:00:00",
+            "consecutive_activation_slots": 1,
+            "strategy_id": "strategy_13",
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+    )
+
+    assert summary["status"] == "no_trades"
     commands = manager.controller._pending_commands
     assert len(commands) == 1
     assert commands[0]["command_type"] == "restore"
     assert commands[0]["payload"]["discrete_state"] == "ON"
     assert _load_state(state_file) == {}
+
+
+def test_hp_off_only_expired_cooldown_requires_fresh_active_telemetry(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "cooldown",
+            "asset_type": "heat_pump",
+            "cooldown_started_slot": "2026-10-08T12:00:00",
+            "cooldown_until_slot_start": "2026-10-08T12:30:00",
+            "last_consecutive_activation_slots": 2,
+            "strategy_id": "strategy_13",
+        }
+    }
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+        previous_state=previous_state,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:30:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "simulated"
+    assert result["is_continuation"] is False
+    assert result["eligibility_basis"] == "fresh_uncontrolled_telemetry"
+    assert provider.calls == [("ECM96.2", 30)]
+    state = _load_state(state_file)
+    assert state["ECM96.2"]["state"] == "controlled"
+    assert state["ECM96.2"]["consecutive_activation_slots"] == 1
+
+
+def test_hp_off_only_non_adjacent_state_is_not_continuation(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-10-08T11:30:00",
+            "slot_end": "2026-10-08T11:45:00",
+            "consecutive_activation_slots": 1,
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(300.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["is_continuation"] is False
+    assert provider.calls == [("ECM96.2", 30)]
+    commands = manager.controller._pending_commands
+    assert len(commands) == 1
+    assert commands[0]["command_type"] == "restore"
+    assert commands[0]["payload"]["discrete_state"] == "ON"
+    assert _load_state(state_file) == {}
+
+
+def test_hp_off_only_asset_rotation_restores_old_hp_and_switches_new_hp_off(tmp_path):
+    previous_state = {
+        "ECM96.2": {
+            "state": "controlled",
+            "asset_type": "heat_pump",
+            "slot_start": "2026-10-08T11:45:00",
+            "slot_end": "2026-10-08T12:00:00",
+            "consecutive_activation_slots": 1,
+        }
+    }
+    publisher = DisconnectedRabbitPublisher()
+    provider = TrackingMeasurementProvider({
+        "ECM97.3": _fresh_hp_measurement(20000.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM97.3", "available_flexibility_kw": 30.0}],
+        measurement_provider=provider,
+        previous_state=previous_state,
+        rabbitmq_publisher=publisher,
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.030,
+    )
+
+    assert summary["control_results"]["ECM97.3"]["status"] == "queued"
+    assert provider.calls == [("ECM97.3", 30)]
+    commands = manager.controller._pending_commands
+    assert [command["command_type"] for command in commands] == [
+        "curtail",
+        "restore",
+    ]
+    assert commands[0]["asset_id"] == "ECM97.3"
+    assert commands[0]["payload"]["discrete_state"] == "OFF"
+    assert commands[1]["asset_id"] == "ECM96.2"
+    assert commands[1]["payload"]["discrete_state"] == "ON"
+    state = _load_state(state_file)
+    assert set(state) == {"ECM97.3"}
+    assert state["ECM97.3"]["consecutive_activation_slots"] == 1
+
+
+def test_hp_off_only_rabbitmq_publishes_off_for_new_and_continuation_slots(tmp_path):
+    first_publisher = RecordingRabbitPublisher()
+    first_provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+    })
+    first, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=first_provider,
+        rabbitmq_publisher=first_publisher,
+    )
+    first_summary = first.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    assert first_summary["rabbitmq_published"] == 1
+    first_commands, _ = first_publisher.calls[0]
+    assert len(first_commands) == 1
+    assert first_commands[0]["command_type"] == "curtail"
+    assert first_commands[0]["payload"]["discrete_state"] == "OFF"
+    assert first_commands[0]["payload"]["target_power_kw"] == pytest.approx(0.0)
+    assert first_commands[0]["payload"]["slot_start"] == "2026-10-08T12:00:00"
+    assert first_commands[0]["payload"]["slot_end"] == "2026-10-08T12:15:00"
+
+    second_publisher = RecordingRabbitPublisher()
+    second_provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(0.0),
+    })
+    second, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=second_provider,
+        rabbitmq_publisher=second_publisher,
+    )
+    second_summary = second.run(
+        slot_override="2026-10-08T12:15:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    assert second_summary["rabbitmq_published"] == 1
+    second_commands, _ = second_publisher.calls[0]
+    assert len(second_commands) == 1
+    assert second_commands[0]["command_type"] == "curtail"
+    assert second_commands[0]["payload"]["discrete_state"] == "OFF"
+    assert second_commands[0]["payload"]["target_power_kw"] == pytest.approx(0.0)
+    assert second_commands[0]["payload"]["slot_start"] == "2026-10-08T12:15:00"
+    assert second_commands[0]["payload"]["slot_end"] == "2026-10-08T12:30:00"
+    assert second_provider.calls == []
+    assert _load_state(state_file)["ECM96.2"][
+        "consecutive_activation_slots"
+    ] == 2
+
+    third_publisher = RecordingRabbitPublisher()
+    third, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        rabbitmq_publisher=third_publisher,
+    )
+    third_summary = third.run(
+        slot_override="2026-10-08T12:30:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    assert third_summary["rabbitmq_published"] == 1
+    third_commands, _ = third_publisher.calls[0]
+    assert len(third_commands) == 1
+    assert third_commands[0]["command_type"] == "restore"
+    assert third_commands[0]["payload"]["discrete_state"] == "ON"
+    assert third_commands[0]["payload"]["target_power_kw"] == pytest.approx(6.0)
+    assert third_commands[0]["payload"]["slot_start"] == "2026-10-08T12:30:00"
+    assert third_commands[0]["payload"]["slot_end"] == "2026-10-08T12:45:00"
+    assert _load_state(state_file)["ECM96.2"]["state"] == "cooldown"
 
 
 def test_default_manager_state_files_are_isolated_per_fsp():

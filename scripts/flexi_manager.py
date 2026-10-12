@@ -3365,6 +3365,29 @@ class FlexibilityManager:
             )
             self.controller.restore_asset(asset_id, dry_run=dry_run)
 
+    def _active_cooldowns_for_slot(
+        self,
+        previous_state: Dict,
+        slot_start: datetime,
+    ) -> Dict:
+        """Return cooldown entries whose release window still covers the slot.
+
+        Early-return paths (no bid, no trade, or invalid bid plan) must restore
+        controlled assets, but they must not erase an active cooldown.  Doing so
+        would allow the asset to be selected again before the configured number
+        of release slots has elapsed.
+        """
+        active = {}
+        for asset_id, meta in previous_state.items():
+            if not isinstance(meta, dict) or meta.get("state") != "cooldown":
+                continue
+            cooldown_until = _parse_aem_utc(
+                meta.get("cooldown_until_slot_start")
+            )
+            if cooldown_until is not None and slot_start < cooldown_until:
+                active[asset_id] = meta
+        return active
+
     def get_target_slot(self, slot_override: str = None) -> Tuple[datetime, datetime]:
         """
         Determine the target time slot for flexibility activation.
@@ -3677,12 +3700,16 @@ class FlexibilityManager:
         asset_id: str,
         curtailment_kw: float,
         activation_cfg: Dict,
+        is_continuation: bool = False,
     ) -> Dict:
-        """Fail closed unless fresh telemetry proves a Strategy 13 HP is active.
+        """Evaluate whether a Strategy 13 HP can receive an OFF command.
 
-        Eligibility requires power strictly above ``active_threshold_w``.  Live
-        power also provides an estimated delivery and shortfall-risk diagnostic;
-        it does not rewrite the market-cleared allocation.
+        A new activation fails closed unless fresh telemetry proves that the HP
+        is consuming strictly above ``active_threshold_w``.  An immediately
+        adjacent continuation is different: its low power is the intended
+        result of the previous OFF command, so telemetry cannot be used as an
+        availability gate.  In that case the accepted current-slot bid plan and
+        the persisted controlled state are the eligibility basis.
         """
         threshold_w = float(activation_cfg["active_threshold_w"])
         max_age_minutes = int(activation_cfg["max_measurement_age_minutes"])
@@ -3699,6 +3726,8 @@ class FlexibilityManager:
             "delivery_shortfall_risk_kw": float(curtailment_kw),
             "delivery_at_risk": True,
             "skip_reason": None,
+            "is_continuation": bool(is_continuation),
+            "eligibility_basis": None,
         }
 
         def ineligible(reason: str) -> Dict:
@@ -3710,6 +3739,26 @@ class FlexibilityManager:
                 curtailment_kw,
                 threshold_w,
                 reason,
+            )
+            return diagnostics
+
+        if is_continuation:
+            diagnostics.update({
+                "eligible": True,
+                "estimated_delivery_kw": float(curtailment_kw),
+                "delivery_shortfall_risk_kw": 0.0,
+                "delivery_at_risk": False,
+                "eligibility_basis": "controlled_state_continuation",
+            })
+            self.logger.info(
+                "HP OFF-only continuation eligibility for %s:\n"
+                "  allocated_curtailment=%.3f kW\n"
+                "  decision=eligible; keep OFF\n"
+                "  eligibility_basis=accepted bid plan plus adjacent "
+                "controlled state\n"
+                "  telemetry_gate=bypassed because power is control-affected",
+                asset_id,
+                curtailment_kw,
             )
             return diagnostics
 
@@ -3777,6 +3826,7 @@ class FlexibilityManager:
             "estimated_delivery_kw": current_power_kw,
             "delivery_shortfall_risk_kw": shortfall_risk_kw,
             "delivery_at_risk": shortfall_risk_kw > 1e-9,
+            "eligibility_basis": "fresh_uncontrolled_telemetry",
         })
         self.logger.info(
             "HP OFF-only activation eligibility for %s:\n"
@@ -5551,7 +5601,11 @@ class FlexibilityManager:
                                     "dry_run": dry_run,
                                 }
                                 self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
-                            self._save_controlled_state({})
+                            self._save_controlled_state(
+                                self._active_cooldowns_for_slot(
+                                    previous_state, slot_start
+                                )
+                            )
 
                         return summary
                 else:
@@ -5588,7 +5642,11 @@ class FlexibilityManager:
                                 "dry_run": dry_run,
                             }
                             self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
-                        self._save_controlled_state({})
+                        self._save_controlled_state(
+                            self._active_cooldowns_for_slot(
+                                previous_state, slot_start
+                            )
+                        )
 
                     return summary
             elif allowed_assets:
@@ -5651,7 +5709,9 @@ class FlexibilityManager:
                         "dry_run": dry_run,
                     }
                     self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
-                self._save_controlled_state({})
+                self._save_controlled_state(
+                    self._active_cooldowns_for_slot(previous_state, slot_start)
+                )
 
             # ========================================================
             # AUTONOMOUS MODE: Analyze price evolution when no bid exists
@@ -5782,7 +5842,9 @@ class FlexibilityManager:
                         "dry_run": dry_run,
                     }
                     self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
-                self._save_controlled_state({})
+                self._save_controlled_state(
+                    self._active_cooldowns_for_slot(previous_state, slot_start)
+                )
 
             # ========================================================
             # AUTONOMOUS MODE: Analyze price evolution when no trades
@@ -5841,7 +5903,11 @@ class FlexibilityManager:
                             "dry_run": dry_run,
                         }
                         self.controller.publish_pending_commands(restore_slot_info, dry_run=dry_run)
-                    self._save_controlled_state({})
+                    self._save_controlled_state(
+                        self._active_cooldowns_for_slot(
+                            previous_state, slot_start
+                        )
+                    )
 
                 return summary
 
@@ -6012,6 +6078,12 @@ class FlexibilityManager:
                 "max_measurement_age_minutes": hp_settings[
                     "max_current_measurement_age_minutes"
                 ],
+                "max_consecutive_activation_slots": hp_settings[
+                    "max_consecutive_activation_slots"
+                ],
+                "cooldown_slots_after_max_activation": hp_settings[
+                    "cooldown_slots_after_max_activation"
+                ],
                 "settings_source": hp_settings["source"],
             }
             summary["hp_off_only_activation_policy"] = dict(
@@ -6023,7 +6095,8 @@ class FlexibilityManager:
         slot_duration = slot_end - slot_start
         # Per-asset comfort-guard bookkeeping for this run.
         ev_activation_meta = {}      # controlled EV -> {consecutive_activation_slots, control_sequence_start}
-        newly_blocked_cooldown = {}  # EV blocked by the cap this slot -> cooldown state entry
+        hp_activation_meta = {}      # controlled HP -> {consecutive_activation_slots, control_sequence_start}
+        newly_blocked_cooldown = {}  # Asset blocked by its cap -> cooldown state entry
         self.logger.info(
             "EV comfort guard config: "
             "max_consecutive_activation_slots=%d, cooldown_slots_after_max_activation=%d",
@@ -6066,6 +6139,21 @@ class FlexibilityManager:
                 force_discrete_off = False
 
             if hp_off_only_activation_cfg is not None:
+                hp_is_continuation = False
+                hp_prev_count = 0
+                hp_new_count = 0
+                hp_sequence_start = current_slot_start_str
+                hp_prev_meta = previous_state.get(asset_id, {})
+                if not isinstance(hp_prev_meta, dict):
+                    hp_prev_meta = {}
+                hp_prev_state_type = hp_prev_meta.get("state", "controlled")
+                hp_max_slots = hp_off_only_activation_cfg[
+                    "max_consecutive_activation_slots"
+                ]
+                hp_cooldown_slots = hp_off_only_activation_cfg[
+                    "cooldown_slots_after_max_activation"
+                ]
+
                 if asset_type != "heat_pump" or mod_type != "discrete":
                     reason = (
                         "skipped: hp_off_only can activate only discrete heat pumps "
@@ -6088,13 +6176,193 @@ class FlexibilityManager:
                         "delivery_shortfall_risk_kw": float(curtailment_kw),
                         "delivery_at_risk": True,
                         "skip_reason": reason,
+                        "is_continuation": False,
+                        "eligibility_basis": None,
                     }
                 else:
-                    hp_diagnostics = self._evaluate_hp_off_only_activation(
-                        asset_id=asset_id,
-                        curtailment_kw=curtailment_kw,
-                        activation_cfg=hp_off_only_activation_cfg,
-                    )
+                    # A cooldown entry has already been restored.  Suppress both
+                    # OFF and repeated restore commands until its window expires.
+                    if hp_prev_state_type == "cooldown":
+                        cooldown_until = _parse_aem_utc(
+                            hp_prev_meta.get("cooldown_until_slot_start")
+                        )
+                        if cooldown_until is not None and slot_start < cooldown_until:
+                            reason = (
+                                "skipped: HP cooldown active until "
+                                f"{hp_prev_meta.get('cooldown_until_slot_start')}"
+                            )
+                            hp_diagnostics = {
+                                "eligible": False,
+                                "active_threshold_w": hp_off_only_activation_cfg[
+                                    "active_threshold_w"
+                                ],
+                                "max_measurement_age_minutes": (
+                                    hp_off_only_activation_cfg[
+                                        "max_measurement_age_minutes"
+                                    ]
+                                ),
+                                "allocated_curtailment_kw": float(curtailment_kw),
+                                "activation_current_power_w": None,
+                                "activation_current_power_kw": None,
+                                "activation_measurement_timestamp_utc": None,
+                                "activation_measurement_age_minutes": None,
+                                "estimated_delivery_kw": 0.0,
+                                "delivery_shortfall_risk_kw": float(curtailment_kw),
+                                "delivery_at_risk": True,
+                                "skip_reason": reason,
+                                "is_continuation": False,
+                                "eligibility_basis": "comfort_cooldown",
+                            }
+                            self.logger.info(
+                                "HP activation sequence for %s:\n"
+                                "  state=cooldown\n"
+                                "  cooldown_until_slot_start=%s\n"
+                                "  current_slot_start=%s\n"
+                                "  decision=skipped: cooldown active",
+                                asset_id,
+                                hp_prev_meta.get("cooldown_until_slot_start"),
+                                current_slot_start_str,
+                            )
+                        else:
+                            # Expired cooldown is treated as a new activation;
+                            # fresh uncontrolled telemetry is required below.
+                            hp_prev_state_type = "expired_cooldown"
+
+                    if hp_prev_state_type != "cooldown":
+                        hp_is_continuation = (
+                            hp_prev_state_type == "controlled"
+                            and hp_prev_meta.get("slot_end")
+                            == current_slot_start_str
+                        )
+
+                        if hp_is_continuation:
+                            try:
+                                hp_prev_count = int(
+                                    hp_prev_meta.get(
+                                        "consecutive_activation_slots", 1
+                                    )
+                                )
+                            except (TypeError, ValueError):
+                                hp_prev_count = 1
+                            hp_prev_count = max(hp_prev_count, 1)
+
+                        if hp_is_continuation and hp_prev_count >= hp_max_slots:
+                            cooldown_until_dt = (
+                                slot_start + hp_cooldown_slots * slot_duration
+                            )
+                            cooldown_until_str = _format_aem_utc(cooldown_until_dt)
+                            hp_sequence_start = hp_prev_meta.get(
+                                "control_sequence_start",
+                                hp_prev_meta.get(
+                                    "slot_start", current_slot_start_str
+                                ),
+                            )
+                            reason = (
+                                "skipped: maximum consecutive HP activation slots "
+                                f"reached (previous_count={hp_prev_count}, "
+                                f"max={hp_max_slots}); restoring and entering "
+                                f"cooldown until {cooldown_until_str}"
+                            )
+                            newly_blocked_cooldown[asset_id] = {
+                                "state": "cooldown",
+                                "asset_type": asset_type,
+                                "cooldown_reason": (
+                                    "max_consecutive_activation_slots"
+                                ),
+                                "cooldown_started_slot": current_slot_start_str,
+                                "cooldown_until_slot_start": cooldown_until_str,
+                                "cooldown_slots_after_max_activation": (
+                                    hp_cooldown_slots
+                                ),
+                                "last_control_sequence_start": hp_sequence_start,
+                                "last_consecutive_activation_slots": hp_prev_count,
+                                "strategy_id": (
+                                    strategy_info.get("id")
+                                    if strategy_info else None
+                                ),
+                            }
+                            hp_diagnostics = {
+                                "eligible": False,
+                                "active_threshold_w": (
+                                    hp_off_only_activation_cfg[
+                                        "active_threshold_w"
+                                    ]
+                                ),
+                                "max_measurement_age_minutes": (
+                                    hp_off_only_activation_cfg[
+                                        "max_measurement_age_minutes"
+                                    ]
+                                ),
+                                "allocated_curtailment_kw": float(curtailment_kw),
+                                "activation_current_power_w": None,
+                                "activation_current_power_kw": None,
+                                "activation_measurement_timestamp_utc": None,
+                                "activation_measurement_age_minutes": None,
+                                "estimated_delivery_kw": 0.0,
+                                "delivery_shortfall_risk_kw": float(curtailment_kw),
+                                "delivery_at_risk": True,
+                                "skip_reason": reason,
+                                "is_continuation": True,
+                                "eligibility_basis": (
+                                    "max_consecutive_activation_guard"
+                                ),
+                            }
+                            self.logger.warning(
+                                "HP activation sequence for %s:\n"
+                                "  state=controlled\n"
+                                "  continuation=True\n"
+                                "  previous_consecutive_slots=%d\n"
+                                "  max_consecutive_slots=%d\n"
+                                "  cooldown_slots_after_max_activation=%d\n"
+                                "  cooldown_until_slot_start=%s\n"
+                                "  decision=skipped: maximum reached; restore "
+                                "and enter cooldown",
+                                asset_id,
+                                hp_prev_count,
+                                hp_max_slots,
+                                hp_cooldown_slots,
+                                cooldown_until_str,
+                            )
+                        else:
+                            if hp_is_continuation:
+                                hp_new_count = hp_prev_count + 1
+                                hp_sequence_start = hp_prev_meta.get(
+                                    "control_sequence_start",
+                                    hp_prev_meta.get(
+                                        "slot_start", current_slot_start_str
+                                    ),
+                                )
+                                decision_label = "continuation allowed"
+                            else:
+                                hp_new_count = 1
+                                hp_sequence_start = current_slot_start_str
+                                decision_label = "new activation allowed"
+
+                            self.logger.info(
+                                "HP activation sequence for %s:\n"
+                                "  state=controlled\n"
+                                "  continuation=%s\n"
+                                "  previous_consecutive_slots=%d\n"
+                                "  max_consecutive_slots=%d\n"
+                                "  cooldown_slots_after_max_activation=%d\n"
+                                "  new_consecutive_slots=%d\n"
+                                "  control_sequence_start=%s\n"
+                                "  decision=%s",
+                                asset_id,
+                                hp_is_continuation,
+                                hp_prev_count,
+                                hp_max_slots,
+                                hp_cooldown_slots,
+                                hp_new_count,
+                                hp_sequence_start,
+                                decision_label,
+                            )
+                            hp_diagnostics = self._evaluate_hp_off_only_activation(
+                                asset_id=asset_id,
+                                curtailment_kw=curtailment_kw,
+                                activation_cfg=hp_off_only_activation_cfg,
+                                is_continuation=hp_is_continuation,
+                            )
 
                 summary["hp_off_only_activation_checks"][asset_id] = hp_diagnostics
                 if not hp_diagnostics["eligible"]:
@@ -6111,6 +6379,10 @@ class FlexibilityManager:
                 activation_current_power_kw = hp_diagnostics[
                     "activation_current_power_kw"
                 ]
+                hp_activation_meta[asset_id] = {
+                    "consecutive_activation_slots": hp_new_count,
+                    "control_sequence_start": hp_sequence_start,
+                }
 
             if enters_ev_comfort_guard:
                 if asset_type == "ev_charger":
@@ -6393,12 +6665,15 @@ class FlexibilityManager:
                 "reference_power_source": cr.get("reference_power_source"),
                 "strategy_id": strategy_info.get("id") if strategy_info else None,
             }
-            ev_meta = ev_activation_meta.get(asset_id)
-            if ev_meta:
-                controlled_entry["consecutive_activation_slots"] = ev_meta[
+            sequence_meta = (
+                hp_activation_meta.get(asset_id)
+                or ev_activation_meta.get(asset_id)
+            )
+            if sequence_meta:
+                controlled_entry["consecutive_activation_slots"] = sequence_meta[
                     "consecutive_activation_slots"
                 ]
-                controlled_entry["control_sequence_start"] = ev_meta[
+                controlled_entry["control_sequence_start"] = sequence_meta[
                     "control_sequence_start"
                 ]
             new_state[asset_id] = controlled_entry
