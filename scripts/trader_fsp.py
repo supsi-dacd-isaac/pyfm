@@ -743,6 +743,11 @@ def run_strategy_mode(strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
                                 "FAILED to place order: %s regulation, quantity=%.3f MW",
                                 k_regulation_type, quantity_to_sell
                             )
+                    else:
+                        logger.info(
+                            "NO ORDER for %s: quantity rounded to 0.000 MW at the NODES atomic resolution of 0.001 MW (1 kW)",
+                            k_regulation_type,
+                        )
     
     return orders_summary, strategy_id
 
