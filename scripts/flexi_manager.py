@@ -47,6 +47,11 @@ from classes.postgresql_interface import PostgreSQLInterface
 from classes.bid_record_repository import BidRecordRepository
 from classes.demand_record_repository import DemandRecordRepository
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
+from classes.asset_commitment_coordinator import (
+    ActivationSequencePolicy,
+    AssetCommitmentCoordinator,
+    resolve_activation_sequence_policy,
+)
 from classes.flexibility_forecaster import (
     _get_discrete_ev_states,
     _select_discrete_ev_target_for_curtailment,
@@ -3216,6 +3221,13 @@ class FlexibilityManager:
             rabbitmq_config=self.rabbitmq_config,
         )
         self.bid_handler = BidRecordHandler(bid_repo, logger)
+        self.commitment_coordinator = None
+        if bid_repo is not None and hasattr(
+            bid_repo, "get_committed_asset_slots"
+        ):
+            self.commitment_coordinator = AssetCommitmentCoordinator(
+                bid_repo, logger
+            )
         self.activation_measurement_provider = None
         if influx_client is not None:
             self.activation_measurement_provider = ActivationMeasurementProvider(
@@ -6091,6 +6103,161 @@ class FlexibilityManager:
             )
             summary["hp_off_only_activation_checks"] = {}
         ev_comfort_cfg = _resolve_ev_comfort_guard_config(strategy_obj, self.config)
+
+        # Resolve the shared policy from the same normalized values used by the
+        # local physical guards.  This preserves their established validation
+        # and fallback semantics while keeping the coordinator itself entirely
+        # independent of strategy IDs and asset types.
+        slot_minutes = self.config.get("fm", {}).get("granularity", 15)
+        if hp_off_only_activation_cfg is not None:
+            activation_sequence_policy = ActivationSequencePolicy(
+                slot_minutes=slot_minutes,
+                max_consecutive_slots=hp_off_only_activation_cfg[
+                    "max_consecutive_activation_slots"
+                ],
+                cooldown_slots=hp_off_only_activation_cfg[
+                    "cooldown_slots_after_max_activation"
+                ],
+            )
+        elif flexibility_method == "recent_profile":
+            activation_sequence_policy = ActivationSequencePolicy(
+                slot_minutes=slot_minutes,
+                max_consecutive_slots=ev_comfort_cfg[
+                    "max_consecutive_activation_slots"
+                ],
+                cooldown_slots=ev_comfort_cfg[
+                    "cooldown_slots_after_max_activation"
+                ],
+            )
+        else:
+            activation_sequence_policy = resolve_activation_sequence_policy(
+                strategy_obj.config if strategy_obj else None,
+                slot_minutes=slot_minutes,
+            )
+
+        commitment_sequence_decisions = {}
+        commitment_coordination_unavailable = False
+        if activation_sequence_policy is not None:
+            self.logger.info(
+                "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=ACTIVE fsp_id=%s "
+                "target_slot=%s allocated_assets=%s "
+                "max_consecutive_slots=%d cooldown_slots=%d "
+                "source=bid_record_assets+market_ledger_sell "
+                "semantics=posted_sell_reservation_not_dispatch_outcome",
+                self.fsp_id,
+                slot_start.isoformat(),
+                list(allocations.keys()),
+                activation_sequence_policy.max_consecutive_slots,
+                activation_sequence_policy.cooldown_slots,
+            )
+            if self.commitment_coordinator is not None:
+                try:
+                    commitment_sequence_decisions = (
+                        self.commitment_coordinator.evaluate_assets(
+                            fsp_id=self.fsp_id,
+                            asset_ids=list(allocations.keys()),
+                            target_slot=slot_start,
+                            policy=activation_sequence_policy,
+                        )
+                    )
+                except Exception as exc:
+                    commitment_coordination_unavailable = True
+                    self.logger.error(
+                        "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=ERROR "
+                        "fsp_id=%s target_slot=%s action=SKIP_ALL_ALLOCATED_ASSETS "
+                        "error=%s",
+                        self.fsp_id,
+                        slot_start.isoformat(),
+                        exc,
+                    )
+            elif self.bid_repo is not None:
+                commitment_coordination_unavailable = True
+                self.logger.error(
+                    "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=UNAVAILABLE "
+                    "fsp_id=%s target_slot=%s "
+                    "action=SKIP_ALL_ALLOCATED_ASSETS reason=coordinator_missing",
+                    self.fsp_id,
+                    slot_start.isoformat(),
+                )
+            else:
+                # Offline/unit-test operation keeps the existing local physical
+                # guard.  Live production initializes the coordinator from the
+                # shared bid repository above.
+                self.logger.warning(
+                    "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=LOCAL_ONLY "
+                    "fsp_id=%s target_slot=%s reason=bid_repository_unavailable",
+                    self.fsp_id,
+                    slot_start.isoformat(),
+                )
+
+            blocked_sequence_assets = [
+                asset_id
+                for asset_id, decision in commitment_sequence_decisions.items()
+                if not decision.eligible
+            ]
+            eligible_sequence_assets = [
+                asset_id
+                for asset_id, decision in commitment_sequence_decisions.items()
+                if decision.eligible
+            ]
+            if commitment_coordination_unavailable:
+                coordination_status = "unavailable"
+            elif self.commitment_coordinator is None:
+                coordination_status = "local_only"
+            elif blocked_sequence_assets:
+                coordination_status = "assets_blocked"
+                self.logger.warning(
+                    "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=ASSETS_BLOCKED "
+                    "fsp_id=%s target_slot=%s eligible_assets=%s "
+                    "blocked_assets=%s",
+                    self.fsp_id,
+                    slot_start.isoformat(),
+                    eligible_sequence_assets,
+                    blocked_sequence_assets,
+                )
+            else:
+                coordination_status = "pass"
+                self.logger.info(
+                    "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=PASS fsp_id=%s "
+                    "target_slot=%s eligible_assets=%s",
+                    self.fsp_id,
+                    slot_start.isoformat(),
+                    eligible_sequence_assets,
+                )
+
+            summary["commitment_sequence_policy"] = {
+                "max_consecutive_slots": (
+                    activation_sequence_policy.max_consecutive_slots
+                ),
+                "cooldown_slots": activation_sequence_policy.cooldown_slots,
+                "slot_minutes": activation_sequence_policy.slot_minutes,
+                "commitment_source": (
+                    "bid_record_assets+market_ledger_sell"
+                ),
+                "commitment_semantics": (
+                    "posted_sell_reservation_not_dispatch_outcome"
+                ),
+            }
+            summary["commitment_coordination_status"] = coordination_status
+            summary["commitment_sequence_checks"] = {
+                asset_id: {
+                    "eligible": decision.eligible,
+                    "reason_code": decision.reason_code,
+                    "reason": decision.reason,
+                    "previous_consecutive_slots": (
+                        decision.previous_consecutive_slots
+                    ),
+                    "prospective_consecutive_slots": (
+                        decision.prospective_consecutive_slots
+                    ),
+                    "blocked_until_slot": (
+                        _format_aem_utc(decision.blocked_until_slot)
+                        if decision.blocked_until_slot
+                        else None
+                    ),
+                }
+                for asset_id, decision in commitment_sequence_decisions.items()
+            }
         current_slot_start_str = _format_aem_utc(slot_start)
         slot_duration = slot_end - slot_start
         # Per-asset comfort-guard bookkeeping for this run.
@@ -6137,6 +6304,78 @@ class FlexibilityManager:
 
             if is_discrete_ev:
                 force_discrete_off = False
+
+            sequence_decision = commitment_sequence_decisions.get(asset_id)
+            if commitment_coordination_unavailable or (
+                sequence_decision is not None
+                and not sequence_decision.eligible
+            ):
+                if sequence_decision is not None:
+                    reason = (
+                        "skipped: shared commitment sequence guard: "
+                        f"{sequence_decision.reason}"
+                    )
+                    cooldown_until_dt = sequence_decision.blocked_until_slot
+                    reason_code = sequence_decision.reason_code
+                else:
+                    reason = (
+                        "skipped: shared commitment coordination unavailable"
+                    )
+                    cooldown_until_dt = None
+                    reason_code = "coordination_unavailable"
+
+                summary["control_results"][asset_id] = {
+                    "asset_id": asset_id,
+                    "status": "skipped",
+                    "message": reason,
+                    "skip_reason": reason,
+                    "eligibility_basis": "shared_commitment_coordinator",
+                    "sequence_reason_code": reason_code,
+                    "allocated_curtailment_kw": float(curtailment_kw),
+                    "delivery_at_risk": True,
+                    "delivery_shortfall_risk_kw": float(curtailment_kw),
+                }
+                if hp_off_only_activation_cfg is not None:
+                    summary["hp_off_only_activation_checks"][asset_id] = {
+                        "eligible": False,
+                        "allocated_curtailment_kw": float(curtailment_kw),
+                        "estimated_delivery_kw": 0.0,
+                        "delivery_shortfall_risk_kw": float(curtailment_kw),
+                        "delivery_at_risk": True,
+                        "skip_reason": reason,
+                        "eligibility_basis": (
+                            "shared_commitment_coordinator"
+                        ),
+                    }
+
+                if cooldown_until_dt is not None:
+                    newly_blocked_cooldown[asset_id] = {
+                        "state": "cooldown",
+                        "asset_type": asset_type,
+                        "cooldown_reason": "shared_commitment_sequence",
+                        "cooldown_started_slot": current_slot_start_str,
+                        "cooldown_until_slot_start": _format_aem_utc(
+                            cooldown_until_dt
+                        ),
+                        "cooldown_slots_after_max_activation": (
+                            activation_sequence_policy.cooldown_slots
+                        ),
+                        "strategy_id": (
+                            strategy_info.get("id") if strategy_info else None
+                        ),
+                    }
+                self.logger.error(
+                    "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=DISPATCH_BLOCKED "
+                    "fsp_id=%s target_slot=%s asset=%s "
+                    "allocated_curtailment_kw=%.3f reason_code=%s reason=%s",
+                    self.fsp_id,
+                    slot_start.isoformat(),
+                    asset_id,
+                    float(curtailment_kw),
+                    reason_code,
+                    reason,
+                )
+                continue
 
             if hp_off_only_activation_cfg is not None:
                 hp_is_continuation = False

@@ -68,8 +68,154 @@ if numpy_missing:
     sys.modules["numpy"] = numpy_stub
 
 
+from classes.asset_commitment_coordinator import ActivationSequencePolicy  # noqa: E402
 from classes.flexibility_forecaster import FlexibilityForecaster  # noqa: E402
-from scripts.trader_fsp import build_persistence_assets_to_activate  # noqa: E402
+from scripts.trader_fsp import (  # noqa: E402
+    build_persistence_assets_to_activate,
+    coordinate_strategy_assets_for_bidding,
+)
+
+
+class FakeSequenceCoordinator:
+    def __init__(self, decisions=None, error=None):
+        self.decisions = decisions or {}
+        self.error = error
+        self.calls = []
+
+    def evaluate_assets(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.decisions
+
+    @staticmethod
+    def eligible_assets(decisions):
+        return [
+            asset_id
+            for asset_id, decision in decisions.items()
+            if decision.eligible
+        ]
+
+
+def _sequence_decisions(target_slot):
+    policy = ActivationSequencePolicy(15, 2, 2)
+    previous = target_slot.replace(minute=target_slot.minute - 15)
+    two_slots_ago = target_slot.replace(minute=target_slot.minute - 30)
+    return policy, {
+        "blocked": policy.evaluate(
+            "blocked", target_slot, [two_slots_ago, previous]
+        ),
+        "eligible": policy.evaluate("eligible", target_slot, [previous]),
+    }
+
+
+def test_bid_coordination_without_policy_is_a_passthrough():
+    target = datetime(2026, 10, 13, 8, 30)
+
+    assets, decisions, force = coordinate_strategy_assets_for_bidding(
+        fsp_id="fsp",
+        candidate_assets=["A", "A", "B"],
+        target_slot=target,
+        activation_sequence_policy=None,
+        commitment_coordinator=None,
+        force_strategy_bid=True,
+        logger=logging.getLogger("test-bid-coordination-no-policy"),
+    )
+
+    assert assets == ["A", "B"]
+    assert decisions == {}
+    assert force is True
+
+
+def test_bid_coordination_unavailable_fails_closed_and_disables_force(caplog):
+    target = datetime(2026, 10, 13, 8, 30)
+    policy = ActivationSequencePolicy(15, 2, 2)
+
+    with caplog.at_level(logging.INFO):
+        assets, decisions, force = coordinate_strategy_assets_for_bidding(
+            fsp_id="fsp",
+            candidate_assets=["A"],
+            target_slot=target,
+            activation_sequence_policy=policy,
+            commitment_coordinator=None,
+            force_strategy_bid=True,
+            logger=logging.getLogger("test-bid-coordination-unavailable"),
+        )
+
+    assert assets == []
+    assert decisions == {}
+    assert force is False
+    assert "state=ACTIVE" in caplog.text
+    assert "state=FORCE_DISABLED" in caplog.text
+    assert "state=UNAVAILABLE" in caplog.text
+
+
+def test_bid_coordination_repository_error_fails_closed(caplog):
+    target = datetime(2026, 10, 13, 8, 30)
+    policy = ActivationSequencePolicy(15, 2, 2)
+    coordinator = FakeSequenceCoordinator(error=RuntimeError("db down"))
+
+    with caplog.at_level(logging.INFO):
+        assets, decisions, force = coordinate_strategy_assets_for_bidding(
+            fsp_id="fsp",
+            candidate_assets=["A"],
+            target_slot=target,
+            activation_sequence_policy=policy,
+            commitment_coordinator=coordinator,
+            force_strategy_bid=False,
+            logger=logging.getLogger("test-bid-coordination-error"),
+        )
+
+    assert assets == []
+    assert decisions == {}
+    assert force is False
+    assert "state=ERROR" in caplog.text
+    assert "action=EXCLUDE_ALL_ASSETS" in caplog.text
+
+
+def test_bid_coordination_keeps_only_eligible_assets_and_logs_reduction(caplog):
+    target = datetime(2026, 10, 13, 8, 30)
+    policy, decisions = _sequence_decisions(target)
+    coordinator = FakeSequenceCoordinator(decisions=decisions)
+
+    with caplog.at_level(logging.INFO):
+        assets, returned_decisions, force = coordinate_strategy_assets_for_bidding(
+            fsp_id="fsp",
+            candidate_assets=["blocked", "eligible"],
+            target_slot=target,
+            activation_sequence_policy=policy,
+            commitment_coordinator=coordinator,
+            force_strategy_bid=False,
+            logger=logging.getLogger("test-bid-coordination-partial"),
+        )
+
+    assert assets == ["eligible"]
+    assert returned_decisions == decisions
+    assert force is False
+    assert coordinator.calls[0]["asset_ids"] == ["blocked", "eligible"]
+    assert "state=ASSET_POOL_REDUCED" in caplog.text
+
+
+def test_bid_coordination_suppresses_bid_when_every_asset_is_blocked(caplog):
+    target = datetime(2026, 10, 13, 8, 30)
+    policy, decisions = _sequence_decisions(target)
+    coordinator = FakeSequenceCoordinator(
+        decisions={"blocked": decisions["blocked"]}
+    )
+
+    with caplog.at_level(logging.INFO):
+        assets, _, _ = coordinate_strategy_assets_for_bidding(
+            fsp_id="fsp",
+            candidate_assets=["blocked"],
+            target_slot=target,
+            activation_sequence_policy=policy,
+            commitment_coordinator=coordinator,
+            force_strategy_bid=False,
+            logger=logging.getLogger("test-bid-coordination-suppressed"),
+        )
+
+    assert assets == []
+    assert "state=BID_SUPPRESSED" in caplog.text
 
 
 def _new_forecaster(asset_mapping, asset_flex_kw):
@@ -141,6 +287,29 @@ def test_persistence_large_hp_above_4kw_target_is_not_bid():
         "continuous": {},
         "continuous_total_kw": 0,
     }
+    assert _allocation(result) == ({}, {})
+
+
+def test_explicit_empty_allowed_assets_produces_zero_bid():
+    forecaster = _new_forecaster(
+        {
+            "HP": {
+                "type": "heat_pump",
+                "modulation_type": "discrete",
+                "capacity_kw": 6.0,
+            }
+        },
+        {"HP": 6.0},
+    )
+
+    result = forecaster.get_achievable_flexibility(
+        datetime(2026, 5, 21, 10, 0),
+        target_kw=6.0,
+        allowed_assets=[],
+    )
+
+    assert result["recommended_bid_kw"] == pytest.approx(0.0)
+    assert result["asset_breakdown"] == {}
     assert _allocation(result) == ({}, {})
 
 

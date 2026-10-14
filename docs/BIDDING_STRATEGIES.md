@@ -580,7 +580,7 @@ The same EV comfort guard as strategy_10 applies to strategy_11:
 | `maxConsecutiveActivationSlots` | 4 | Maximum consecutive 15-min slots under control |
 | `cooldownSlotsAfterMaxActivation` | 2 | Slots released after reaching the cap |
 
-After 4 consecutive activation slots, the charger is restored and enters a 2-slot cooldown. This prevents indefinite curtailment of EV charging sessions. Strategy 13 heat pumps use a separate HP-owned continuation guard with their own limits.
+After 4 consecutive activation slots, the charger is restored and enters a 2-slot cooldown. This prevents indefinite curtailment of EV charging sessions. The generic asset-commitment coordinator also applies this schedule before bidding: submitted asset-slot commitments are read from the existing bid and market-ledger tables, assets in their release window are excluded, and the bid is recalculated from the remaining assets. Strategy 13 uses the same coordinator with its own configured limits.
 
 ### Strategy-owned Settings
 
@@ -868,6 +868,25 @@ Strategy 13 reuses the bid-record activation-plan path:
 6. Track consecutive controlled slots. After two slots, restore the HP to ON and keep it released for two cooldown slots.
 
 Only an immediately adjacent controlled slot is a continuation. A gap, expired cooldown, or new control sequence requires fresh telemetry above 500 W again. No accepted trade or rotation to another HP restores the previously controlled asset. Active cooldown state persists even through slots with no accepted trade.
+
+Before placing an order, the generic asset-commitment coordinator reconstructs each asset's submitted-slot sequence from the existing `bid_records`, `bid_record_assets`, and `market_ledger` facts. After two committed slots it excludes that HP from the following two slots and recalculates the portfolio bid. `flexi_manager.py` applies the same strategy-agnostic policy as a final dispatch interlock. No strategy-specific database table or column is used; the `2+2` values remain in `hpOffOnlySettings`.
+
+The coordination path emits stable event markers for operations and incident
+review:
+
+- `ACTIVATION_SEQUENCE_HISTORY_QUERY` / `HISTORY_LOADED`: which persisted
+  asset-slot reservations were evaluated.
+- `ACTIVATION_SEQUENCE_DECISION`: the per-asset eligibility decision, sequence
+  counts, cooldown boundary, and any conflicting committed slots.
+- `ACTIVATION_SEQUENCE_BID_GUARD`: whether bidding passed, used a reduced asset
+  pool, was fully suppressed, or failed closed because history was unavailable.
+- `ACTIVATION_SEQUENCE_DISPATCH_GUARD`: whether activation passed, an asset was
+  blocked, or dispatch failed closed.
+
+These events label the source as `bid_record_assets+market_ledger_sell`. This is
+a posted Sell reservation used to protect future capacity; it is not evidence
+that the physical asset was successfully dispatched. Completed command attempts
+remain recorded separately in `asset_activations`.
 
 There is no preconditioning lifecycle and no preheating command. A normal post-delivery restore may release the OFF override by sending the enabled state again, but that does not force the compressor to consume and must not be interpreted as preheating.
 
@@ -1355,7 +1374,8 @@ python scripts/strategy_evaluator.py --config_file conf/test_fm01_aem.json \
 | **Discrete states** | Finite set of power levels an asset can be commanded to; for OCPP EVs these correspond to integer current limits |
 | **OCPP current-step** | A specific integer current limit sent to the charger via OCPP; each step maps to a fixed kW power level |
 | **Overdelivery-tolerant selection** | Policy that prefers slightly more curtailment than requested over less, when exact discrete match is unavailable |
-| **Comfort cooldown guard** | Strategy-owned mechanism limiting consecutive activation slots and enforcing release time; EV and Strategy 13 HP limits are configured independently |
+| **Comfort cooldown guard** | Shared, strategy-agnostic sequence policy limiting consecutive asset commitments/activations and enforcing release time; EV and Strategy 13 limits are configured independently |
+| **Asset commitment coordinator** | Shared trader/activation layer that applies configured sequence limits to generic asset-slot commitment facts stored in the existing bid and market-ledger tables |
 | **Preconditioned binary** | Strategy 12 flexibility method that bids only binary HP blocks whose recent telemetry proves they are ON |
 | **Weather gate** | Strategy 12 daily decision that controls whether the simulated HP portfolio should be prepared |
 | **Lifecycle ownership** | Persistent Strategy 12 state indicating that the manager prepared or controls an asset and must later release it |

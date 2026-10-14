@@ -517,6 +517,71 @@ class BidRecordRepository:
             return []
         finally:
             cur.close()
+
+    def get_committed_asset_slots(
+        self,
+        fsp_id: str,
+        asset_ids: List[str],
+        from_slot: datetime,
+        before_slot: datetime,
+    ) -> List[Dict]:
+        """Return generic asset-slot commitments backed by live sell orders.
+
+        A bid asset alone is not a commitment: ``trader_fsp.py`` creates the
+        bid record and asset allocation before attempting the NODES order, and
+        dry-run evaluations can also create bid-order rows.  A linked positive
+        sell entry in the existing ``market_ledger`` is therefore required.
+
+        This query deliberately exposes only facts (asset and slot).  Sequence
+        limits and cooldown rules remain in application configuration/code.
+        No strategy or asset type is interpreted here.
+        """
+        if not asset_ids:
+            return []
+
+        cur = self.conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(f"""
+                SELECT DISTINCT
+                    a.asset_id,
+                    b.slot_start,
+                    b.slot_end,
+                    b.id AS bid_record_id
+                FROM {self.SCHEMA}.{self.TABLE_BID_RECORDS} b
+                JOIN {self.SCHEMA}.{self.TABLE_ASSETS} a
+                  ON a.bid_record_id = b.id
+                WHERE b.fsp_id = %s
+                  AND a.asset_id = ANY(%s)
+                  AND a.available_flexibility_kw > 0
+                  AND b.slot_start >= %s
+                  AND b.slot_start < %s
+                  AND EXISTS (
+                      SELECT 1
+                      FROM {self.SCHEMA}.market_ledger ml
+                      WHERE ml.bid_record_id = b.id
+                        AND ml.side = 'Sell'
+                        AND ml.flexibility_quantity > 0
+                  )
+                ORDER BY b.slot_start, a.asset_id
+            """, (fsp_id, list(asset_ids), from_slot, before_slot))
+            rows = [dict(row) for row in cur.fetchall()]
+            self.logger.info(
+                "ASSET_COMMITMENT_QUERY_RESULT fsp_id=%s from_slot=%s "
+                "before_slot=%s candidate_assets=%s row_count=%d "
+                "source=bid_record_assets+market_ledger_sell "
+                "semantics=posted_sell_reservation_not_dispatch_outcome",
+                fsp_id,
+                from_slot,
+                before_slot,
+                list(asset_ids),
+                len(rows),
+            )
+            return rows
+        except Exception as e:
+            self.logger.error("Error getting committed asset slots: %s", str(e))
+            raise
+        finally:
+            cur.close()
     
     def mark_activated(self, fsp_id: str, slot_start: datetime) -> bool:
         """

@@ -3559,8 +3559,9 @@ class FlexibilityForecaster:
             current_time_utc=current_time_utc,
         )
         
-        # Filter by allowed assets if specified
-        if allowed_assets:
+        # ``None`` means no caller-side restriction; an explicit empty list
+        # means that coordination/policy excluded every asset for this slot.
+        if allowed_assets is not None:
             breakdown = {k: v for k, v in breakdown.items() if k in allowed_assets}
         
         # Separate into discrete and continuous assets

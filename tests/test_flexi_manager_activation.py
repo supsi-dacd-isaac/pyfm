@@ -3144,6 +3144,191 @@ def _fresh_hp_measurement(power_w, age_minutes=5.0):
     }
 
 
+def test_shared_commitment_coordinator_blocks_third_slot_without_local_state(
+    tmp_path,
+):
+    class CommitmentRepository:
+        def get_committed_asset_slots(
+            self, fsp_id, asset_ids, from_slot, before_slot
+        ):
+            assert fsp_id == "supsi02"
+            assert asset_ids == ["ECM96.2"]
+            return [
+                {
+                    "asset_id": "ECM96.2",
+                    "slot_start": fm.datetime(2026, 10, 8, 11, 30),
+                },
+                {
+                    "asset_id": "ECM96.2",
+                    "slot_start": fm.datetime(2026, 10, 8, 11, 45),
+                },
+            ]
+
+        def save_asset_activations_batch(self, **kwargs):
+            return len(kwargs.get("activations", []))
+
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+    })
+    manager, state_file = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+    )
+    repository = CommitmentRepository()
+    manager.bid_repo = repository
+    manager.commitment_coordinator = fm.AssetCommitmentCoordinator(
+        repository, manager.logger
+    )
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["eligibility_basis"] == "shared_commitment_coordinator"
+    assert result["sequence_reason_code"] == "sequence_cooldown"
+    assert summary["commitment_sequence_checks"]["ECM96.2"][
+        "blocked_until_slot"
+    ] == "2026-10-08T12:30:00"
+    assert provider.calls == []
+    assert manager.controller._pending_commands == []
+    state = _load_state(state_file)
+    assert state["ECM96.2"]["state"] == "cooldown"
+    assert state["ECM96.2"]["cooldown_until_slot_start"] == (
+        "2026-10-08T12:30:00"
+    )
+
+
+def test_shared_commitment_repository_error_fails_dispatch_closed(
+    tmp_path, caplog
+):
+    class FailingCommitmentRepository:
+        def get_committed_asset_slots(self, **kwargs):
+            raise RuntimeError("commitment database unavailable")
+
+        def save_asset_activations_batch(self, **kwargs):
+            return len(kwargs.get("activations", []))
+
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+    })
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+    )
+    repository = FailingCommitmentRepository()
+    manager.bid_repo = repository
+    manager.commitment_coordinator = fm.AssetCommitmentCoordinator(
+        repository, manager.logger
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = manager.run(
+            slot_override="2026-10-08T12:00:00Z",
+            dry_run=True,
+            simulate_sold_mw=0.006,
+        )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["sequence_reason_code"] == "coordination_unavailable"
+    assert result["delivery_at_risk"] is True
+    assert summary["commitment_coordination_status"] == "unavailable"
+    assert summary["status"] == "activation_failed"
+    assert provider.calls == []
+    assert manager.controller._pending_commands == []
+    assert "ACTIVATION_SEQUENCE_DISPATCH_GUARD state=ERROR" in caplog.text
+    assert "state=DISPATCH_BLOCKED" in caplog.text
+
+
+def test_missing_shared_coordinator_with_live_repository_fails_closed(tmp_path):
+    class ActivationOnlyRepository:
+        def save_asset_activations_batch(self, **kwargs):
+            return len(kwargs.get("activations", []))
+
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+    })
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [{"asset_id": "ECM96.2", "available_flexibility_kw": 6.0}],
+        measurement_provider=provider,
+    )
+    manager.bid_repo = ActivationOnlyRepository()
+    manager.commitment_coordinator = None
+
+    summary = manager.run(
+        slot_override="2026-10-08T12:00:00Z",
+        dry_run=True,
+        simulate_sold_mw=0.006,
+    )
+
+    result = summary["control_results"]["ECM96.2"]
+    assert result["status"] == "skipped"
+    assert result["sequence_reason_code"] == "coordination_unavailable"
+    assert summary["commitment_coordination_status"] == "unavailable"
+    assert provider.calls == []
+
+
+def test_shared_commitment_guard_blocks_one_asset_and_dispatches_the_other(
+    tmp_path, caplog
+):
+    class PartialCommitmentRepository:
+        def get_committed_asset_slots(
+            self, fsp_id, asset_ids, from_slot, before_slot
+        ):
+            assert set(asset_ids) == {"ECM96.2", "ECM97.3"}
+            return [
+                {
+                    "asset_id": "ECM96.2",
+                    "slot_start": fm.datetime(2026, 10, 8, 11, 30),
+                },
+                {
+                    "asset_id": "ECM96.2",
+                    "slot_start": fm.datetime(2026, 10, 8, 11, 45),
+                },
+            ]
+
+        def save_asset_activations_batch(self, **kwargs):
+            return len(kwargs.get("activations", []))
+
+    provider = TrackingMeasurementProvider({
+        "ECM96.2": _fresh_hp_measurement(4200.0),
+        "ECM97.3": _fresh_hp_measurement(20000.0),
+    })
+    manager, _ = _new_hp_off_only_manager(
+        tmp_path,
+        [
+            {"asset_id": "ECM96.2", "available_flexibility_kw": 6.0},
+            {"asset_id": "ECM97.3", "available_flexibility_kw": 30.0},
+        ],
+        measurement_provider=provider,
+    )
+    repository = PartialCommitmentRepository()
+    manager.bid_repo = repository
+    manager.commitment_coordinator = fm.AssetCommitmentCoordinator(
+        repository, manager.logger
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = manager.run(
+            slot_override="2026-10-08T12:00:00Z",
+            dry_run=True,
+            simulate_sold_mw=0.036,
+        )
+
+    assert summary["control_results"]["ECM96.2"]["status"] == "skipped"
+    assert summary["control_results"]["ECM97.3"]["status"] == "simulated"
+    assert summary["commitment_coordination_status"] == "assets_blocked"
+    assert provider.calls == [("ECM97.3", 30)]
+    assert "state=ASSETS_BLOCKED" in caplog.text
+
+
 def test_hp_off_only_fresh_active_hp_receives_off_and_reports_delivery_risk(tmp_path):
     provider = TrackingMeasurementProvider({
         "ECM96.2": _fresh_hp_measurement(4200.0),

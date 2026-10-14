@@ -21,6 +21,10 @@ from classes.flexibility_forecaster import (
     format_recent_profile_asset_log_lines,
 )
 from classes.bidding_strategy import BiddingStrategy, StrategyManager
+from classes.asset_commitment_coordinator import (
+    AssetCommitmentCoordinator,
+    resolve_activation_sequence_policy,
+)
 
 POSTGRESQL_IMPORT_ERROR = None
 try:
@@ -794,6 +798,109 @@ def resolve_strategy_flexibility_method(strategy, logger):
     return method
 
 
+def coordinate_strategy_assets_for_bidding(
+    fsp_id,
+    candidate_assets,
+    target_slot,
+    activation_sequence_policy,
+    commitment_coordinator,
+    force_strategy_bid,
+    logger,
+):
+    """Apply the shared sequence guard before bid quantity calculation.
+
+    Returns ``(eligible_assets, decisions, effective_force_strategy_bid)``.
+    A configured policy fails closed if its shared commitment history cannot be
+    read, because bidding without that history can create an undeliverable
+    future reservation.
+    """
+    candidates = list(dict.fromkeys(candidate_assets or []))
+    if activation_sequence_policy is None:
+        return candidates, {}, force_strategy_bid
+
+    logger.info(
+        "ACTIVATION_SEQUENCE_BID_GUARD state=ACTIVE fsp_id=%s "
+        "target_slot=%s candidate_assets=%s max_consecutive_slots=%d "
+        "cooldown_slots=%d source=bid_record_assets+market_ledger_sell "
+        "semantics=posted_sell_reservation_not_dispatch_outcome",
+        fsp_id,
+        target_slot.isoformat(),
+        candidates,
+        activation_sequence_policy.max_consecutive_slots,
+        activation_sequence_policy.cooldown_slots,
+    )
+
+    effective_force_strategy_bid = force_strategy_bid
+    if force_strategy_bid:
+        effective_force_strategy_bid = False
+        logger.warning(
+            "ACTIVATION_SEQUENCE_BID_GUARD state=FORCE_DISABLED fsp_id=%s "
+            "target_slot=%s reason=force_must_not_bypass_shared_guard",
+            fsp_id,
+            target_slot.isoformat(),
+        )
+
+    if commitment_coordinator is None:
+        logger.error(
+            "ACTIVATION_SEQUENCE_BID_GUARD state=UNAVAILABLE fsp_id=%s "
+            "target_slot=%s action=EXCLUDE_ALL_ASSETS",
+            fsp_id,
+            target_slot.isoformat(),
+        )
+        return [], {}, effective_force_strategy_bid
+
+    try:
+        decisions = commitment_coordinator.evaluate_assets(
+            fsp_id=fsp_id,
+            asset_ids=candidates,
+            target_slot=target_slot,
+            policy=activation_sequence_policy,
+        )
+        eligible_assets = commitment_coordinator.eligible_assets(decisions)
+    except Exception as exc:
+        logger.error(
+            "ACTIVATION_SEQUENCE_BID_GUARD state=ERROR fsp_id=%s "
+            "target_slot=%s action=EXCLUDE_ALL_ASSETS error=%s",
+            fsp_id,
+            target_slot.isoformat(),
+            exc,
+        )
+        return [], {}, effective_force_strategy_bid
+
+    blocked_assets = {
+        asset_id: decision.reason_code
+        for asset_id, decision in decisions.items()
+        if not decision.eligible
+    }
+    if not eligible_assets:
+        logger.warning(
+            "ACTIVATION_SEQUENCE_BID_GUARD state=BID_SUPPRESSED fsp_id=%s "
+            "target_slot=%s reason=no_eligible_assets blocked_assets=%s",
+            fsp_id,
+            target_slot.isoformat(),
+            blocked_assets,
+        )
+    elif blocked_assets:
+        logger.warning(
+            "ACTIVATION_SEQUENCE_BID_GUARD state=ASSET_POOL_REDUCED "
+            "fsp_id=%s target_slot=%s eligible_assets=%s blocked_assets=%s",
+            fsp_id,
+            target_slot.isoformat(),
+            eligible_assets,
+            blocked_assets,
+        )
+    else:
+        logger.info(
+            "ACTIVATION_SEQUENCE_BID_GUARD state=PASS fsp_id=%s "
+            "target_slot=%s eligible_assets=%s",
+            fsp_id,
+            target_slot.isoformat(),
+            eligible_assets,
+        )
+
+    return eligible_assets, decisions, effective_force_strategy_bid
+
+
 if __name__ == "__main__":
     # --------------------------------------------------------------------------- #
     # Configuration file
@@ -923,11 +1030,27 @@ if __name__ == "__main__":
 
     strategy_flexibility_method = None
     forecaster_method_override = None
+    activation_sequence_policy = None
     if use_strategy_mode and strategy:
         strategy_flexibility_method = resolve_strategy_flexibility_method(
             strategy, logger
         )
         forecaster_method_override = strategy_flexibility_method
+        sequence_defaults = {
+            "recent_profile": (4, 2),
+            "hp_off_only": (2, 2),
+        }.get(strategy_flexibility_method)
+        activation_sequence_policy = resolve_activation_sequence_policy(
+            strategy.config,
+            slot_minutes=cfg["fm"]["granularity"],
+            default_max_consecutive_slots=(
+                sequence_defaults[0] if sequence_defaults else None
+            ),
+            default_cooldown_slots=(
+                sequence_defaults[1] if sequence_defaults else None
+            ),
+            enabled_when_missing=sequence_defaults is not None,
+        )
 
     if dry_run:
         logger.info("Starting program (DRY-RUN MODE - no orders will be placed)")
@@ -954,6 +1077,7 @@ if __name__ == "__main__":
     pgi = None
     bid_repo = None
     demand_repo = None
+    commitment_coordinator = None
     if PostgreSQLInterface is None:
         logger.warning(
             "PostgreSQL support is unavailable in this runtime: %s",
@@ -965,6 +1089,18 @@ if __name__ == "__main__":
             # Initialize bid record repository for storing bid info
             bid_repo = BidRecordRepository(pgi, logger)
             logger.info("Bid record repository initialized")
+            if activation_sequence_policy is not None:
+                commitment_coordinator = AssetCommitmentCoordinator(
+                    bid_repo, logger
+                )
+                logger.info(
+                    "Asset commitment coordinator initialized: "
+                    "max_consecutive_slots=%d, cooldown_slots=%d, "
+                    "slot_minutes=%d",
+                    activation_sequence_policy.max_consecutive_slots,
+                    activation_sequence_policy.cooldown_slots,
+                    activation_sequence_policy.slot_minutes,
+                )
             # Initialize demand record repository for storing DSO demand info
             demand_repo = DemandRecordRepository(pgi, logger)
             logger.info("Demand record repository initialized")
@@ -1043,6 +1179,30 @@ if __name__ == "__main__":
 
     # Set current baselines for FSP
     fsp.download_baselines(slot_time)
+
+    # Apply generic future-commitment coordination before estimating the
+    # strategy quantity.  The coordinator knows only FSP/asset/slot facts and
+    # the supplied sequence limits; it does not inspect strategy IDs or asset
+    # types.  If a sequence-limited strategy cannot access shared persistence,
+    # fail closed rather than submit a commitment that activation may reject.
+    coordinated_strategy_assets = (
+        list(strategy.allowed_assets)
+        if use_strategy_mode and strategy
+        else []
+    )
+    (
+        coordinated_strategy_assets,
+        activation_sequence_decisions,
+        effective_force_strategy_bid,
+    ) = coordinate_strategy_assets_for_bidding(
+        fsp_id=args.fsp,
+        candidate_assets=coordinated_strategy_assets,
+        target_slot=slot_time,
+        activation_sequence_policy=activation_sequence_policy,
+        commitment_coordinator=commitment_coordinator,
+        force_strategy_bid=force_strategy_bid,
+        logger=logger,
+    )
 
     # Initialize FlexibilityForecaster for the 5-asset portfolio
     flex_forecaster = FlexibilityForecaster(
@@ -1243,7 +1403,7 @@ if __name__ == "__main__":
                 achievable = flex_forecaster.get_achievable_flexibility(
                     period_from=slot_time,
                     target_kw=effective_target_kw,
-                    allowed_assets=strategy.allowed_assets,
+                    allowed_assets=coordinated_strategy_assets,
                     use_temperature=False,
                     asset_ids=portfolio_asset_ids,
                     current_time_utc=current_time_utc,
@@ -1477,7 +1637,7 @@ if __name__ == "__main__":
             strategy, strategy_id, fsp, fmo, dso_demands, slot_time,
             asset_breakdown, flex_forecaster, dry_run, logger, 
             bid_record_id=bid_record_id, demand_record_id=demand_record_id,
-            force_strategy_bid=force_strategy_bid,
+            force_strategy_bid=effective_force_strategy_bid,
             portfolio_strategy_contexts=portfolio_strategy_contexts,
         )
     else:
